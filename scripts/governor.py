@@ -102,6 +102,7 @@ def _subset_mismatch(want: Any, have: Any) -> bool:
 
 
 def settings_drift(repo: dict[str, Any]) -> list[str]:
+    """`repo` must come from GET repos/{full}: the list endpoints omit the merge settings."""
     return [f"setting {k}={repo.get(k)}" for k, v in SETTINGS.items() if repo.get(k) != v]
 
 
@@ -188,7 +189,7 @@ def reconcile(repo: dict[str, Any], ref: str, dry: bool, have_key: bool) -> dict
             except gh.GhError as exc:
                 out["errors"].append(f"{name}: {exc}")
 
-    step("settings", settings_drift(repo),
+    step("settings", settings_drift(gh.api(f"repos/{full}")),
          lambda: gh.api(f"repos/{full}", "PATCH", SETTINGS) and "settings applied")
 
     if have_key:

@@ -1,5 +1,6 @@
 import copy
 import unittest
+from unittest import mock
 
 from tests.helpers import *  # noqa: F401,F403
 import governor as g
@@ -45,3 +46,14 @@ class GovernorTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReconcileSettingsTest(unittest.TestCase):
+    """user/repos list entries omit the merge settings; reconcile must read the full repo."""
+
+    def test_settings_read_from_full_repo_not_list_entry(self):
+        listed = {"full_name": "o/r", "default_branch": "", "size": 0}  # list shape: no allow_* keys
+        full = dict(listed, **g.SETTINGS)
+        with mock.patch.object(g.gh, "api", side_effect=lambda path, *a, **k: full if path == "repos/o/r" else []):
+            out = g.reconcile(listed, "v1", dry=True, have_key=False)
+        self.assertFalse([d for d in out["drift"] if d.startswith("setting ")], out["drift"])
