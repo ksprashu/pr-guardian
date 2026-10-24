@@ -13,7 +13,7 @@ A PR merges only when all of these hold:
 1. A PR is opened or pushed. The workflow runs `route`, then `scan` (semgrep, gitleaks, osv-scanner, trivy, actionlint, zizmor, native audits, linters). Then `review` runs agy with structured output, then `publish` writes the inline threads and summary, and `verdict` sets the status.
 2. On every push, the PR gets a full re-review. Each earlier finding is marked `fixed`, `still_open`, `reopened` or `accepted_pushback`:
    - If a thread was resolved but the code still has the problem, the thread is unresolved and gets a reply.
-   - If a finding was fixed, or the pushback was accepted, the bot resolves the thread.
+   - If a finding was fixed, or the pushback was accepted, the bot says so in the thread and the author resolves it. The bot tries to resolve it too, but GitHub refuses that to a workflow token without `contents: write`, which the publishing job deliberately lacks.
 3. The PR author works the threads. The [`pr-review-loop`](https://github.com/ksprashu/agent-skill-forge/tree/main/skills/pr-review-loop) skill does this for agents. For each thread they either:
    - fix it and push,
    - reply `/ai-review wontfix: <reason>`, or
