@@ -2,6 +2,8 @@
 #
 # route   -> decide review / verdict / skip                      (no token)
 # scan    -> scanners + linters on the PR head                   (read)
+#            SARIF stays an artifact: code-scanning uploads open unresolvable
+#            duplicate PR threads that block required conversation resolution.
 # review  -> Antigravity CLI + forge skills, structured output   (read + GEMINI_API_KEY)
 # publish -> threads, resolutions, summary + state               (pull-requests write; no model)
 # verdict -> commit status pr-guardian/verdict on the head SHA   (statuses write; no model)
@@ -55,7 +57,6 @@ jobs:
     permissions:
       contents: read
       pull-requests: read
-      security-events: write
     outputs:
       head_sha: ${{ steps.pr.outputs.head_sha }}
     steps:
@@ -105,14 +106,6 @@ jobs:
         run: |
           python3 .forge/skills/review/scripts/review_collector.py \
             --path src --base "origin/$BASE" --out "$RUNNER_TEMP/evidence.json" || echo "collector exit $?"
-      - name: Upload scanner SARIF to code scanning
-        if: hashFiles(format('{0}/scan.sarif', runner.temp)) != ''
-        continue-on-error: true # private repos without code scanning reject the upload
-        uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
-        with:
-          sarif_file: ${{ runner.temp }}/scan.sarif
-          category: pr-guardian-scanners
-          checkout_path: src
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: prg-scan
@@ -199,7 +192,6 @@ jobs:
       contents: read
       pull-requests: write
       issues: write
-      security-events: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -220,7 +212,6 @@ jobs:
       - name: Validate findings (untrusted model output)
         run: |
           python3 .forge/skills/review/scripts/findings.py validate "$RUNNER_TEMP/out/findings.json"
-          python3 .forge/skills/review/scripts/findings.py sarif "$RUNNER_TEMP/out/findings.json" > "$RUNNER_TEMP/findings.sarif"
       - name: Publish threads and summary
         env:
           GH_TOKEN: ${{ github.token }}
@@ -230,14 +221,6 @@ jobs:
           python3 .prg/scripts/publish_review.py --repo "$GITHUB_REPOSITORY" --pr "$PR" --sha "$SHA" \
             --findings "$RUNNER_TEMP/out/findings.json" --prior "$RUNNER_TEMP/out/prior.json" \
             --usage "$RUNNER_TEMP/out/agy.json"
-      - name: Upload review SARIF to code scanning
-        continue-on-error: true
-        uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
-        with:
-          sarif_file: ${{ runner.temp }}/findings.sarif
-          category: pr-guardian-review
-          ref: refs/pull/${{ needs.route.outputs.pr }}/head
-          sha: ${{ needs.scan.outputs.head_sha }}
 
   verdict:
     needs: [route, scan, review, publish]

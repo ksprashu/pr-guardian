@@ -37,6 +37,7 @@ A PR merges only when all of these hold:
 - The model job has a read-only token. `GEMINI_API_KEY` is set only on the agy step, and agy runs `--sandbox` with a read-only command allowlist (`config/agy-settings.json`).
 - `publish` and `verdict` never run the model. They validate its output against the forge's findings schema, strip HTML comments so the model cannot forge markers, and defuse @-mentions.
 - PRs from forks are never reviewed automatically, because secrets are not available to them. The owner reviews them and applies `human-override`. No workflow uses `pull_request_target`.
+- Scanner and findings SARIF is kept as a run artifact, not uploaded to code scanning. Code-scanning alerts open their own PR threads, which the bot cannot resolve, and required conversation resolution would block on them.
 - Every action is pinned by SHA, and every scanner binary is checked against its release SHA-256 (`scripts/install_scanners.sh`).
 - Known gap: agy installs through its official bootstrapper and updates itself, so it is not pinned.
 
