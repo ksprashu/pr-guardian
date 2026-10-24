@@ -273,8 +273,10 @@ def main() -> int:
         Path(summary).write_text(text + "\n", encoding="utf-8")
     if args.report_issue:
         title = "Governor drift report"
-        issues = gh.api(f"repos/{owner}/{HOME_REPO}/issues?state=open&labels=governor", paginate=True)
-        existing = next((i for i in issues if i["title"] == title), None)
+        # Match on title: the label is dropped silently when the token cannot label issues.
+        issues = gh.api(f"repos/{owner}/{HOME_REPO}/issues?state=open&creator={owner}", paginate=True)
+        existing = min((i for i in issues if i["title"] == title and "pull_request" not in i),
+                       key=lambda i: i["number"], default=None)
         if existing:
             gh.api(f"repos/{owner}/{HOME_REPO}/issues/{existing['number']}", "PATCH", {"body": text})
         else:
