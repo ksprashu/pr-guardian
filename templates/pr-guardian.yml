@@ -35,6 +35,5 @@ jobs:
       pull-requests: write
       issues: write
       statuses: write
-      security-events: write
     secrets:
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
