@@ -14,9 +14,9 @@ on:
         type: string
         required: true
       model:
-        description: Model slug passed to agy --model
+        description: agy --model slug (gemini-launch-candidate-high = Gemini 4 Argon, High)
         type: string
-        default: gemini-4-argon
+        default: gemini-launch-candidate-high
     secrets:
       GEMINI_API_KEY:
         required: false

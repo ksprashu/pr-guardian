@@ -25,6 +25,7 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parent.parent
 TIMEOUT_S = 40 * 60
+DEFAULT_MODEL = "gemini-launch-candidate-high"  # agy's slug for Gemini 4 Argon (High)
 
 
 def load_findings_lib(path: str):
@@ -51,14 +52,19 @@ def extract(result: dict[str, Any]) -> Any:
 
 
 def run_agy(prompt: str, schema: str, model: str, workdir: str, extra_dir: str) -> dict[str, Any]:
-    cmd = ["agy", "-p", prompt, "--add-dir", extra_dir, "--model", model, "--effort", "max",
+    # The Argon slugs carry their effort (-high/-medium/-low); agy rejects --effort with them.
+    cmd = ["agy", "-p", prompt, "--add-dir", extra_dir, "--model", model,
            "--output-format", "json", "--json-schema", schema, "--sandbox", "--disable-slash-commands",
            "--print-timeout", f"{TIMEOUT_S - 60}s"]
     proc = subprocess.run(cmd, capture_output=True, text=True, shell=False, cwd=workdir,
                           timeout=TIMEOUT_S)
-    if proc.returncode != 0:
-        raise RuntimeError(f"agy exited {proc.returncode}: {proc.stderr.strip()[-1500:]}")
-    return json.loads(proc.stdout)
+    try:
+        result = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        raise RuntimeError(f"agy exited {proc.returncode}: {proc.stderr.strip()[-1500:]}") from None
+    if proc.returncode != 0 or result.get("status") != "SUCCESS":
+        raise RuntimeError(f"agy {result.get('status')}: {str(result.get('error'))[:1500]}")
+    return result
 
 
 def add_usage(total: dict[str, int], usage: dict[str, Any] | None) -> None:
@@ -74,7 +80,7 @@ def main() -> int:
     ap.add_argument("--findings-lib", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--usage-out", required=True)
-    ap.add_argument("--model", default=os.environ.get("PRG_MODEL", "gemini-4-argon"))
+    ap.add_argument("--model", default=os.environ.get("PRG_MODEL") or DEFAULT_MODEL)
     ap.add_argument("--workdir", default=".")
     args = ap.parse_args()
 
