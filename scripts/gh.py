@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from typing import Any
 
@@ -11,16 +12,17 @@ class GhError(RuntimeError):
     pass
 
 
-def _run(args: list[str], stdin: str | None = None) -> str:
+def _run(args: list[str], stdin: str | None = None, token: str | None = None) -> str:
+    env = {**os.environ, "GH_TOKEN": token} if token else None
     proc = subprocess.run(["gh", *args], input=stdin, capture_output=True, text=True,
-                          shell=False, timeout=120)
+                          shell=False, timeout=120, env=env)
     if proc.returncode != 0:
         raise GhError(f"gh {' '.join(args[:3])}… failed: {proc.stderr.strip()[:500]}")
     return proc.stdout
 
 
 def api(path: str, method: str = "GET", body: dict[str, Any] | None = None,
-        paginate: bool = False) -> Any:
+        paginate: bool = False, token: str | None = None) -> Any:
     args = ["api", path, "-X", method, "-H", "Accept: application/vnd.github+json"]
     if paginate:
         args += ["--paginate", "--slurp"]
@@ -28,7 +30,7 @@ def api(path: str, method: str = "GET", body: dict[str, Any] | None = None,
     if body is not None:
         args += ["--input", "-"]
         stdin = json.dumps(body)
-    out = _run(args, stdin)
+    out = _run(args, stdin, token)
     if not out.strip():
         return None
     data = json.loads(out)

@@ -273,15 +273,21 @@ def main() -> int:
         Path(summary).write_text(text + "\n", encoding="utf-8")
     if args.report_issue:
         title = "Governor drift report"
-        # Match on title: the label is dropped silently when the token cannot label issues.
-        issues = gh.api(f"repos/{owner}/{HOME_REPO}/issues?state=open&creator={owner}", paginate=True)
-        existing = min((i for i in issues if i["title"] == title and "pull_request" not in i),
+        # The workflow token writes the report, so GOVERNOR_TOKEN needs no Issues access.
+        token = os.environ.get("REPORT_TOKEN") or None
+        # Match on title and a trusted author: the label is dropped silently when the token
+        # cannot label issues, and the report was first opened with the PAT.
+        authors = {owner, "github-actions[bot]"}
+        issues = gh.api(f"repos/{owner}/{HOME_REPO}/issues?state=open", paginate=True, token=token)
+        existing = min((i for i in issues if i["title"] == title and "pull_request" not in i
+                        and i["user"]["login"] in authors),
                        key=lambda i: i["number"], default=None)
         if existing:
-            gh.api(f"repos/{owner}/{HOME_REPO}/issues/{existing['number']}", "PATCH", {"body": text})
+            gh.api(f"repos/{owner}/{HOME_REPO}/issues/{existing['number']}", "PATCH", {"body": text},
+                   token=token)
         else:
             gh.api(f"repos/{owner}/{HOME_REPO}/issues", "POST",
-                   {"title": title, "body": text, "labels": ["governor"]})
+                   {"title": title, "body": text, "labels": ["governor"]}, token=token)
 
     if any(r["errors"] for r in results):
         return 2
