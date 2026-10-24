@@ -1,0 +1,28 @@
+name: ci
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions: {}
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Unit tests
+        run: python3 -m unittest discover -s tests -t . -v
+      - name: Install linters
+        run: scripts/install_scanners.sh
+      - name: actionlint (workflows + rendered caller template)
+        run: |
+          mkdir -p "$RUNNER_TEMP/caller/.github/workflows"
+          sed 's/{{REF}}/0123456789abcdef0123456789abcdef01234567/g' templates/pr-guardian.yml \
+            > "$RUNNER_TEMP/caller/.github/workflows/pr-guardian.yml"
+          actionlint .github/workflows/*.yml "$RUNNER_TEMP/caller/.github/workflows/pr-guardian.yml"
+      - name: zizmor
+        run: zizmor --offline .github/workflows "$RUNNER_TEMP/caller/.github/workflows"

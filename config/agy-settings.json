@@ -1,0 +1,16 @@
+{
+  "allowNonWorkspaceAccess": false,
+  "enableTerminalSandbox": true,
+  "permissions": {
+    "allow": [
+      "command(ls)", "command(cat)", "command(head)", "command(tail)", "command(wc)",
+      "command(grep)", "command(rg)", "command(find)", "command(tree)", "command(diff)",
+      "command(git (log|show|diff|blame|ls-files|grep|status)( .*)?)"
+    ],
+    "deny": [
+      "command(curl.*)", "command(wget.*)", "command(nc.*)", "command(ssh.*)",
+      "command(env.*)", "command(printenv.*)", "command(python.*)", "command(node.*)",
+      "command(bash.*)", "command(sh .*)", "command(git (push|remote|config|fetch|clone).*)"
+    ]
+  }
+}

@@ -1,0 +1,268 @@
+# Reusable pr-guardian review. Callers: templates/pr-guardian.yml (installed by the governor).
+#
+# route   -> decide review / verdict / skip                      (no token)
+# scan    -> scanners + linters on the PR head                   (read)
+# review  -> Antigravity CLI + forge skills, structured output   (read + GEMINI_API_KEY)
+# publish -> threads, resolutions, summary + state               (pull-requests write; no model)
+# verdict -> commit status pr-guardian/verdict on the head SHA   (statuses write; no model)
+name: pr-guardian review
+on:
+  workflow_call:
+    inputs:
+      guardian_ref:
+        description: pr-guardian ref the scripts are loaded from (match the uses@ ref)
+        type: string
+        required: true
+      model:
+        description: Model slug passed to agy --model
+        type: string
+        default: gemini-4-argon
+    secrets:
+      GEMINI_API_KEY:
+        required: false
+
+permissions: {}
+
+env:
+  # agent-skill-forge commit the review / security-review skills are loaded from.
+  FORGE_REPO: ksprashu/agent-skill-forge
+  FORGE_REF: FORGE_SHA_PLACEHOLDER
+
+jobs:
+  route:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      action: ${{ steps.route.outputs.action }}
+      pr: ${{ steps.route.outputs.pr }}
+      escalate: ${{ steps.route.outputs.escalate }}
+      reason: ${{ steps.route.outputs.reason }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ksprashu/pr-guardian
+          ref: ${{ inputs.guardian_ref }}
+          path: .prg
+          persist-credentials: false
+      - id: route
+        run: python3 .prg/scripts/route.py
+
+  scan:
+    needs: route
+    if: needs.route.outputs.action == 'review'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      pull-requests: read
+      security-events: write
+    outputs:
+      head_sha: ${{ steps.pr.outputs.head_sha }}
+    steps:
+      - id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ needs.route.outputs.pr }}
+        run: |
+          gh pr view "$PR" -R "$GITHUB_REPOSITORY" --json headRefOid,baseRefName,isCrossRepository \
+            --jq '"head_sha=" + .headRefOid, "base_ref=" + .baseRefName, "fork=" + (.isCrossRepository|tostring)' \
+            > "$RUNNER_TEMP/pr.env"
+          if grep -qx 'fork=true' "$RUNNER_TEMP/pr.env"; then
+            echo "::error::PR #$PR comes from a fork; pr-guardian does not run the model on fork code. The owner reviews it and applies human-override."
+            exit 1
+          fi
+          cat "$RUNNER_TEMP/pr.env" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ steps.pr.outputs.head_sha }}
+          path: src
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ksprashu/pr-guardian
+          ref: ${{ inputs.guardian_ref }}
+          path: .prg
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.FORGE_REPO }}
+          ref: ${{ env.FORGE_REF }}
+          path: .forge
+          persist-credentials: false
+      - name: Install pinned scanners
+        run: .prg/scripts/install_scanners.sh
+      - name: Security scanners (leads, not findings)
+        env:
+          BASE: ${{ steps.pr.outputs.base_ref }}
+        run: |
+          python3 .forge/skills/security-review/scripts/run_scanners.py \
+            --repo-root src --diff "origin/$BASE" \
+            --json-out "$RUNNER_TEMP/scan.json" --sarif-out "$RUNNER_TEMP/scan.sarif" || echo "run_scanners exit $?"
+      - name: Linters and type checkers
+        env:
+          BASE: ${{ steps.pr.outputs.base_ref }}
+        run: |
+          python3 .forge/skills/review/scripts/review_collector.py \
+            --path src --base "origin/$BASE" --out "$RUNNER_TEMP/evidence.json" || echo "collector exit $?"
+      - name: Upload scanner SARIF to code scanning
+        if: hashFiles(format('{0}/scan.sarif', runner.temp)) != ''
+        continue-on-error: true # private repos without code scanning reject the upload
+        uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        with:
+          sarif_file: ${{ runner.temp }}/scan.sarif
+          category: pr-guardian-scanners
+          checkout_path: src
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: prg-scan
+          path: |
+            ${{ runner.temp }}/scan.json
+            ${{ runner.temp }}/scan.sarif
+            ${{ runner.temp }}/evidence.json
+          if-no-files-found: warn
+          retention-days: 7
+
+  review:
+    needs: [route, scan]
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.scan.outputs.head_sha }}
+          path: src
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ksprashu/pr-guardian
+          ref: ${{ inputs.guardian_ref }}
+          path: .prg
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.FORGE_REPO }}
+          ref: ${{ env.FORGE_REF }}
+          path: .forge
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: prg-scan
+          path: ${{ runner.temp }}/scan
+      - name: Build review context
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ needs.route.outputs.pr }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/out"
+          python3 .prg/scripts/build_context.py --repo "$GITHUB_REPOSITORY" --pr "$PR" \
+            --out "$RUNNER_TEMP/context.md" --scan "$RUNNER_TEMP/scan/scan.json" \
+            --collector "$RUNNER_TEMP/scan/evidence.json" \
+            --prior-out "$RUNNER_TEMP/out/prior.json" --triage-out "$RUNNER_TEMP/triage.json"
+          cat "$RUNNER_TEMP/triage.json"
+      - name: Install Antigravity CLI and skills
+        run: |
+          curl -fsSL https://antigravity.google/cli/install.sh | bash
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          mkdir -p ~/.gemini/antigravity-cli ~/.gemini/config/skills
+          cp .prg/config/agy-settings.json ~/.gemini/antigravity-cli/settings.json
+          for s in review security-review; do cp -R ".forge/skills/$s" ~/.gemini/config/skills/; done
+          "$HOME/.local/bin/agy" --version || true
+      - name: Review (Gemini via Antigravity CLI)
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          PRG_MODEL: ${{ inputs.model }}
+        run: |
+          test -n "$GEMINI_API_KEY" || { echo "::error::GEMINI_API_KEY secret is not set on this repo"; exit 1; }
+          python3 .prg/scripts/run_model.py --context "$RUNNER_TEMP/context.md" \
+            --triage "$RUNNER_TEMP/triage.json" \
+            --findings-lib .forge/skills/review/scripts/findings.py \
+            --out "$RUNNER_TEMP/out/findings.json" --usage-out "$RUNNER_TEMP/out/agy.json" \
+            --workdir src
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: prg-review
+          path: ${{ runner.temp }}/out/
+          retention-days: 14
+
+  publish:
+    needs: [route, scan, review]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+      security-events: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ksprashu/pr-guardian
+          ref: ${{ inputs.guardian_ref }}
+          path: .prg
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.FORGE_REPO }}
+          ref: ${{ env.FORGE_REF }}
+          path: .forge
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: prg-review
+          path: ${{ runner.temp }}/out
+      - name: Validate findings (untrusted model output)
+        run: |
+          python3 .forge/skills/review/scripts/findings.py validate "$RUNNER_TEMP/out/findings.json"
+          python3 .forge/skills/review/scripts/findings.py sarif "$RUNNER_TEMP/out/findings.json" > "$RUNNER_TEMP/findings.sarif"
+      - name: Publish threads and summary
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ needs.route.outputs.pr }}
+          SHA: ${{ needs.scan.outputs.head_sha }}
+        run: |
+          python3 .prg/scripts/publish_review.py --repo "$GITHUB_REPOSITORY" --pr "$PR" --sha "$SHA" \
+            --findings "$RUNNER_TEMP/out/findings.json" --prior "$RUNNER_TEMP/out/prior.json" \
+            --usage "$RUNNER_TEMP/out/agy.json"
+      - name: Upload review SARIF to code scanning
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        with:
+          sarif_file: ${{ runner.temp }}/findings.sarif
+          category: pr-guardian-review
+          ref: refs/pull/${{ needs.route.outputs.pr }}/head
+          sha: ${{ needs.scan.outputs.head_sha }}
+
+  verdict:
+    needs: [route, scan, review, publish]
+    if: always() && needs.route.result == 'success' && needs.route.outputs.action != 'skip'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      pull-requests: write
+      issues: write
+      statuses: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ksprashu/pr-guardian
+          ref: ${{ inputs.guardian_ref }}
+          path: .prg
+          persist-credentials: false
+      - name: Post pr-guardian/verdict
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ needs.route.outputs.pr }}
+          SHA: ${{ needs.scan.outputs.head_sha }}
+          ESCALATE: ${{ needs.route.outputs.escalate }}
+          REASON: ${{ needs.route.outputs.reason }}
+          RESULT: ${{ needs.route.outputs.action == 'review' && needs.publish.result || 'skipped' }}
+          CLEAR: ${{ needs.route.outputs.reason == 'pull_request.synchronize' }}
+        run: |
+          python3 .prg/scripts/verdict.py --repo "$GITHUB_REPOSITORY" --pr "$PR" --sha "$SHA" \
+            --escalate "$ESCALATE" --reason "$REASON" --review-result "$RESULT" --clear-override "$CLEAR"

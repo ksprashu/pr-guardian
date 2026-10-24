@@ -1,0 +1,52 @@
+# Reconciles every owned repo to the PR-only baseline. See scripts/governor.py.
+name: governor
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Report drift without changing anything
+        type: boolean
+        default: true
+      repos:
+        description: Comma-separated repo names (blank = all owned)
+        type: string
+        default: ""
+      batch:
+        description: Max repos this run (0 = all)
+        type: number
+        default: 0
+      offset:
+        description: Skip this many repos (sorted by name)
+        type: number
+        default: 0
+permissions: {}
+concurrency:
+  group: governor
+  cancel-in-progress: false
+jobs:
+  reconcile:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Reconcile
+        env:
+          GH_TOKEN: ${{ secrets.GOVERNOR_TOKEN }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          PRG_OWNER: ${{ github.repository_owner }}
+          PRG_REF: ${{ vars.PRG_REF || 'v1' }}
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
+          REPOS: ${{ inputs.repos }}
+          BATCH: ${{ inputs.batch || 0 }}
+          OFFSET: ${{ inputs.offset || 0 }}
+        run: |
+          args=(--report-issue --batch "$BATCH" --offset "$OFFSET")
+          [ "$DRY_RUN" = "true" ] && args+=(--dry-run)
+          [ -n "$REPOS" ] && args+=(--repos "$REPOS")
+          python3 scripts/governor.py "${args[@]}"
