@@ -14,9 +14,9 @@ on:
         type: string
         required: true
       model:
-        description: agy --model slug (gemini-launch-candidate-high = Gemini 4 Argon, High)
+        description: agy --model slug (gemini-4-argon-high = Gemini 4 Argon, High)
         type: string
-        default: gemini-launch-candidate-high
+        default: gemini-4-argon-high
     secrets:
       GEMINI_API_KEY:
         required: false
@@ -178,6 +178,7 @@ jobs:
           PRG_MODEL: ${{ inputs.model }}
         run: |
           test -n "$GEMINI_API_KEY" || { echo "::error::GEMINI_API_KEY secret is not set on this repo"; exit 1; }
+          agy models || echo "::warning::agy models failed"
           python3 .prg/scripts/run_model.py --context "$RUNNER_TEMP/context.md" \
             --triage "$RUNNER_TEMP/triage.json" \
             --findings-lib .forge/skills/review/scripts/findings.py \

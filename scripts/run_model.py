@@ -25,7 +25,7 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parent.parent
 TIMEOUT_S = 40 * 60
-DEFAULT_MODEL = "gemini-launch-candidate-high"  # agy's slug for Gemini 4 Argon (High)
+DEFAULT_MODEL = "gemini-4-argon-high"  # agy's slug for Gemini 4 Argon (High)
 
 
 def load_findings_lib(path: str):
@@ -63,7 +63,10 @@ def run_agy(prompt: str, schema: str, model: str, workdir: str, extra_dir: str) 
     except json.JSONDecodeError:
         raise RuntimeError(f"agy exited {proc.returncode}: {proc.stderr.strip()[-1500:]}") from None
     if proc.returncode != 0 or result.get("status") != "SUCCESS":
-        raise RuntimeError(f"agy {result.get('status')}: {str(result.get('error'))[:1500]}")
+        # agy prints a structured AGY_ERROR {...} line on stderr; it carries the real cause.
+        detail = [ln for ln in proc.stderr.splitlines() if ln.startswith("AGY_ERROR")]
+        raise RuntimeError(f"agy {result.get('status')} (exit {proc.returncode}): "
+                           f"{str(result.get('error'))[:1000]} {' '.join(detail)[:1000]}".rstrip())
     return result
 
 
