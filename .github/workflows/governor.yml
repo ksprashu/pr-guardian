@@ -31,6 +31,7 @@ jobs:
     timeout-minutes: 60
     permissions:
       contents: read
+      issues: write # drift report, written with the workflow token
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -38,6 +39,7 @@ jobs:
       - name: Reconcile
         env:
           GH_TOKEN: ${{ secrets.GOVERNOR_TOKEN }}
+          REPORT_TOKEN: ${{ github.token }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           PRG_OWNER: ${{ github.repository_owner }}
           PRG_REF: ${{ vars.PRG_REF || 'v1' }}

@@ -57,3 +57,33 @@ class ReconcileSettingsTest(unittest.TestCase):
         with mock.patch.object(g.gh, "api", side_effect=lambda path, *a, **k: full if path == "repos/o/r" else []):
             out = g.reconcile(listed, "v1", dry=True, have_key=False)
         self.assertFalse([d for d in out["drift"] if d.startswith("setting ")], out["drift"])
+
+
+class DriftReportTest(unittest.TestCase):
+    """The report is written with REPORT_TOKEN (the workflow token), not the governor PAT."""
+
+    def run_main(self, issues):
+        calls = []
+
+        def api(path, method="GET", body=None, paginate=False, token=None):
+            calls.append((path, method, token))
+            return issues if path.startswith("repos/o/pr-guardian/issues?") else None
+
+        env = {"PRG_OWNER": "o", "REPORT_TOKEN": "wf-token", "GEMINI_API_KEY": ""}
+        with mock.patch.dict(g.os.environ, env), mock.patch.object(g.gh, "api", side_effect=api), \
+                mock.patch.object(g, "list_repos", return_value=[]), \
+                mock.patch.object(g.sys, "argv", ["governor.py", "--dry-run", "--report-issue"]), \
+                mock.patch("builtins.print"):
+            g.main()
+        return [c for c in calls if c[0].startswith("repos/o/pr-guardian/issues")]
+
+    def test_updates_trusted_report_with_workflow_token(self):
+        issues = [{"number": 9, "title": "Governor drift report", "user": {"login": "mallory"}},
+                  {"number": 1, "title": "Governor drift report", "user": {"login": "o"}}]
+        calls = self.run_main(issues)
+        self.assertEqual(calls[-1], ("repos/o/pr-guardian/issues/1", "PATCH", "wf-token"))
+        self.assertTrue(all(token == "wf-token" for _, _, token in calls))
+
+    def test_creates_report_when_only_untrusted_match(self):
+        issues = [{"number": 9, "title": "Governor drift report", "user": {"login": "mallory"}}]
+        self.assertEqual(self.run_main(issues)[-1], ("repos/o/pr-guardian/issues", "POST", "wf-token"))
