@@ -245,17 +245,26 @@ REPLY = ("mutation($id:ID!,$body:String!){addPullRequestReviewThreadReply("
          "input:{pullRequestReviewThreadId:$id, body:$body}){comment{id}}}")
 
 
+def toggle(mutation: str, thread: str) -> None:
+    # Thread state is advisory: the verdict counts open findings, so a failed (un)resolve
+    # must not stop the summary and state from being written.
+    try:
+        gh.graphql(mutation, id=thread)
+    except gh.GhError as exc:
+        print(f"::warning::could not change thread {thread}: {exc}", file=sys.stderr)
+
+
 def execute(repo: str, pr: int, sha: str, doc: dict[str, Any], result: dict[str, Any],
             round_cost: float) -> None:
     a = result["actions"]
     for item in a["unresolve"]:
-        gh.graphql(UNRESOLVE, id=item["thread"])
+        toggle(UNRESOLVE, item["thread"])
         gh.graphql(REPLY, id=item["thread"], body=item["body"])
     for item in a["reply"]:
         gh.graphql(REPLY, id=item["thread"], body=item["body"])
     for item in a["resolve"]:
         gh.graphql(REPLY, id=item["thread"], body=item["body"])
-        gh.graphql(RESOLVE, id=item["thread"])
+        toggle(RESOLVE, item["thread"])
 
     if a["comments"]:
         comments = []

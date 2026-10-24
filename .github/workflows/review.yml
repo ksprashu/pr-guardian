@@ -28,7 +28,7 @@ permissions: {}
 env:
   # agent-skill-forge commit the review / security-review skills are loaded from.
   FORGE_REPO: ksprashu/agent-skill-forge
-  FORGE_REF: 175fdec352fad41359bc2afcffcb47101e9b5da8 # review-security-hardening (PR #9); repin to the merged main SHA
+  FORGE_REF: f8c0b1a401913136e5ce5747ad49ae7455e29617 # review-security-hardening (PR #9) after rebase; repin to the merged main SHA
 
 jobs:
   route:

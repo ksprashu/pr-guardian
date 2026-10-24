@@ -59,11 +59,18 @@ def extract(result: dict[str, Any]) -> Any:
         return json.loads(text[start:end + 1])  # JSON wrapped in prose
 
 
-def run_agy(prompt: str, schema: str, model: str, workdir: str, extra_dir: str) -> dict[str, Any]:
+FINALIZE = ("Your previous turn ended without a final answer. Do not investigate further and do not "
+            "call tools. Return the complete findings JSON document for the review you just did.")
+
+
+def run_agy(prompt: str, schema: str, model: str, workdir: str, extra_dir: str,
+            conversation: str | None = None) -> dict[str, Any]:
     # The Argon slugs carry their effort (-high/-medium/-low); agy rejects --effort with them.
     cmd = ["agy", "-p", prompt, "--add-dir", extra_dir, "--model", model,
            "--output-format", "json", "--json-schema", schema, "--sandbox", "--disable-slash-commands",
            "--print-timeout", f"{TIMEOUT_S - 60}s"]
+    if conversation:
+        cmd += ["--conversation", conversation]
     proc = subprocess.run(cmd, capture_output=True, text=True, shell=False, cwd=workdir,
                           timeout=TIMEOUT_S)
     try:
@@ -76,6 +83,17 @@ def run_agy(prompt: str, schema: str, model: str, workdir: str, extra_dir: str) 
         raise RuntimeError(f"agy {result.get('status')} (exit {proc.returncode}): "
                            f"{str(result.get('error'))[:1000]} {' '.join(detail)[:1000]}".rstrip())
     return result
+
+
+def is_empty(result: dict[str, Any]) -> bool:
+    return not isinstance(result.get("structured_output"), dict) and not (result.get("response") or "").strip()
+
+
+def record_raw(out: str, label: str, result: dict[str, Any]) -> None:
+    raw = {k: result.get(k) for k in ("status", "num_turns", "duration_seconds", "error", "usage")}
+    raw["response_head"] = (result.get("response") or "")[:4000]
+    raw["has_structured_output"] = isinstance(result.get("structured_output"), dict)
+    Path(out).with_name(f"agy-raw-{label}.json").write_text(json.dumps(raw, indent=1))
 
 
 def add_usage(total: dict[str, int], usage: dict[str, Any] | None) -> None:
@@ -122,10 +140,17 @@ def main() -> int:
             print(f"run_model: attempt {attempt}: {exc}", file=sys.stderr)
             continue
         add_usage(usage, result.get("usage"))
-        raw = {k: result.get(k) for k in ("status", "num_turns", "duration_seconds", "error")}
-        raw["response_head"] = (result.get("response") or "")[:4000]
-        raw["has_structured_output"] = isinstance(result.get("structured_output"), dict)
-        Path(args.out).with_name(f"agy-raw-{attempt}.json").write_text(json.dumps(raw, indent=1))
+        record_raw(args.out, str(attempt), result)
+        if is_empty(result) and result.get("conversation_id"):
+            # Seen in CI: status SUCCESS, thousands of output tokens, but no final message.
+            # Ask the same conversation for the answer instead of paying for a fresh review.
+            try:
+                result = run_agy(FINALIZE, str(schema), args.model, args.workdir,
+                                 str(Path(args.context).resolve().parent), result["conversation_id"])
+                add_usage(usage, result.get("usage"))
+                record_raw(args.out, f"{attempt}-finalize", result)
+            except (RuntimeError, json.JSONDecodeError, subprocess.TimeoutExpired) as exc:
+                print(f"run_model: attempt {attempt}: finalize failed: {exc}", file=sys.stderr)
         try:
             doc = extract(result)
         except (json.JSONDecodeError, TypeError, ValueError) as exc:
