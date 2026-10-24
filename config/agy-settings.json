@@ -1,4 +1,5 @@
 {
+  "modelProvider": "gemini",
   "allowNonWorkspaceAccess": false,
   "enableTerminalSandbox": true,
   "permissions": {
