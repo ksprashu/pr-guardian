@@ -46,9 +46,17 @@ def extract(result: dict[str, Any]) -> Any:
     if isinstance(result.get("structured_output"), dict):
         return result["structured_output"]
     text = (result.get("response") or "").strip()
+    if not text:
+        raise ValueError("empty response and no structured_output (the turn ended without a final answer)")
     if text.startswith("```"):
         text = text.split("\n", 1)[-1].rsplit("```", 1)[0]
-    return json.loads(text)
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        start, end = text.find("{"), text.rfind("}")
+        if start == -1 or end <= start:
+            raise
+        return json.loads(text[start:end + 1])  # JSON wrapped in prose
 
 
 def run_agy(prompt: str, schema: str, model: str, workdir: str, extra_dir: str) -> dict[str, Any]:
@@ -114,10 +122,16 @@ def main() -> int:
             print(f"run_model: attempt {attempt}: {exc}", file=sys.stderr)
             continue
         add_usage(usage, result.get("usage"))
+        raw = {k: result.get(k) for k in ("status", "num_turns", "duration_seconds", "error")}
+        raw["response_head"] = (result.get("response") or "")[:4000]
+        raw["has_structured_output"] = isinstance(result.get("structured_output"), dict)
+        Path(args.out).with_name(f"agy-raw-{attempt}.json").write_text(json.dumps(raw, indent=1))
         try:
             doc = extract(result)
-        except (json.JSONDecodeError, TypeError) as exc:
-            errors = [f"output is not JSON: {exc}"]
+        except (json.JSONDecodeError, TypeError, ValueError) as exc:
+            errors = [f"output is not a JSON document: {exc}. End your final turn with only the "
+                      "complete findings JSON object, no prose and no tool calls"]
+            print(f"run_model: attempt {attempt}: {exc}", file=sys.stderr)
             continue
         errors = lib.validate(doc)
         if not errors:
