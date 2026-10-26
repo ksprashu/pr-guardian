@@ -245,7 +245,13 @@ jobs:
           SHA: ${{ needs.scan.outputs.head_sha }}
           ESCALATE: ${{ needs.route.outputs.escalate }}
           REASON: ${{ needs.route.outputs.reason }}
-          RESULT: ${{ needs.route.outputs.action == 'review' && needs.publish.result || 'skipped' }}
+          # First non-success of scan -> review -> publish, so a failed review reads as an error,
+          # not as "no review yet" (publish is skipped when review fails).
+          RESULT: >-
+            ${{ needs.route.outputs.action != 'review' && 'skipped'
+            || needs.scan.result != 'success' && needs.scan.result
+            || needs.review.result != 'success' && needs.review.result
+            || needs.publish.result }}
           CLEAR: ${{ needs.route.outputs.reason == 'pull_request.synchronize' }}
         run: |
           python3 .prg/scripts/verdict.py --repo "$GITHUB_REPOSITORY" --pr "$PR" --sha "$SHA" \

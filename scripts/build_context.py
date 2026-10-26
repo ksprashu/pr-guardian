@@ -26,8 +26,10 @@ import gh
 import state as st
 import threads as th
 
-DIFF_BUDGET = 400_000      # characters of diff before per-file truncation
-PER_FILE_BUDGET = 40_000
+# agy resends the context on every turn, so a large diff multiplies into the per-minute
+# token quota (Gemini 429 RESOURCE_EXHAUSTED). Past the budget the model reads files itself.
+DIFF_BUDGET = 160_000      # characters of diff before per-file truncation, and the hard total
+PER_FILE_BUDGET = 16_000
 LEADS_BUDGET = 150
 
 DOC_SUFFIXES = (".md", ".mdx", ".rst", ".txt", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp")
@@ -65,11 +67,17 @@ def render_diff(diff: str) -> tuple[str, list[str]]:
     if len(diff) <= DIFF_BUDGET:
         return diff, []
     out, truncated = [], []
+    size = 0
     for path, chunk in _split_diff(diff):
+        if size >= DIFF_BUDGET:
+            truncated.append(path)
+            out.append(f"diff --git a/{path} b/{path}\n… [diff omitted: over the context budget; read the file]\n")
+            continue
         if len(chunk) > PER_FILE_BUDGET:
             truncated.append(path)
             chunk = chunk[:PER_FILE_BUDGET] + f"\n… [diff for {path} truncated; read the file]\n"
         out.append(chunk)
+        size += len(chunk)
     return "".join(out), truncated
 
 

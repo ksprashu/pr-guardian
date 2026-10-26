@@ -58,6 +58,13 @@ class DiffTest(unittest.TestCase):
         self.assertIn("truncated", out)
         self.assertLess(len(out), bc.PER_FILE_BUDGET + 200)
 
+    def test_total_is_capped_across_many_files(self):
+        many = "".join(f"diff --git a/f{i}.py b/f{i}.py\n" + "+x\n" * 3_000 for i in range(200))
+        out, truncated = bc.render_diff(many)
+        self.assertLess(len(out), bc.DIFF_BUDGET + bc.PER_FILE_BUDGET + 200 * 120)
+        self.assertIn("f199.py", truncated)
+        self.assertNotIn("f0.py", truncated)
+
 
 if __name__ == "__main__":
     unittest.main()

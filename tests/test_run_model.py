@@ -54,3 +54,11 @@ class FinalizeTest(unittest.TestCase):
             code, calls = self.run_main([{"status": "SUCCESS", "structured_output": {"findings": []},
                                           "conversation_id": "c1"}], tmp)
         self.assertEqual((code, calls), (0, [None]))
+
+
+class RateLimitTest(unittest.TestCase):
+    def test_quota_exhaustion_waits_but_spending_cap_does_not(self):
+        self.assertTrue(rm.is_rate_limited("Error 429, Message: Resource has been exhausted, Status: RESOURCE_EXHAUSTED"))
+        self.assertFalse(rm.is_rate_limited(
+            "Error 429, Message: Your billing account has exceeded its monthly spending cap, Status: RESOURCE_EXHAUSTED"))
+        self.assertFalse(rm.is_rate_limited("agy ERROR (exit 3): authentication failed"))
