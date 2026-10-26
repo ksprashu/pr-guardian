@@ -20,12 +20,14 @@ import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
 ROOT = Path(__file__).resolve().parent.parent
 TIMEOUT_S = 40 * 60
 DEFAULT_MODEL = "gemini-4-argon-high"  # agy's slug for Gemini 4 Argon (High)
+RATE_LIMIT_WAIT_S = 120
 
 
 def load_findings_lib(path: str):
@@ -85,6 +87,11 @@ def run_agy(prompt: str, schema: str, model: str, workdir: str, extra_dir: str,
     return result
 
 
+def is_rate_limited(error: str) -> bool:
+    # A spending cap is also a 429 but does not refill within minutes, so do not wait on it.
+    return "RESOURCE_EXHAUSTED" in error and "spending cap" not in error
+
+
 def is_empty(result: dict[str, Any]) -> bool:
     return not isinstance(result.get("structured_output"), dict) and not (result.get("response") or "").strip()
 
@@ -138,6 +145,10 @@ def main() -> int:
         except (RuntimeError, json.JSONDecodeError, subprocess.TimeoutExpired) as exc:
             errors = [f"run failed: {exc}"]
             print(f"run_model: attempt {attempt}: {exc}", file=sys.stderr)
+            if attempt == 1 and is_rate_limited(str(exc)):
+                # Per-minute quotas (RESOURCE_EXHAUSTED) refill; an immediate retry just fails again.
+                print(f"run_model: rate limited; waiting {RATE_LIMIT_WAIT_S}s", file=sys.stderr)
+                time.sleep(RATE_LIMIT_WAIT_S)
             continue
         add_usage(usage, result.get("usage"))
         record_raw(args.out, str(attempt), result)
