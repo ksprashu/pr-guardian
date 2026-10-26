@@ -87,3 +87,22 @@ class DriftReportTest(unittest.TestCase):
     def test_creates_report_when_only_untrusted_match(self):
         issues = [{"number": 9, "title": "Governor drift report", "user": {"login": "mallory"}}]
         self.assertEqual(self.run_main(issues)[-1], ("repos/o/pr-guardian/issues", "POST", "wf-token"))
+
+
+class GitlessRepoTest(unittest.TestCase):
+    """A repo with a size but no branches (yo-angular-express-seed) waits like an empty repo."""
+
+    def test_size_without_branch_is_empty(self):
+        repo = {"full_name": "o/r", "default_branch": "master", "size": 56}
+
+        def api(path, *a, **k):
+            if path == "repos/o/r":
+                return dict(repo, **g.SETTINGS)
+            if path == "repos/o/r/branches/master":
+                raise g.gh.GhError("gh api repos/o/r/branches/master… failed: Git Repository is empty. (HTTP 409)")
+            return []
+
+        with mock.patch.object(g.gh, "api", side_effect=api):
+            out = g.reconcile(repo, "v1", dry=True, have_key=False)
+        self.assertIn("empty repo: caller and ruleset wait for the first commit", out["drift"])
+        self.assertFalse(out["errors"][1:], out["errors"])
