@@ -135,6 +135,19 @@ def find_ruleset(full: str) -> dict[str, Any] | None:
     return None
 
 
+def has_branch(full: str, branch: str) -> bool:
+    # size counts uploaded objects, so a repo with no refs can still report a size.
+    if not branch:
+        return False
+    try:
+        gh.api(f"repos/{full}/branches/{branch}")
+        return True
+    except gh.GhError as exc:
+        if "404" in str(exc) or "409" in str(exc):
+            return False
+        raise
+
+
 def has_secret(full: str) -> bool:
     names = json.loads(gh._run(["secret", "list", "-R", full, "--json", "name"]))
     return any(n["name"] == SECRET for n in names)
@@ -199,7 +212,7 @@ def reconcile(repo: dict[str, Any], ref: str, dry: bool, have_key: bool) -> dict
     else:
         out["errors"].append(f"{SECRET} not in governor env; secret step skipped")
 
-    empty = repo.get("size", 0) == 0
+    empty = repo.get("size", 0) == 0 or not has_branch(full, default)
     if empty or not default:
         out["drift"].append("empty repo: caller and ruleset wait for the first commit")
         return out
