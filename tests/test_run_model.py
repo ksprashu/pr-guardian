@@ -62,3 +62,68 @@ class RateLimitTest(unittest.TestCase):
         self.assertFalse(rm.is_rate_limited(
             "Error 429, Message: Your billing account has exceeded its monthly spending cap, Status: RESOURCE_EXHAUSTED"))
         self.assertFalse(rm.is_rate_limited("agy ERROR (exit 3): authentication failed"))
+
+
+class ClaudeFallbackTest(unittest.TestCase):
+    """A Gemini rate limit hands the retry to Claude Code when ANTHROPIC_API_KEY is set."""
+
+    def run_main(self, tmp, env):
+        import json
+        from pathlib import Path
+        from unittest import mock
+        quota = RuntimeError("agy ERROR (exit 3): Error 429, Status: RESOURCE_EXHAUSTED")
+        claude = {"status": "SUCCESS", "structured_output": {"findings": []},
+                  "usage": {"input_tokens": 10, "output_tokens": 5}, "cost_usd": 0.42}
+        lib = mock.Mock(build_schema=lambda: {}, validate=lambda doc: [])
+        Path(tmp, "ctx.md").write_text("x")
+        Path(tmp, "triage.json").write_text("{}")
+        argv = ["run_model.py", "--context", f"{tmp}/ctx.md", "--triage", f"{tmp}/triage.json",
+                "--findings-lib", "unused", "--out", f"{tmp}/f.json", "--usage-out", f"{tmp}/u.json"]
+        with mock.patch.dict(rm.os.environ, env, clear=True), \
+                mock.patch.object(rm, "run_agy", side_effect=[quota, quota]) as agy, \
+                mock.patch.object(rm, "run_claude", return_value=claude) as cc, \
+                mock.patch.object(rm.time, "sleep") as sleep, \
+                mock.patch.object(rm, "load_findings_lib", return_value=lib), \
+                mock.patch.object(rm.sys, "argv", argv), mock.patch("builtins.print"):
+            code = rm.main()
+        return code, agy.call_count, cc.call_count, sleep.call_count, json.loads(Path(tmp, "u.json").read_text())
+
+    def test_rate_limit_falls_back_to_claude_with_key(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            code, agy, cc, slept, usage = self.run_main(tmp, {"ANTHROPIC_API_KEY": "k"})
+        self.assertEqual((code, agy, cc, slept), (0, 1, 1, 0))
+        self.assertEqual((usage["engine"], usage["cost_usd"]), ("claude", 0.42))
+
+    def test_rate_limit_without_key_waits_and_retries_gemini(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            code, agy, cc, slept, usage = self.run_main(tmp, {})
+        self.assertEqual((code, agy, cc, slept), (1, 2, 0, 1))
+        self.assertEqual(usage["engine"], "agy")
+
+    def test_claude_result_is_normalised_to_agy_shape(self):
+        import json
+        from unittest import mock
+        raw = {"is_error": False, "result": "{}", "structured_output": {"findings": []}, "num_turns": 3,
+               "duration_ms": 2000, "total_cost_usd": 0.5,
+               "usage": {"input_tokens": 2, "cache_read_input_tokens": 100, "cache_creation_input_tokens": 50,
+                         "output_tokens": 7}}
+        proc = mock.Mock(returncode=0, stdout=json.dumps(raw), stderr="")
+        with mock.patch.object(rm.subprocess, "run", return_value=proc) as run, \
+                mock.patch.object(rm.Path, "read_text", return_value="{}"):
+            out = rm.run_claude("p", "s.json", "claude-opus-5-5", ".", "/ctx")
+        cmd = run.call_args.args[0]
+        self.assertNotIn("Bash", cmd[cmd.index("--allowedTools"):cmd.index("--disallowedTools")])
+        self.assertEqual(out["status"], "SUCCESS")
+        self.assertEqual(out["usage"], {"input_tokens": 152, "output_tokens": 7})
+        self.assertEqual(out["cost_usd"], 0.5)
+
+    def test_claude_error_raises(self):
+        import json
+        from unittest import mock
+        proc = mock.Mock(returncode=0, stdout=json.dumps({"is_error": True, "result": "overloaded"}), stderr="")
+        with mock.patch.object(rm.subprocess, "run", return_value=proc), \
+                mock.patch.object(rm.Path, "read_text", return_value="{}"):
+            with self.assertRaisesRegex(RuntimeError, "overloaded"):
+                rm.run_claude("p", "s.json", "claude-opus-5-5", ".", "/ctx")
