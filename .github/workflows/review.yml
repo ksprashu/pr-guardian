@@ -22,6 +22,9 @@ on:
     secrets:
       GEMINI_API_KEY:
         required: false
+      ANTHROPIC_API_KEY:
+        description: optional; Claude Code reviews when Gemini is rate limited
+        required: false
 
 permissions: {}
 
@@ -163,11 +166,24 @@ jobs:
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           mkdir -p ~/.gemini/antigravity-cli ~/.gemini/config/skills
           cp .prg/config/agy-settings.json ~/.gemini/antigravity-cli/settings.json
-          for s in review security-review; do cp -R ".forge/skills/$s" ~/.gemini/config/skills/; done
+          mkdir -p ~/.claude/skills
+          for s in review security-review; do
+            cp -R ".forge/skills/$s" ~/.gemini/config/skills/
+            cp -R ".forge/skills/$s" ~/.claude/skills/
+          done
           "$HOME/.local/bin/agy" --version || true
-      - name: Review (Gemini via Antigravity CLI)
+      - name: Install Claude Code (rate-limit fallback)
+        # npm ci checks every package against the committed lockfile hashes; the package's own
+        # installer then links the platform binary that the lockfile already verified.
+        run: |
+          npm ci --ignore-scripts --no-audit --no-fund --prefix .prg/config/claude-code
+          node .prg/config/claude-code/node_modules/@anthropic-ai/claude-code/install.cjs
+          echo "$GITHUB_WORKSPACE/.prg/config/claude-code/node_modules/.bin" >> "$GITHUB_PATH"
+      - name: Review (Gemini via Antigravity CLI; Claude Code if rate limited)
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
           PRG_MODEL: ${{ inputs.model }}
         run: |
           test -n "$GEMINI_API_KEY" || { echo "::error::GEMINI_API_KEY secret is not set on this repo"; exit 1; }

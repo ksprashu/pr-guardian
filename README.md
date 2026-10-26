@@ -1,6 +1,6 @@
 # pr-guardian
 
-pr-guardian reviews every pull request automatically and gates the merge on the result. It runs as one reusable GitHub Actions workflow. The Antigravity CLI (`agy`) drives Gemini 4 Argon through the `review` and `security-review` skills from [agent-skill-forge](https://github.com/ksprashu/agent-skill-forge). A pinned set of scanners runs first and feeds the model leads.
+pr-guardian reviews every pull request automatically and gates the merge on the result. It runs as one reusable GitHub Actions workflow. The Antigravity CLI (`agy`) drives Gemini 4 Argon through the `review` and `security-review` skills from [agent-skill-forge](https://github.com/ksprashu/agent-skill-forge). A pinned set of scanners runs first and feeds the model leads. If Gemini is rate limited and the repo has an `ANTHROPIC_API_KEY` secret, Claude Opus 5.5 does that round's review through Claude Code, using the same skills, prompt and findings schema. Without the key, pr-guardian waits two minutes and retries Gemini.
 
 A PR merges only when all of these hold:
 
@@ -34,11 +34,12 @@ A PR merges only when all of these hold:
 
 ## Security model
 
-- The model job has a read-only token. `GEMINI_API_KEY` is set only on the agy step, and agy runs `--sandbox` with a read-only command allowlist (`config/agy-settings.json`).
+- The model job has a read-only token. `GEMINI_API_KEY` and `ANTHROPIC_API_KEY` are set only on the review step. agy runs `--sandbox` with a read-only command allowlist (`config/agy-settings.json`). The Claude Code fallback may only use Read, Grep, Glob and Skill. Bash, edits and web access are denied.
 - `publish` and `verdict` never run the model. They validate its output against the forge's findings schema, strip HTML comments so the model cannot forge markers, and defuse @-mentions.
 - PRs from forks are never reviewed automatically, because secrets are not available to them. The owner reviews them and applies `human-override`. No workflow uses `pull_request_target`.
 - Scanner and findings SARIF is kept as a run artifact, not uploaded to code scanning. Code-scanning alerts open their own PR threads, which the bot cannot resolve, and required conversation resolution would block on them.
 - Every action is pinned by SHA, and every scanner binary is checked against its release SHA-256 (`scripts/install_scanners.sh`).
+- Claude Code installs with `npm ci` from `config/claude-code/package-lock.json`, so its packages are checked against the lockfile hashes.
 - Known gap: agy installs through its official bootstrapper and updates itself, so it is not pinned.
 
 ## Governor

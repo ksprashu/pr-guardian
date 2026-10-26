@@ -111,6 +111,16 @@ class CostAndSummaryTest(unittest.TestCase):
         self.assertEqual(pub.cost(u, dt.date(2026, 12, 1)), 6.0)
         self.assertEqual(pub.cost(None), 0.0)
 
+    def test_claude_round_uses_reported_cost_and_says_so(self):
+        cost, note = pub.round_cost_of({"engine": "claude", "cost_usd": 1.23, "usage": {"input_tokens": 9}})
+        self.assertEqual(cost, 1.23)
+        self.assertIn("Claude", note)
+        u = {"input_tokens": 1_000_000}
+        self.assertEqual(pub.round_cost_of({"usage": u}), (pub.cost(u), ""))
+        r = pub.plan(doc(), st.empty_state(), [], DIFF)
+        self.assertIn("Claude Opus 5.5 reviewed", pub.summary_body(doc(), r, 1.23, note))
+        self.assertFalse(r["actions"]["signals"])
+
     def test_summary_has_markers_and_state(self):
         r = pub.plan(doc(finding("R-001"), finding("R-002", severity="nit")), st.empty_state(), [], DIFF)
         r["state"]["cost_usd"] = [0.5]
