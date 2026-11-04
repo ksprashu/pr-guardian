@@ -1,9 +1,14 @@
 import datetime as dt
+import os
+import tempfile
 import unittest
+from unittest import mock
 
 from tests.helpers import DIFF, doc, finding, thread
+import gh
 import publish_review as pub
 import state as st
+import threads as th
 
 
 def prior(*findings, **kw):
@@ -36,7 +41,7 @@ class SanitiseTest(unittest.TestCase):
 
     def test_finding_body_marker_first(self):
         body = pub.finding_body(finding(suggestion="safe()"), True)
-        self.assertTrue(body.startswith("<!-- pr-guardian:finding id=R-001 severity=P1 -->"))
+        self.assertTrue(body.startswith("<!-- pr-guardian:finding id=R-001 severity=P1 key=R-001 -->"))
         self.assertIn("```suggestion\nsafe()\n```", body)
         self.assertNotIn("suggestion", pub.finding_body(finding(suggestion="safe()"), False).split("<sub>")[0])
 
@@ -102,6 +107,159 @@ class PlanTest(unittest.TestCase):
     def test_escalation_is_per_round(self):
         p = prior(escalated=True)
         self.assertFalse(pub.plan(doc(), p, [], DIFF)["state"]["escalated"])
+
+
+def next_round(result):
+    """What the next round's build_context hands publish as prior state."""
+    return st.decode(st.encode(result["state"]))
+
+
+class DriftTest(unittest.TestCase):
+    """Ids are renumbered every round; prior_id only points one round back (#15)."""
+
+    def test_three_round_drift_resolves_the_original_thread(self):
+        t = [thread("R-001")]
+        r1 = pub.plan(doc(finding("R-001")), st.empty_state(), [], DIFF)
+        self.assertEqual(r1["state"]["findings"][0]["thread_key"], "R-001")
+        r2 = pub.plan(doc(finding("R-005", status="still_open", prior_id="R-001")), next_round(r1), t, DIFF)
+        self.assertEqual(r2["actions"]["comments"], [])
+        self.assertEqual(r2["state"]["findings"][0]["thread_key"], "R-001")
+        r3 = pub.plan(doc(finding("R-003", status="fixed", prior_id="R-005")), next_round(r2), t, DIFF)
+        self.assertEqual([x["thread"] for x in r3["actions"]["resolve"]], ["T-R-001"])
+        self.assertIn("status=fixed", r3["actions"]["resolve"][0]["body"])
+        self.assertIn("id=R-001", r3["actions"]["resolve"][0]["body"])
+        self.assertEqual(r3["actions"]["unmatched"], [])
+
+    def test_drift_does_not_open_a_duplicate_thread(self):
+        t = [thread("S-001", rule="CWE-78")]
+        r1 = pub.plan(doc(finding("S-001", rule="CWE-78")), st.empty_state(), [], DIFF)
+        r2 = pub.plan(doc(finding("S-002", status="still_open", prior_id="S-001", rule="CWE-78")),
+                      next_round(r1), t, DIFF)
+        r3 = pub.plan(doc(finding("S-003", status="still_open", prior_id="S-002", rule="CWE-78")),
+                      next_round(r2), t, DIFF)
+        self.assertEqual(r3["actions"]["comments"], [])
+        self.assertEqual(r3["actions"]["outside"], [])
+
+    def test_reopen_count_survives_drift(self):
+        t = [thread("R-001", resolved=True)]
+        p = prior(finding("R-001", thread_key="R-001"))
+        for n, new_id in enumerate(["R-004", "R-007", "R-002"], start=1):
+            prev = p["findings"][0]["id"]
+            r = pub.plan(doc(finding(new_id, status="reopened", prior_id=prev)), p, t, DIFF)
+            self.assertEqual(r["state"]["reopen_counts"]["R-001"], n)
+            p = next_round(r)
+        self.assertTrue(r["state"]["escalated"])
+
+    def test_new_thread_marker_carries_the_key(self):
+        # Outside the diff in round 1 (no thread), inside it in round 2: the marker keeps the key.
+        r1 = pub.plan(doc(finding("R-002", start=40, end=41)), st.empty_state(), [], DIFF)
+        r2 = pub.plan(doc(finding("R-009", status="still_open", prior_id="R-002")), next_round(r1), [], DIFF)
+        body = pub.finding_body(r2["actions"]["comments"][0], True)
+        self.assertIn("id=R-009 severity=P1 key=R-002", body)
+        r3 = pub.plan(doc(finding("R-004", status="fixed", prior_id="R-009")), next_round(r2),
+                      [thread("R-009", key="R-002")], DIFF)
+        self.assertEqual([x["thread"] for x in r3["actions"]["resolve"]], ["T-R-009"])
+
+    def test_legacy_state_uses_the_prior_id_chain(self):
+        # State written before thread_key existed: findings only carry one prior_id hop.
+        p = prior(finding("R-005", status="still_open", prior_id="R-001"))
+        r = pub.plan(doc(finding("R-003", status="fixed", prior_id="R-005")), p, [thread("R-001")], DIFF)
+        self.assertEqual([x["thread"] for x in r["actions"]["resolve"]], ["T-R-001"])
+
+    def test_file_rule_line_fallback(self):
+        # Chain lost entirely (state from a round that never saw R-001): match on file + rule + line.
+        p = prior(finding("R-008", status="still_open", prior_id="R-006", start=5, end=5))
+        t = [thread("R-001", line=4), thread("R-002", line=4, rule="CWE-79"), thread("R-003", path="b.py")]
+        r = pub.plan(doc(finding("R-010", status="fixed", prior_id="R-008", start=6, end=6)), p, t, DIFF)
+        self.assertEqual([x["thread"] for x in r["actions"]["resolve"]], ["T-R-001"])
+        self.assertEqual(r["state"]["findings"][0]["thread_key"], "R-001")
+
+    def test_fallback_skips_far_lines_and_new_findings(self):
+        p = prior(finding("R-008", prior_id="R-006"))
+        far = [thread("R-001", line=300)]
+        r = pub.plan(doc(finding("R-010", status="fixed", prior_id="R-008")), p, far, DIFF)
+        self.assertEqual(r["actions"]["resolve"], [])
+        r = pub.plan(doc(finding("R-011")), st.empty_state(), [thread("R-001")], DIFF)
+        self.assertEqual(len(r["actions"]["comments"]), 1)  # "new" never borrows a thread
+
+    def test_a_thread_is_claimed_once(self):
+        p = prior(finding("R-001", thread_key="R-001"))
+        d = doc(finding("R-002", status="fixed", prior_id="R-001"),
+                finding("R-003", status="fixed", prior_id="R-001"))
+        r = pub.plan(d, p, [thread("R-001")], DIFF)
+        self.assertEqual(len(r["actions"]["resolve"]), 1)
+
+    def test_human_threads_and_markers_are_ignored(self):
+        forged = thread("R-001", opener="mallory")
+        self.assertEqual(th.by_finding([forged]), {})
+        p = prior(finding("R-001", thread_key="R-001"))
+        r = pub.plan(doc(finding("R-002", status="fixed", prior_id="R-001")), p, [forged], DIFF)
+        self.assertEqual(r["actions"]["resolve"], [])
+
+    def test_model_cannot_set_thread_key(self):
+        d = doc(finding("R-001", thread_key="R-999", posted="summary"))
+        r = pub.plan(d, st.empty_state(), [], DIFF)
+        self.assertEqual(r["state"]["findings"][0]["thread_key"], "R-001")
+        self.assertEqual(r["state"]["findings"][0]["posted"], "thread")
+
+
+class ThreadErrorTest(unittest.TestCase):
+    """Unmatched findings and failed (un)resolves are reported, not swallowed (#16)."""
+
+    def test_fixed_finding_without_thread_is_unmatched(self):
+        p = prior(finding("R-001", thread_key="R-001", posted="thread"))
+        r = pub.plan(doc(finding("R-002", status="fixed", prior_id="R-001")), p, [], DIFF)
+        self.assertEqual(r["actions"]["unmatched"][0]["finding"], "R-002")
+        self.assertIn("no thread for R-001", "\n".join(pub.manual_actions(r)))
+
+    def test_summary_only_finding_is_not_unmatched(self):
+        p = prior(finding("R-001", thread_key="R-001", posted="summary"))
+        r = pub.plan(doc(finding("R-002", status="fixed", prior_id="R-001")), p, [], DIFF)
+        self.assertEqual(r["actions"]["unmatched"], [])
+
+    def _run(self, fail=False):
+        p = prior(finding("R-001", thread_key="R-001", posted="thread"))
+        d = doc(finding("R-002", status="fixed", prior_id="R-001"))
+        r = pub.plan(d, p, [thread("R-001")], DIFF)
+        calls = []
+
+        def graphql(query, **v):
+            calls.append(query)
+            if query is pub.RESOLVE:
+                raise gh.GhError("graphql: Resource not accessible by integration")
+            return {}
+
+        posted = {}
+
+        def api(path, method="GET", body=None, paginate=False):
+            if method in ("POST", "PATCH"):
+                posted["body"] = body["body"]
+            return []
+
+        with tempfile.NamedTemporaryFile("r", suffix=".md") as summary, \
+                mock.patch.object(gh, "graphql", graphql), mock.patch.object(gh, "api", api), \
+                mock.patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": summary.name}), \
+                mock.patch("sys.stderr") as err:
+            pub.execute("o/r", 1, "sha", d, r, 0.0)
+            pub.write_step_summary(r)
+            step = summary.read()
+        warnings = "".join(c.args[0] for c in err.write.call_args_list)
+        return r, calls, posted["body"], step, warnings
+
+    def test_failed_resolve_is_warned_and_listed(self):
+        r, calls, body, step, warnings = self._run()
+        self.assertEqual(calls, [pub.REPLY, pub.RESOLVE])  # the reply still lands
+        self.assertIn("::warning::could not resolve thread T-R-001", warnings)
+        self.assertIn("Threads needing manual action", body)
+        self.assertIn("(https://github.com/o/r/pull/1#discussion_R-001)", body)
+        self.assertIn("Resource not accessible by integration", step)
+        self.assertEqual(pub.exit_code(r, False), 0)
+        self.assertEqual(pub.exit_code(r, True), 1)
+
+    def test_clean_run_exits_zero_even_when_strict(self):
+        r = pub.plan(doc(finding("R-001")), st.empty_state(), [], DIFF)
+        self.assertEqual(pub.exit_code(r, True), 0)
+        self.assertNotIn("manual action", pub.summary_body(doc(), dict(r, thread_errors=[]), 0.0))
 
 
 class CostAndSummaryTest(unittest.TestCase):

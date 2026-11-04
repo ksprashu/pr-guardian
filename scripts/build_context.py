@@ -110,7 +110,8 @@ def render_prior(prior: dict[str, Any], threads: list[dict[str, Any]]) -> str:
     for f in prior["findings"]:
         if f.get("status") in ("fixed", "accepted_pushback"):
             continue
-        t = by_id.get(f["id"])
+        # Ids drift every round; the thread is filed under the key of the round that opened it.
+        t = next((by_id[k] for k in (f.get("thread_key"), f.get("prior_id"), f["id"]) if k and k in by_id), None)
         thread_state = "no thread"
         if t:
             thread_state = "RESOLVED by someone" if t["isResolved"] else "open"

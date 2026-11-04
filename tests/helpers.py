@@ -19,13 +19,15 @@ def doc(*findings):
             "inspected": [], "not_inspected": [], "findings": list(findings)}
 
 
-def thread(fid, tid=None, resolved=False, last_author="github-actions", severity="P1"):
-    nodes = [{"author": {"login": "github-actions"},
-              "body": f"<!-- pr-guardian:finding id={fid} severity={severity} -->\nbody"}]
+def thread(fid, tid=None, resolved=False, last_author="github-actions", severity="P1", key=None,
+           path="app.py", line=3, rule="CWE-89", opener="github-actions"):
+    marker = f"<!-- pr-guardian:finding id={fid} severity={severity}" + (f" key={key}" if key else "") + " -->"
+    nodes = [{"author": {"login": opener}, "url": f"https://github.com/o/r/pull/1#discussion_{fid}",
+              "body": f"{marker}\n**{severity} · security · {rule}** · title {fid}\n\nwhy"}]
     if last_author != "github-actions":
         nodes.append({"author": {"login": last_author}, "body": "/ai-review wontfix: because"})
     return {"id": tid or f"T-{fid}", "isResolved": resolved, "isOutdated": False,
-            "path": "app.py", "line": 3, "comments": {"nodes": nodes}}
+            "path": path, "line": line, "comments": {"nodes": nodes}}
 
 
 DIFF = """diff --git a/app.py b/app.py

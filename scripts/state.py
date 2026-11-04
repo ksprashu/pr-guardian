@@ -19,8 +19,12 @@ from typing import Any
 
 SUMMARY_MARKER = "<!-- pr-guardian:summary -->"
 _STATE_RE = re.compile(r"<!-- pr-guardian:state v1 ([A-Za-z0-9+/=]+) -->")
-FINDING_MARKER = "<!-- pr-guardian:finding id={id} severity={severity} -->"
-FINDING_RE = re.compile(r"<!-- pr-guardian:finding id=([A-Z][A-Z0-9]*-[0-9]{3,}) severity=(P[0-3]|nit) -->")
+# `key` is the finding's thread_key: the id of the finding that first opened the thread.
+# Ids are renumbered every round; the key is what stays the same. Markers written before
+# the key existed have no `key=` and their id is the key.
+FINDING_MARKER = "<!-- pr-guardian:finding id={id} severity={severity} key={key} -->"
+FINDING_RE = re.compile(r"<!-- pr-guardian:finding id=([A-Z][A-Z0-9]*-[0-9]{3,}) severity=(P[0-3]|nit)"
+                        r"(?: key=([A-Z][A-Z0-9]*-[0-9]{3,}))? -->")
 
 
 def empty_state() -> dict[str, Any]:

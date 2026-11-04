@@ -1,6 +1,6 @@
 import unittest
 
-from tests.helpers import finding
+from tests.helpers import finding, thread
 import build_context as bc
 import state as st
 
@@ -64,6 +64,16 @@ class DiffTest(unittest.TestCase):
         self.assertLess(len(out), bc.DIFF_BUDGET + bc.PER_FILE_BUDGET + 200 * 120)
         self.assertIn("f199.py", truncated)
         self.assertNotIn("f0.py", truncated)
+
+
+class RenderPriorDriftTest(unittest.TestCase):
+    def test_renumbered_finding_shows_its_original_thread(self):
+        prior = st.empty_state()
+        prior.update(round=2, findings=[finding("R-005", status="still_open", prior_id="R-001",
+                                                thread_key="R-001")])
+        out = bc.render_prior(prior, [thread("R-001", resolved=True, last_author="dev")])
+        self.assertIn("thread: RESOLVED by someone", out)
+        self.assertIn("/ai-review wontfix: because", out)
 
 
 if __name__ == "__main__":

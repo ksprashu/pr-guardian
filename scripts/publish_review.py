@@ -16,6 +16,11 @@ Thread policy:
   still_open / reopened, thread resolved   -> unresolve + reply why
   still_open, author replied since bot     -> reply with the counter-argument
   fixed / accepted_pushback      -> reply + resolve
+  fixed with no thread found     -> ::warning:: + "Threads needing manual action"
+  failed (un)resolve             -> ::warning:: + "Threads needing manual action"
+
+Threads are matched by thread_key (the id that opened the thread, carried in state and
+in the marker), then the prior_id chain, then file + rule + nearby line.
   prior open id missing from this round    -> kept open, flagged as unaccounted
   nit                            -> summary comment only, never a thread
 """
@@ -25,6 +30,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
+import os
 import re
 import sys
 from pathlib import Path
@@ -37,7 +43,6 @@ import threads as th
 BLOCKING = ("P0", "P1", "P2", "P3")
 STATUS_MARKER = "<!-- pr-guardian:status id={id} status={status} -->"
 NITS_MARKER = "<!-- pr-guardian:nits -->"
-BOT_LOGINS = ("github-actions", "github-actions[bot]")
 REOPEN_ESCALATION = 3
 ROUND_CAP = 6
 
@@ -61,7 +66,7 @@ def fence(text: str, lang: str = "") -> str:
 
 
 def finding_body(f: dict[str, Any], in_diff: bool) -> str:
-    parts = [st.FINDING_MARKER.format(id=f["id"], severity=f["severity"]),
+    parts = [st.FINDING_MARKER.format(id=f["id"], severity=f["severity"], key=f.get("thread_key") or f["id"]),
              f"**{f['severity']} · {f['axis']} · {clean(f['rule'])}** · {clean(f['title'])}",
              "", clean(f["rationale"])]
     if f.get("evidence"):
@@ -109,17 +114,92 @@ def in_diff(f: dict[str, Any], lines: dict[str, set[int]]) -> bool:
 
 # --- planning (pure, tested) -------------------------------------------------
 
+NEAR_LINES = 20  # how far a renumbered finding may drift from its thread's line and still match
+
+
 def last_comment_is_bot(thread: dict[str, Any]) -> bool:
     nodes = thread.get("comments", {}).get("nodes", [])
-    return bool(nodes) and (nodes[-1].get("author") or {}).get("login") in BOT_LOGINS
+    return bool(nodes) and th.is_bot(nodes[-1])
+
+
+def _key_candidates(f: dict[str, Any], prior_by_id: dict[str, dict[str, Any]]) -> list[str]:
+    """thread_key first, then the prior_id chain, newest link last.
+
+    The model renumbers findings every round and prior_id points one round back, so the
+    thread opened in round 1 is found through the key that state carries forward. State
+    written before keys existed only has the one-hop chain (prior_id, its prior_id).
+    """
+    pid = f.get("prior_id")
+    if not pid:
+        return [f["id"]]
+    old = prior_by_id.get(pid) or {}
+    out = [old.get("thread_key"), old.get("prior_id"), pid]
+    return list(dict.fromkeys(k for k in out if k))
+
+
+def _near(thread: dict[str, Any], f: dict[str, Any]) -> int | None:
+    """Line distance between a thread and a finding, None when they cannot be the same."""
+    if thread.get("path") != f["file"]:
+        return None
+    line = thread.get("line")
+    if line is None:  # outdated: GitHub no longer maps it to a line in the head
+        return NEAR_LINES
+    gap = 0 if f["start_line"] <= line <= f["end_line"] else min(
+        abs(line - f["start_line"]), abs(line - f["end_line"]))
+    return gap if gap <= NEAR_LINES else None
+
+
+def _fallback(f: dict[str, Any], thread_list: list[dict[str, Any]], claimed: set[str]) -> dict[str, Any] | None:
+    """Same file and rule, nearest line. Only for findings that continue an earlier one."""
+    best, best_gap = None, NEAR_LINES + 1
+    for t in thread_list:
+        m = th.meta(t)
+        if not m or t["id"] in claimed or m["rule"] != clean(f["rule"]):
+            continue
+        gap = _near(t, f)
+        if gap is not None and gap < best_gap:
+            best, best_gap = t, gap
+    return best
+
+
+def match_threads(findings: list[dict[str, Any]], prior: dict[str, Any],
+                  thread_list: list[dict[str, Any]]) -> dict[int, dict[str, Any]]:
+    """Set each finding's thread_key and return {index: thread} for the ones with a thread.
+
+    Lookup order: thread_key, then the prior_id chain, then file + rule + nearby line.
+    A thread is claimed by at most one finding.
+    """
+    prior_by_id = {old["id"]: old for old in prior["findings"]}
+    by_key = th.by_finding(thread_list)
+    matched: dict[int, dict[str, Any]] = {}
+    claimed: set[str] = set()
+    for i, f in enumerate(findings):
+        cands = _key_candidates(f, prior_by_id)
+        f["thread_key"] = cands[0]
+        old = prior_by_id.get(f.get("prior_id") or "")
+        if old and old.get("posted"):
+            f["posted"] = old["posted"]
+        for k in cands:
+            t = by_key.get(k)
+            if t and t["id"] not in claimed:
+                matched[i], f["thread_key"] = t, k
+                claimed.add(t["id"])
+                break
+    for i, f in enumerate(findings):
+        if i in matched or not f.get("prior_id") or f["severity"] == "nit":
+            continue
+        t = _fallback(f, thread_list, claimed)
+        if t:
+            matched[i], f["thread_key"] = t, th.meta(t)["key"]
+            claimed.add(t["id"])
+    return matched
 
 
 def plan(doc: dict[str, Any], prior: dict[str, Any], thread_list: list[dict[str, Any]],
          diff: str) -> dict[str, Any]:
     lines = commentable_lines(diff)
-    threads = th.by_finding(thread_list)
     actions: dict[str, Any] = {"comments": [], "outside": [], "unresolve": [], "reply": [],
-                               "resolve": [], "nits": [], "signals": []}
+                               "resolve": [], "nits": [], "signals": [], "unmatched": []}
     new_state = dict(prior)
     new_state["round"] = prior["round"] + 1
     new_state["reopen_counts"] = dict(prior["reopen_counts"])
@@ -128,23 +208,33 @@ def plan(doc: dict[str, Any], prior: dict[str, Any], thread_list: list[dict[str,
 
     accepted_keys = {(a["file"], a["rule"]) for a in prior["accepted"]}
     seen_prior: set[str] = set()
-    findings = [dict(f) for f in doc["findings"]]
+    # The model's output is untrusted: thread_key and posted are ours to set, never its.
+    findings = [{k: v for k, v in f.items() if k not in ("thread_key", "posted")} for f in doc["findings"]]
+    matched = match_threads(findings, prior, thread_list)
 
-    for f in findings:
+    for i, f in enumerate(findings):
         if f.get("prior_id"):
             seen_prior.add(f["prior_id"])
         if f["severity"] == "nit":
             if f["status"] not in st_closed():
                 actions["nits"].append(f)
             continue
-        thread = threads.get(f["prior_id"] or f["id"])
+        thread = matched.get(i)
+        key = f["thread_key"]
         status = f["status"]
+        if thread:
+            f["posted"] = "thread"
 
         if status in st_closed():
             if thread and not thread["isResolved"]:
                 verb = "Verified fixed" if status == "fixed" else "Pushback accepted"
-                actions["resolve"].append({"thread": thread["id"], "body": _status(f, status)
+                actions["resolve"].append({"thread": thread["id"], "finding": f["id"], "key": key,
+                                           "url": th.url(thread), "body": _status(f, status)
                                            + f"✅ {verb}: {clean(f['rationale'])}"})
+            elif not thread and f.get("prior_id") and f.get("posted") != "summary":
+                # Listed only in the summary (outside the diff) means there was never a thread.
+                actions["unmatched"].append({"finding": f["id"], "key": key, "status": status,
+                                             "file": f["file"], "line": f["start_line"]})
             if status == "accepted_pushback":
                 new_state["accepted"].append({"id": f["prior_id"], "file": f["file"], "rule": f["rule"]})
             continue
@@ -153,28 +243,33 @@ def plan(doc: dict[str, Any], prior: dict[str, Any], thread_list: list[dict[str,
             actions["signals"].append(f"oscillation: {f['id']} re-raises accepted pushback "
                                       f"({f['file']}, {f['rule']})")
 
+        if status == "reopened" and f.get("prior_id"):
+            counts = new_state["reopen_counts"]
+            n = counts.get(key, counts.get(f["prior_id"], 0)) + 1  # legacy counts were keyed by prior_id
+            counts[key] = n
+            if n >= REOPEN_ESCALATION:
+                actions["signals"].append(f"{key} reopened {n} times")
+
         if thread:
-            if status == "reopened":
-                key = f["prior_id"]
-                new_state["reopen_counts"][key] = new_state["reopen_counts"].get(key, 0) + 1
-                if new_state["reopen_counts"][key] >= REOPEN_ESCALATION:
-                    actions["signals"].append(f"{key} reopened {new_state['reopen_counts'][key]} times")
             if thread["isResolved"]:
-                actions["unresolve"].append({"thread": thread["id"], "body": _status(f, "reopened")
+                actions["unresolve"].append({"thread": thread["id"], "finding": f["id"], "key": key,
+                                             "url": th.url(thread), "body": _status(f, "reopened")
                                              + f"🔁 Reopened: the code still has this problem. {clean(f['rationale'])}"})
             elif not last_comment_is_bot(thread):
                 actions["reply"].append({"thread": thread["id"], "body": _status(f, "still_open")
                                          + f"Still open after your reply: {clean(f['rationale'])}"})
             continue
 
-        target = actions["comments"] if in_diff(f, lines) else actions["outside"]
-        target.append(f)
+        inline = in_diff(f, lines)
+        f["posted"] = "thread" if inline else "summary"
+        (actions["comments"] if inline else actions["outside"]).append(f)
 
+    ids = {f["id"] for f in findings}
     for old in prior["findings"]:
         if (old["severity"] in BLOCKING and old.get("status") not in st_closed()
-                and old["id"] not in seen_prior
-                and old["id"] not in {f["id"] for f in findings}):
+                and old["id"] not in seen_prior and old["id"] not in ids):
             carried = dict(old, status="still_open", prior_id=old["id"])
+            carried.setdefault("thread_key", old.get("prior_id") or old["id"])
             findings.append(carried)
             actions["signals"].append(f"unaccounted: reviewer dropped {old['id']} without a status; kept open")
 
@@ -191,7 +286,7 @@ def plan(doc: dict[str, Any], prior: dict[str, Any], thread_list: list[dict[str,
 
 
 def _status(f: dict[str, Any], status: str) -> str:
-    return STATUS_MARKER.format(id=f["prior_id"] or f["id"], status=status) + "\n"
+    return STATUS_MARKER.format(id=f.get("thread_key") or f["prior_id"] or f["id"], status=status) + "\n"
 
 
 def st_closed() -> tuple[str, ...]:
@@ -228,6 +323,11 @@ def summary_body(doc: dict[str, Any], result: dict[str, Any], round_cost: float)
         lines.append("<details><summary>Not inspected</summary>\n")
         lines += [f"- {clean(n['what'])}: {clean(n['reason'])}" for n in doc["not_inspected"]]
         lines.append("\n</details>\n")
+    manual = manual_actions(result)
+    if manual:
+        lines.append("**Threads needing manual action** (resolve or check these by hand):")
+        lines += [f"- {m}" for m in manual]
+        lines.append("")
     if a["signals"]:
         lines.append("**Signals:** " + "; ".join(clean(x) for x in a["signals"]))
     total = round(sum(s["cost_usd"]), 2)
@@ -245,26 +345,59 @@ REPLY = ("mutation($id:ID!,$body:String!){addPullRequestReviewThreadReply("
          "input:{pullRequestReviewThreadId:$id, body:$body}){comment{id}}}")
 
 
-def toggle(mutation: str, thread: str) -> None:
+def toggle(mutation: str, item: dict[str, Any], errors: list[dict[str, Any]]) -> None:
     # Thread state is advisory: the verdict counts open findings, so a failed (un)resolve
-    # must not stop the summary and state from being written.
+    # must not stop the summary and state from being written. It is reported, not hidden.
     try:
-        gh.graphql(mutation, id=thread)
+        gh.graphql(mutation, id=item["thread"])
     except gh.GhError as exc:
-        print(f"::warning::could not change thread {thread}: {exc}", file=sys.stderr)
+        action = "resolve" if mutation is RESOLVE else "unresolve"
+        errors.append({**item, "action": action, "error": str(exc)})
+        print(f"::warning::could not {action} thread {item['thread']} ({item.get('finding')}): {exc}",
+              file=sys.stderr)
+
+
+def manual_actions(result: dict[str, Any]) -> list[str]:
+    """One markdown line per thread the bot could not handle, for the summary comment."""
+    out = []
+    for e in result.get("thread_errors", []):
+        where = f"[thread]({e['url']})" if e.get("url", "").startswith("https://") else f"thread `{e['thread']}`"
+        out.append(f"{where} for **{e.get('key') or e.get('finding')}**: could not {e['action']} it "
+                   f"(`{clean(e['error'])[:200].replace('`', '')}`)")
+    for u in result["actions"].get("unmatched", []):
+        out.append(f"**{u['finding']}** (`{u['file']}:{u['line']}`) is {u['status']}, "
+                   f"but no thread for {u['key']} was found to reply on or resolve")
+    return out
+
+
+def warn_unmatched(result: dict[str, Any]) -> None:
+    for u in result["actions"].get("unmatched", []):
+        print(f"::warning::{u['finding']} is {u['status']} but has no matching thread "
+              f"(thread_key {u['key']}, {u['file']}:{u['line']})", file=sys.stderr)
+
+
+def write_step_summary(result: dict[str, Any]) -> None:
+    path = os.environ.get("GITHUB_STEP_SUMMARY")
+    manual = manual_actions(result)
+    if not path or not manual:
+        return
+    with open(path, "a", encoding="utf-8") as fh:
+        fh.write("### pr-guardian: threads needing manual action\n\n")
+        fh.write("".join(f"- {m}\n" for m in manual) + "\n")
 
 
 def execute(repo: str, pr: int, sha: str, doc: dict[str, Any], result: dict[str, Any],
             round_cost: float) -> None:
     a = result["actions"]
+    errors = result.setdefault("thread_errors", [])
     for item in a["unresolve"]:
-        toggle(UNRESOLVE, item["thread"])
+        toggle(UNRESOLVE, item, errors)
         gh.graphql(REPLY, id=item["thread"], body=item["body"])
     for item in a["reply"]:
         gh.graphql(REPLY, id=item["thread"], body=item["body"])
     for item in a["resolve"]:
         gh.graphql(REPLY, id=item["thread"], body=item["body"])
-        toggle(RESOLVE, item["thread"])
+        toggle(RESOLVE, item, errors)
 
     if a["comments"]:
         comments = []
@@ -280,6 +413,8 @@ def execute(repo: str, pr: int, sha: str, doc: dict[str, Any], result: dict[str,
             gh.api(f"repos/{repo}/pulls/{pr}/reviews", "POST", review)
         except gh.GhError as exc:  # a line GitHub will not anchor: fall back to the body
             print(f"publish: inline review rejected ({exc}); listing findings in the summary", file=sys.stderr)
+            for f in a["comments"]:
+                f["posted"] = "summary"
             a["outside"].extend(a["comments"])
             a["comments"] = []
 
@@ -302,6 +437,9 @@ def main() -> int:
     ap.add_argument("--prior", required=True)
     ap.add_argument("--usage", help="agy --output-format json result, for cost")
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--fail-on-thread-errors", default="false",
+                    help="true: exit 1 (after writing the summary) when a thread could not be "
+                         "matched, resolved or unresolved")
     args = ap.parse_args()
 
     doc = json.loads(Path(args.findings).read_text(encoding="utf-8"))
@@ -313,12 +451,23 @@ def main() -> int:
     diff = gh._run(["pr", "diff", str(args.pr), "-R", args.repo])
     result = plan(doc, prior, th.fetch(args.repo, args.pr), diff)
     round_cost = cost(usage)
+    warn_unmatched(result)
     if args.dry_run:
         print(json.dumps({"actions": {k: len(v) for k, v in result["actions"].items()},
-                          "signals": result["actions"]["signals"], "cost": round_cost}, indent=2))
+                          "signals": result["actions"]["signals"],
+                          "unmatched": result["actions"]["unmatched"], "cost": round_cost}, indent=2))
         return 0
     execute(args.repo, args.pr, args.sha, doc, result, round_cost)
+    write_step_summary(result)
     print(json.dumps({"round": result["state"]["round"], "signals": result["actions"]["signals"]}))
+    return exit_code(result, args.fail_on_thread_errors == "true")
+
+
+def exit_code(result: dict[str, Any], fail_on_thread_errors: bool) -> int:
+    problems = len(result.get("thread_errors", [])) + len(result["actions"].get("unmatched", []))
+    if problems and fail_on_thread_errors:
+        print(f"::error::{problems} thread(s) need manual action (fail_on_thread_errors is on)", file=sys.stderr)
+        return 1
     return 0
 
 
