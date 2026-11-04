@@ -75,6 +75,13 @@ class RenderPriorDriftTest(unittest.TestCase):
         self.assertIn("thread: RESOLVED by someone", out)
         self.assertIn("/ai-review wontfix: because", out)
 
+    def test_legacy_state_recovers_thread_by_file_rule_line(self):
+        prior = st.empty_state()
+        prior.update(round=3, findings=[finding("R-003", status="still_open", prior_id="R-005")])
+        out = bc.render_prior(prior, [thread("R-001", resolved=True, last_author="dev")])
+        self.assertIn("thread: RESOLVED by someone", out)
+        self.assertIn("/ai-review wontfix: because", out)
+
 
 if __name__ == "__main__":
     unittest.main()

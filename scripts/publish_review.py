@@ -122,35 +122,40 @@ def last_comment_is_bot(thread: dict[str, Any]) -> bool:
     return bool(nodes) and th.is_bot(nodes[-1])
 
 
+ID_RE = re.compile(r"[A-Z][A-Z0-9]*-[0-9]{3,}")  # the finding-id grammar markers accept
+
+
+def valid_id(value: Any) -> bool:
+    return isinstance(value, str) and ID_RE.fullmatch(value) is not None
+
+
 def _key_candidates(f: dict[str, Any], prior_by_id: dict[str, dict[str, Any]]) -> list[str]:
-    """thread_key first, then the prior_id chain, newest link last.
+    """For a continuation: thread_key first, then the prior_id chain, newest link last.
 
     The model renumbers findings every round and prior_id points one round back, so the
     thread opened in round 1 is found through the key that state carries forward. State
     written before keys existed only has the one-hop chain (prior_id, its prior_id).
+    A prior_id that names no finding from last round links to nothing.
     """
-    pid = f.get("prior_id")
-    if not pid:
-        return [f["id"]]
-    old = prior_by_id.get(pid) or {}
-    out = [old.get("thread_key"), old.get("prior_id"), pid]
-    return list(dict.fromkeys(k for k in out if k))
+    old = prior_by_id.get(f.get("prior_id") or "")
+    if not old:
+        return []
+    out = [old.get("thread_key"), old.get("prior_id"), old["id"]]
+    return [k for k in dict.fromkeys(out) if valid_id(k)]
 
 
 def _near(thread: dict[str, Any], f: dict[str, Any]) -> int | None:
     """Line distance between a thread and a finding, None when they cannot be the same."""
-    if thread.get("path") != f["file"]:
-        return None
     line = thread.get("line")
-    if line is None:  # outdated: GitHub no longer maps it to a line in the head
-        return NEAR_LINES
+    if thread.get("path") != f["file"] or line is None:  # None: outdated, position unknown
+        return None
     gap = 0 if f["start_line"] <= line <= f["end_line"] else min(
         abs(line - f["start_line"]), abs(line - f["end_line"]))
     return gap if gap <= NEAR_LINES else None
 
 
 def _fallback(f: dict[str, Any], thread_list: list[dict[str, Any]], claimed: set[str]) -> dict[str, Any] | None:
-    """Same file and rule, nearest line. Only for findings that continue an earlier one."""
+    """Same file and rule, nearest line."""
     best, best_gap = None, NEAR_LINES + 1
     for t in thread_list:
         m = th.meta(t)
@@ -162,36 +167,60 @@ def _fallback(f: dict[str, Any], thread_list: list[dict[str, Any]], claimed: set
     return best
 
 
+def _fresh_key(fid: str, used: set[str]) -> str:
+    """fid if no thread or earlier finding uses it as a key, else the next free number."""
+    if fid not in used:
+        return fid
+    prefix = fid.rsplit("-", 1)[0]
+    nums = [int(k.rsplit("-", 1)[1]) for k in used if k.rsplit("-", 1)[0] == prefix]
+    return f"{prefix}-{max(nums) + 1:03d}"
+
+
 def match_threads(findings: list[dict[str, Any]], prior: dict[str, Any],
                   thread_list: list[dict[str, Any]]) -> dict[int, dict[str, Any]]:
     """Set each finding's thread_key and return {index: thread} for the ones with a thread.
 
-    Lookup order: thread_key, then the prior_id chain, then file + rule + nearby line.
-    A thread is claimed by at most one finding.
+    Only a continuation (prior_id naming a finding from last round) inherits a thread.
+    Lookup order: thread_key, then the prior_id chain, then file + rule + nearby line
+    (skipped when the finding was only ever listed in the summary). A thread is claimed
+    by at most one finding. A new finding gets a key no thread or earlier finding uses,
+    so a reused id cannot take over another finding's thread. Nits never get threads.
     """
-    prior_by_id = {old["id"]: old for old in prior["findings"]}
+    prior_by_id = {old["id"]: old for old in prior["findings"] if valid_id(old.get("id"))}
     by_key = th.by_finding(thread_list)
     matched: dict[int, dict[str, Any]] = {}
     claimed: set[str] = set()
+    used = set(by_key) | {k for old in prior["findings"]
+                          for k in (old.get("thread_key"), old.get("id")) if valid_id(k)}
+    cands = [_key_candidates(f, prior_by_id) for f in findings]
+
     for i, f in enumerate(findings):
-        cands = _key_candidates(f, prior_by_id)
-        f["thread_key"] = cands[0]
-        old = prior_by_id.get(f.get("prior_id") or "")
-        if old and old.get("posted"):
+        if not cands[i]:
+            continue
+        f["thread_key"] = cands[i][0]
+        old = prior_by_id[f["prior_id"]]
+        if old.get("posted"):
             f["posted"] = old["posted"]
-        for k in cands:
+        if f["severity"] == "nit":
+            continue
+        for k in cands[i]:
             t = by_key.get(k)
             if t and t["id"] not in claimed:
                 matched[i], f["thread_key"] = t, k
                 claimed.add(t["id"])
                 break
     for i, f in enumerate(findings):
-        if i in matched or not f.get("prior_id") or f["severity"] == "nit":
+        if i in matched or not cands[i] or f["severity"] == "nit" or f.get("posted") == "summary":
             continue
         t = _fallback(f, thread_list, claimed)
         if t:
             matched[i], f["thread_key"] = t, th.meta(t)["key"]
             claimed.add(t["id"])
+    used |= {f["thread_key"] for f in findings if f.get("thread_key")}
+    for f in findings:
+        if not f.get("thread_key"):
+            f["thread_key"] = _fresh_key(f["id"], used)
+            used.add(f["thread_key"])
     return matched
 
 
@@ -210,6 +239,9 @@ def plan(doc: dict[str, Any], prior: dict[str, Any], thread_list: list[dict[str,
     seen_prior: set[str] = set()
     # The model's output is untrusted: thread_key and posted are ours to set, never its.
     findings = [{k: v for k, v in f.items() if k not in ("thread_key", "posted")} for f in doc["findings"]]
+    for f in findings:  # prior_id ends up in markers and the summary: only the id grammar passes
+        if not valid_id(f.get("prior_id")):
+            f["prior_id"] = None
     matched = match_threads(findings, prior, thread_list)
 
     for i, f in enumerate(findings):
@@ -365,7 +397,7 @@ def manual_actions(result: dict[str, Any]) -> list[str]:
         out.append(f"{where} for **{e.get('key') or e.get('finding')}**: could not {e['action']} it "
                    f"(`{clean(e['error'])[:200].replace('`', '')}`)")
     for u in result["actions"].get("unmatched", []):
-        out.append(f"**{u['finding']}** (`{u['file']}:{u['line']}`) is {u['status']}, "
+        out.append(f"**{u['finding']}** (`{clean(u['file']).replace('`', '')}:{u['line']}`) is {u['status']}, "
                    f"but no thread for {u['key']} was found to reply on or resolve")
     return out
 
