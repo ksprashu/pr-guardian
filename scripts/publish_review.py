@@ -300,11 +300,16 @@ def plan(doc: dict[str, Any], prior: dict[str, Any], thread_list: list[dict[str,
         f["posted"] = "thread" if inline else "summary"
         (actions["comments"] if inline else actions["outside"]).append(f)
 
+    # Ids are round-local, so only an explicit prior_id accounts for an old finding; a new
+    # finding that happens to reuse its id does not. A carried finding gets an id that is
+    # unique in this round, so next round's prior_by_id cannot conflate the two.
     ids = {f["id"] for f in findings}
     for old in prior["findings"]:
         if (old["severity"] in BLOCKING and old.get("status") not in st_closed()
-                and old["id"] not in seen_prior and old["id"] not in ids):
-            carried = dict(old, status="still_open", prior_id=old["id"])
+                and old["id"] not in seen_prior):
+            cid = _fresh_key(old["id"], ids)
+            ids.add(cid)
+            carried = dict(old, id=cid, status="still_open", prior_id=old["id"])
             carried.setdefault("thread_key", old.get("prior_id") or old["id"])
             findings.append(carried)
             actions["signals"].append(f"unaccounted: reviewer dropped {old['id']} without a status; kept open")

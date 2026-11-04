@@ -266,6 +266,19 @@ class DriftTest(unittest.TestCase):
         self.assertEqual(r["state"]["reopen_counts"]["R-002"], 1)
         self.assertFalse(r["state"]["escalated"])
 
+    def test_dropped_finding_survives_its_id_being_reused(self):
+        # Round 2 renumbers from R-001: fixes old R-002 as R-001 and silently drops old R-001.
+        p = prior(finding("R-001", thread_key="R-001"), finding("R-002", thread_key="R-002"))
+        r = pub.plan(doc(finding("R-001", status="fixed", prior_id="R-002")), p,
+                     [thread("R-001"), thread("R-002")], DIFF)
+        carried = [f for f in r["state"]["findings"] if f.get("prior_id") == "R-001"]
+        self.assertEqual(len(carried), 1)
+        self.assertEqual(carried[0]["status"], "still_open")
+        self.assertEqual(carried[0]["thread_key"], "R-001")
+        self.assertNotEqual(carried[0]["id"], "R-001")  # ids stay unique within a round
+        self.assertEqual(len({f["id"] for f in r["state"]["findings"]}), 2)
+        self.assertTrue(any("dropped R-001" in x for x in r["actions"]["signals"]))
+
 
 class ThreadErrorTest(unittest.TestCase):
     """Unmatched findings and failed (un)resolves are reported, not swallowed (#16)."""
