@@ -413,6 +413,16 @@ class ThreadErrorTest(unittest.TestCase):
         self.assertEqual(pub.exit_code(r, True), 0)
         self.assertNotIn("manual action", pub.summary_body(doc(), dict(r, thread_errors=[]), 0.0))
 
+    def test_warnings_cannot_inject_workflow_commands(self):
+        p = prior(finding("R-001", thread_key="R-001", posted="thread", file="a.py\n::stop-commands::x"))
+        r = pub.plan(doc(finding("R-002", status="fixed", prior_id="R-001",
+                                 file="a.py\n::stop-commands::x")), p, [], DIFF)
+        with mock.patch("sys.stderr") as err:
+            pub.warn_unmatched(r)
+        out = "".join(c.args[0] for c in err.write.call_args_list)
+        self.assertEqual(out.count("\n"), 1)  # only print's own line end
+        self.assertIn("%0A::stop-commands", out)
+
 
 class CostAndSummaryTest(unittest.TestCase):
     def test_price_change(self):

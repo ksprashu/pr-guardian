@@ -426,6 +426,12 @@ REPLY = ("mutation($id:ID!,$body:String!){addPullRequestReviewThreadReply("
          "input:{pullRequestReviewThreadId:$id, body:$body}){comment{id}}}")
 
 
+def cmd_escape(text: Any) -> str:
+    """GitHub's escaping for workflow-command data, so model text or gh stderr containing a
+    newline cannot start a command line of its own (`::set-output`, `::stop-commands`, ...)."""
+    return str(text).replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+
+
 def toggle(mutation: str, item: dict[str, Any], errors: list[dict[str, Any]]) -> None:
     # Thread state is advisory: the verdict counts open findings, so a failed (un)resolve
     # must not stop the summary and state from being written. It is reported, not hidden.
@@ -434,7 +440,8 @@ def toggle(mutation: str, item: dict[str, Any], errors: list[dict[str, Any]]) ->
     except gh.GhError as exc:
         action = "resolve" if mutation is RESOLVE else "unresolve"
         errors.append({**item, "action": action, "error": str(exc)})
-        print(f"::warning::could not {action} thread {item['thread']} ({item.get('finding')}): {exc}",
+        print(cmd_escape(f"::warning::could not {action} thread {item['thread']} "
+                         f"({item.get('finding')}): {exc}"),
               file=sys.stderr)
 
 
@@ -453,8 +460,8 @@ def manual_actions(result: dict[str, Any]) -> list[str]:
 
 def warn_unmatched(result: dict[str, Any]) -> None:
     for u in result["actions"].get("unmatched", []):
-        print(f"::warning::{u['finding']} is {u['status']} but has no matching thread "
-              f"(thread_key {u['key']}, {u['file']}:{u['line']})", file=sys.stderr)
+        print(cmd_escape(f"::warning::{u['finding']} is {u['status']} but has no matching thread "
+                         f"(thread_key {u['key']}, {u['file']}:{u['line']})"), file=sys.stderr)
 
 
 def write_step_summary(result: dict[str, Any]) -> None:
@@ -493,7 +500,8 @@ def execute(repo: str, pr: int, sha: str, doc: dict[str, Any], result: dict[str,
         try:
             gh.api(f"repos/{repo}/pulls/{pr}/reviews", "POST", review)
         except gh.GhError as exc:  # a line GitHub will not anchor: fall back to the body
-            print(f"publish: inline review rejected ({exc}); listing findings in the summary", file=sys.stderr)
+            print(cmd_escape(f"publish: inline review rejected ({exc}); listing findings in the summary"),
+                  file=sys.stderr)
             for f in a["comments"]:
                 f["posted"] = "summary"
             a["outside"].extend(a["comments"])
