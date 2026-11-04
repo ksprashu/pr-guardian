@@ -251,6 +251,21 @@ class DriftTest(unittest.TestCase):
         self.assertEqual(r["actions"]["resolve"], [])
         self.assertEqual(r["actions"]["unmatched"], [])
 
+    def test_keyed_summary_finding_does_not_match_on_its_round_local_id(self):
+        # R-002 was summary-only under key R-002... renumbered to R-005; another thread is keyed R-005.
+        p = prior(finding("R-005", status="still_open", prior_id="R-002", thread_key="R-002", posted="summary"))
+        t = [thread("R-007", key="R-005")]
+        r = pub.plan(doc(finding("R-001", status="fixed", prior_id="R-005")), p, t, DIFF)
+        self.assertEqual(r["actions"]["resolve"], [])
+
+    def test_keyed_reopen_does_not_read_another_findings_legacy_counter(self):
+        p = prior(finding("R-001", status="still_open", prior_id="R-004", thread_key="R-002"),
+                  reopen_counts={"R-001": 2})
+        r = pub.plan(doc(finding("R-009", status="reopened", prior_id="R-001")), p,
+                     [thread("R-010", key="R-002", resolved=True)], DIFF)
+        self.assertEqual(r["state"]["reopen_counts"]["R-002"], 1)
+        self.assertFalse(r["state"]["escalated"])
+
 
 class ThreadErrorTest(unittest.TestCase):
     """Unmatched findings and failed (un)resolves are reported, not swallowed (#16)."""

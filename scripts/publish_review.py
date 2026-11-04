@@ -130,7 +130,7 @@ def valid_id(value: Any) -> bool:
 
 
 def _key_candidates(f: dict[str, Any], prior_by_id: dict[str, dict[str, Any]]) -> list[str]:
-    """For a continuation: thread_key first, then the prior_id chain, newest link last.
+    """For a continuation: its thread_key, or for legacy state the prior_id chain.
 
     The model renumbers findings every round and prior_id points one round back, so the
     thread opened in round 1 is found through the key that state carries forward. State
@@ -140,7 +140,9 @@ def _key_candidates(f: dict[str, Any], prior_by_id: dict[str, dict[str, Any]]) -
     old = prior_by_id.get(f.get("prior_id") or "")
     if not old:
         return []
-    out = [old.get("thread_key"), old.get("prior_id"), old["id"]]
+    if valid_id(old.get("thread_key")):  # keyed state is authoritative: ids are round-local
+        return [old["thread_key"]]
+    out = [old.get("prior_id"), old["id"]]
     return [k for k in dict.fromkeys(out) if valid_id(k)]
 
 
@@ -243,6 +245,7 @@ def plan(doc: dict[str, Any], prior: dict[str, Any], thread_list: list[dict[str,
         if not valid_id(f.get("prior_id")):
             f["prior_id"] = None
     matched = match_threads(findings, prior, thread_list)
+    prior_by_id = {old["id"]: old for old in prior["findings"]}
 
     for i, f in enumerate(findings):
         if f.get("prior_id"):
@@ -277,7 +280,8 @@ def plan(doc: dict[str, Any], prior: dict[str, Any], thread_list: list[dict[str,
 
         if status == "reopened" and f.get("prior_id"):
             counts = new_state["reopen_counts"]
-            n = counts.get(key, counts.get(f["prior_id"], 0)) + 1  # legacy counts were keyed by prior_id
+            legacy = not prior_by_id.get(f["prior_id"], {}).get("thread_key")
+            n = counts.get(key, counts.get(f["prior_id"], 0) if legacy else 0) + 1  # legacy: keyed by prior_id
             counts[key] = n
             if n >= REOPEN_ESCALATION:
                 actions["signals"].append(f"{key} reopened {n} times")
