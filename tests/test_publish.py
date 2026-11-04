@@ -70,7 +70,7 @@ class PlanTest(unittest.TestCase):
         d = doc(finding("R-010", status="fixed", prior_id="R-001"),
                 finding("R-011", status="accepted_pushback", prior_id="R-002", file="b.py", rule="CWE-20"))
         r = pub.plan(d, prior(finding("R-001"), finding("R-002")),
-                     [thread("R-001"), thread("R-002")], DIFF)
+                     [thread("R-001"), thread("R-002", path="b.py", rule="CWE-20")], DIFF)
         self.assertEqual({x["thread"] for x in r["actions"]["resolve"]}, {"T-R-001", "T-R-002"})
         self.assertEqual(r["state"]["accepted"], [{"id": "R-002", "file": "b.py", "rule": "CWE-20"}])
 
@@ -278,6 +278,31 @@ class DriftTest(unittest.TestCase):
         self.assertNotEqual(carried[0]["id"], "R-001")  # ids stay unique within a round
         self.assertEqual(len({f["id"] for f in r["state"]["findings"]}), 2)
         self.assertTrue(any("dropped R-001" in x for x in r["actions"]["signals"]))
+
+    def test_legacy_chain_id_needs_same_file_and_rule(self):
+        p = prior(finding("R-008", status="still_open", prior_id="R-005"))  # legacy: no thread_key
+        other = thread("R-005", path="other.py", rule="CWE-79", line=300)
+        r = pub.plan(doc(finding("R-002", status="fixed", prior_id="R-008")), p, [other], DIFF)
+        self.assertEqual(r["actions"]["resolve"], [])
+
+    def test_fallback_does_not_take_an_omitted_findings_thread(self):
+        # Prior R-001 (thread R-001) is omitted this round; R-008 has lost its chain.
+        p = prior(finding("R-001", thread_key="R-001"),
+                  finding("R-008", status="still_open", prior_id="R-006", start=4, end=4))
+        r = pub.plan(doc(finding("R-002", status="fixed", prior_id="R-008", start=4, end=4)), p,
+                     [thread("R-001")], DIFF)
+        self.assertEqual(r["actions"]["resolve"], [])
+        self.assertTrue(any("dropped R-001" in x for x in r["actions"]["signals"]))
+
+    def test_second_continuation_of_one_finding_gets_its_own_key(self):
+        p = prior(finding("R-001", thread_key="R-001"))
+        d = doc(finding("R-002", status="still_open", prior_id="R-001"),
+                finding("R-003", status="still_open", prior_id="R-001", start=2, end=2))
+        r = pub.plan(d, p, [thread("R-001")], DIFF)
+        keys = [f["thread_key"] for f in r["state"]["findings"]]
+        self.assertEqual(keys[0], "R-001")
+        self.assertEqual(len(set(keys)), 2)
+        self.assertEqual(len(r["actions"]["comments"]), 1)
 
 
 class ThreadErrorTest(unittest.TestCase):

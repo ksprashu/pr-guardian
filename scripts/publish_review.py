@@ -178,15 +178,23 @@ def _fresh_key(fid: str, used: set[str]) -> str:
     return f"{prefix}-{max(nums) + 1:03d}"
 
 
+def _legacy_ok(t: dict[str, Any], f: dict[str, Any]) -> bool:
+    """A legacy chain id is round-local, so it only counts on the same file and rule."""
+    m = th.meta(t)
+    return bool(m) and t.get("path") == f["file"] and m["rule"] == clean(f["rule"])
+
+
 def match_threads(findings: list[dict[str, Any]], prior: dict[str, Any],
                   thread_list: list[dict[str, Any]]) -> dict[int, dict[str, Any]]:
     """Set each finding's thread_key and return {index: thread} for the ones with a thread.
 
     Only a continuation (prior_id naming a finding from last round) inherits a thread.
-    Lookup order: thread_key, then the prior_id chain, then file + rule + nearby line
-    (skipped when the finding was only ever listed in the summary). A thread is claimed
-    by at most one finding. A new finding gets a key no thread or earlier finding uses,
-    so a reused id cannot take over another finding's thread. Nits never get threads.
+    Lookup order: thread_key, then (legacy state only, same file + rule) the prior_id
+    chain, then file + rule + nearby line (skipped for summary-only findings, and never
+    taking a thread an omitted open prior finding still owns). A thread is claimed by at
+    most one finding, and a key by at most one finding: a new finding, or a second
+    continuation of the same prior finding, gets a key nothing else uses. Nits never
+    get threads.
     """
     prior_by_id = {old["id"]: old for old in prior["findings"] if valid_id(old.get("id"))}
     by_key = th.by_finding(thread_list)
@@ -201,28 +209,44 @@ def match_threads(findings: list[dict[str, Any]], prior: dict[str, Any],
             continue
         f["thread_key"] = cands[i][0]
         old = prior_by_id[f["prior_id"]]
+        legacy = not valid_id(old.get("thread_key"))
         if old.get("posted"):
             f["posted"] = old["posted"]
         if f["severity"] == "nit":
             continue
         for k in cands[i]:
             t = by_key.get(k)
-            if t and t["id"] not in claimed:
+            if t and t["id"] not in claimed and (not legacy or _legacy_ok(t, f)):
                 matched[i], f["thread_key"] = t, k
                 claimed.add(t["id"])
                 break
+
+    # Threads of open prior findings this round omits: they are carried open, so the
+    # positional fallback must not resolve them on someone else's behalf.
+    referenced = {f.get("prior_id") for f in findings}
+    reserved: set[str] = set()
+    for old in prior_by_id.values():
+        if old["id"] in referenced or old.get("status") in st_closed():
+            continue
+        keys = [old["thread_key"]] if valid_id(old.get("thread_key")) else [old.get("prior_id"), old["id"]]
+        reserved |= {by_key[k]["id"] for k in keys if k in by_key}
+
     for i, f in enumerate(findings):
         if i in matched or not cands[i] or f["severity"] == "nit" or f.get("posted") == "summary":
             continue
-        t = _fallback(f, thread_list, claimed)
+        t = _fallback(f, thread_list, claimed | reserved)
         if t:
             matched[i], f["thread_key"] = t, th.meta(t)["key"]
             claimed.add(t["id"])
-    used |= {f["thread_key"] for f in findings if f.get("thread_key")}
-    for f in findings:
-        if not f.get("thread_key"):
-            f["thread_key"] = _fresh_key(f["id"], used)
-            used.add(f["thread_key"])
+
+    taken = {findings[i]["thread_key"] for i in matched}
+    for i, f in enumerate(findings):
+        if i in matched:
+            continue
+        if not f.get("thread_key") or f["thread_key"] in taken:
+            f["thread_key"] = _fresh_key(f["id"], used | taken)
+        taken.add(f["thread_key"])
+        used.add(f["thread_key"])
     return matched
 
 
