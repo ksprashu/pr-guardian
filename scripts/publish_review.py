@@ -243,7 +243,8 @@ def match_threads(findings: list[dict[str, Any]], prior: dict[str, Any],
     for i, f in enumerate(findings):
         if i in matched:
             continue
-        if not f.get("thread_key") or f["thread_key"] in taken:
+        # A key some thread already carries is not this finding's (it did not match it).
+        if not f.get("thread_key") or f["thread_key"] in taken or f["thread_key"] in by_key:
             f["thread_key"] = _fresh_key(f["id"], used | taken)
         taken.add(f["thread_key"])
         used.add(f["thread_key"])

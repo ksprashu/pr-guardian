@@ -304,6 +304,19 @@ class DriftTest(unittest.TestCase):
         self.assertEqual(len(set(keys)), 2)
         self.assertEqual(len(r["actions"]["comments"]), 1)
 
+    def test_rejected_legacy_key_is_not_reused_for_a_new_thread(self):
+        # Legacy R-008 -> R-005; the R-005 thread is another file's, so it is rejected.
+        p = prior(finding("R-008", status="still_open", prior_id="R-005"))
+        other = thread("R-005", path="other.py", rule="CWE-79", line=300)
+        r2 = pub.plan(doc(finding("R-002", status="still_open", prior_id="R-008")), p, [other], DIFF)
+        new = r2["actions"]["comments"][0]
+        self.assertNotEqual(new["thread_key"], "R-005")
+        # Next round: the continuation is fixed; only its own new thread is resolved.
+        mine = thread("R-002", key=new["thread_key"], tid="T-mine")
+        r3 = pub.plan(doc(finding("R-001", status="fixed", prior_id="R-002")), next_round(r2),
+                      [other, mine], DIFF)
+        self.assertEqual([x["thread"] for x in r3["actions"]["resolve"]], ["T-mine"])
+
 
 class ThreadErrorTest(unittest.TestCase):
     """Unmatched findings and failed (un)resolves are reported, not swallowed (#16)."""
