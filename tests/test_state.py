@@ -22,8 +22,12 @@ class StateTest(unittest.TestCase):
         self.assertEqual(st.find_summary_comment([bot, human])["id"], 2)
 
     def test_finding_marker_regex(self):
-        m = st.FINDING_RE.search(st.FINDING_MARKER.format(id="SEC-012", severity="P0"))
-        self.assertEqual(m.groups(), ("SEC-012", "P0"))
+        m = st.FINDING_RE.search(st.FINDING_MARKER.format(id="SEC-012", severity="P0", key="SEC-001"))
+        self.assertEqual(m.groups(), ("SEC-012", "P0", "SEC-001"))
+
+    def test_legacy_marker_without_key_still_parses(self):
+        m = st.FINDING_RE.search("<!-- pr-guardian:finding id=R-001 severity=P1 -->")
+        self.assertEqual(m.groups(), ("R-001", "P1", None))
 
 
 if __name__ == "__main__":

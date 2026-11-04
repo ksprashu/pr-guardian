@@ -19,6 +19,13 @@ on:
         description: agy --model slug (gemini-4-argon-high = Gemini 4 Argon, High)
         type: string
         default: gemini-4-argon-high
+      fail_on_thread_errors:
+        description: >-
+          Fail the publish job (and so the verdict) when a fixed finding has no matching thread
+          or a thread could not be resolved / unresolved. Off: those only warn and are listed
+          under "Threads needing manual action" in the summary comment.
+        type: boolean
+        default: false
     secrets:
       GEMINI_API_KEY:
         required: false
@@ -217,10 +224,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           PR: ${{ needs.route.outputs.pr }}
           SHA: ${{ needs.scan.outputs.head_sha }}
+          FAIL_ON_THREAD_ERRORS: ${{ inputs.fail_on_thread_errors }}
         run: |
           python3 .prg/scripts/publish_review.py --repo "$GITHUB_REPOSITORY" --pr "$PR" --sha "$SHA" \
             --findings "$RUNNER_TEMP/out/findings.json" --prior "$RUNNER_TEMP/out/prior.json" \
-            --usage "$RUNNER_TEMP/out/agy.json"
+            --usage "$RUNNER_TEMP/out/agy.json" --fail-on-thread-errors "$FAIL_ON_THREAD_ERRORS"
 
   verdict:
     needs: [route, scan, review, publish]

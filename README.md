@@ -13,7 +13,8 @@ A PR merges only when all of these hold:
 1. A PR is opened or pushed. The workflow runs `route`, then `scan` (semgrep, gitleaks, osv-scanner, trivy, actionlint, zizmor, native audits, linters). Then `review` runs agy with structured output, then `publish` writes the inline threads and summary, and `verdict` sets the status.
 2. On every push, the PR gets a full re-review. Each earlier finding is marked `fixed`, `still_open`, `reopened` or `accepted_pushback`:
    - If a thread was resolved but the code still has the problem, the thread is unresolved and gets a reply.
-   - If a finding was fixed, or the pushback was accepted, the bot says so in the thread and the author resolves it. The bot tries to resolve it too, but GitHub refuses that to a workflow token without `contents: write`, which the publishing job deliberately lacks.
+   - If a finding was fixed, or the pushback was accepted, the bot says so in the thread and the author resolves it. The bot tries to resolve it too, but GitHub refuses that to a workflow token without `contents: write`, which the publishing job deliberately lacks. Every thread the bot could not resolve, and every fixed finding it could not match to a thread, gets a `::warning::` and is listed under **Threads needing manual action** in the summary comment and the job summary.
+   - The model renumbers findings every round. Each finding carries a stable `thread_key` (the id that opened its thread), kept in round state and in the thread marker, so round 3+ still finds the round-1 thread. Lookup order: `thread_key`, then the `prior_id` chain, then same file + rule within 20 lines. Only threads the bot opened are matched.
 3. The PR author works the threads. The [`pr-review-loop`](https://github.com/ksprashu/agent-skill-forge/tree/main/skills/pr-review-loop) skill does this for agents. For each thread they either:
    - fix it and push,
    - reply `/ai-review wontfix: <reason>`, or
@@ -31,6 +32,14 @@ A PR merges only when all of these hold:
 | `/ai-review escalate: <why>` | PR comment | writers | Adds `needs-human` and fails the verdict until the owner overrides. |
 | `/ai-review` | PR comment | owner | Forces a re-review of the current head. |
 | `human-override` label | PR | owner only | Turns the verdict green for this commit. |
+
+## Inputs
+
+| Input | Default | Effect |
+|---|---|---|
+| `guardian_ref` | required | pr-guardian ref the scripts load from; match the `uses:` ref |
+| `model` | `gemini-4-argon-high` | agy `--model` slug |
+| `fail_on_thread_errors` | `false` | Fail `publish` (so the verdict errors) when a thread needs manual action, instead of warning |
 
 ## Security model
 

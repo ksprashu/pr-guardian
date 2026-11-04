@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any
 
 import gh
+import publish_review as pub
 import state as st
 import threads as th
 
@@ -104,13 +105,15 @@ def render_leads(scan: dict[str, Any]) -> str:
 def render_prior(prior: dict[str, Any], threads: list[dict[str, Any]]) -> str:
     if not prior["findings"]:
         return "_first round: no prior findings_"
-    by_id = th.by_finding(threads)
+    # Same matching publish uses (key, prior_id chain, file + rule + line), so the model sees
+    # the thread state and replies of the thread publish will act on.
+    open_prior = [f for f in prior["findings"] if f.get("status") not in ("fixed", "accepted_pushback")]
+    probes = [dict(f, prior_id=f["id"]) for f in open_prior]
+    matched = pub.match_threads(probes, prior, threads)
     lines = [f"Round {prior['round']} raised these. Account for **every** id below in this round "
              "(status still_open / reopened / fixed / accepted_pushback, with prior_id set)."]
-    for f in prior["findings"]:
-        if f.get("status") in ("fixed", "accepted_pushback"):
-            continue
-        t = by_id.get(f["id"])
+    for i, f in enumerate(open_prior):
+        t = matched.get(i)
         thread_state = "no thread"
         if t:
             thread_state = "RESOLVED by someone" if t["isResolved"] else "open"
