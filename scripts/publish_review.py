@@ -221,18 +221,22 @@ def match_threads(findings: list[dict[str, Any]], prior: dict[str, Any],
                 claimed.add(t["id"])
                 break
 
-    # Threads of open prior findings this round omits: they are carried open, so the
-    # positional fallback must not resolve them on someone else's behalf.
+    # Threads of prior findings this round does not reference, open or closed, belong to
+    # those findings: the positional fallback must not act on them for someone else.
     referenced = {f.get("prior_id") for f in findings}
     reserved: set[str] = set()
     for old in prior_by_id.values():
-        if old["id"] in referenced or old.get("status") in st_closed():
+        if old["id"] in referenced:
             continue
         keys = [old["thread_key"]] if valid_id(old.get("thread_key")) else [old.get("prior_id"), old["id"]]
         reserved |= {by_key[k]["id"] for k in keys if k in by_key}
 
+    # The fallback is for legacy state only (a stored key is authoritative: no thread under
+    # it means no thread), and not for a split continuation whose sibling holds the thread.
+    held = {findings[i]["prior_id"] for i in matched}
     for i, f in enumerate(findings):
-        if i in matched or not cands[i] or f["severity"] == "nit" or f.get("posted") == "summary":
+        if (i in matched or not cands[i] or f["severity"] == "nit" or f.get("posted") == "summary"
+                or valid_id(prior_by_id[f["prior_id"]].get("thread_key")) or f["prior_id"] in held):
             continue
         t = _fallback(f, thread_list, claimed | reserved)
         if t:
@@ -271,6 +275,7 @@ def plan(doc: dict[str, Any], prior: dict[str, Any], thread_list: list[dict[str,
             f["prior_id"] = None
     matched = match_threads(findings, prior, thread_list)
     prior_by_id = {old["id"]: old for old in prior["findings"]}
+    held = {findings[i]["prior_id"] for i in matched if findings[i].get("prior_id")}
 
     for i, f in enumerate(findings):
         if f.get("prior_id"):
@@ -291,8 +296,10 @@ def plan(doc: dict[str, Any], prior: dict[str, Any], thread_list: list[dict[str,
                 actions["resolve"].append({"thread": thread["id"], "finding": f["id"], "key": key,
                                            "url": th.url(thread), "body": _status(f, status)
                                            + f"✅ {verb}: {clean(f['rationale'])}"})
-            elif not thread and f.get("prior_id") and f.get("posted") != "summary":
-                # Listed only in the summary (outside the diff) means there was never a thread.
+            elif (not thread and f.get("prior_id") in prior_by_id and f["prior_id"] not in held
+                  and f.get("posted") != "summary"):
+                # Listed only in the summary (outside the diff) means there was never a thread;
+                # an unknown prior_id links to nothing; a split sibling's thread is handled.
                 actions["unmatched"].append({"finding": f["id"], "key": key, "status": status,
                                              "file": f["file"], "line": f["start_line"]})
             if status == "accepted_pushback":
@@ -335,7 +342,15 @@ def plan(doc: dict[str, Any], prior: dict[str, Any], thread_list: list[dict[str,
             cid = _fresh_key(old["id"], ids)
             ids.add(cid)
             carried = dict(old, id=cid, status="still_open", prior_id=old["id"])
-            carried.setdefault("thread_key", old.get("prior_id") or old["id"])
+            if not valid_id(carried.get("thread_key")):
+                # Legacy: only stamp a key that names a thread on the same file and rule;
+                # otherwise stay keyless so next round still applies the legacy checks.
+                carried.pop("thread_key", None)
+                by_key = th.by_finding(thread_list)
+                for k in (old.get("prior_id"), old["id"]):
+                    if valid_id(k) and k in by_key and _legacy_ok(by_key[k], old):
+                        carried["thread_key"] = k
+                        break
             findings.append(carried)
             actions["signals"].append(f"unaccounted: reviewer dropped {old['id']} without a status; kept open")
 

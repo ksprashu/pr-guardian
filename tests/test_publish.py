@@ -317,6 +317,43 @@ class DriftTest(unittest.TestCase):
                       [other, mine], DIFF)
         self.assertEqual([x["thread"] for x in r3["actions"]["resolve"]], ["T-mine"])
 
+    # --- pr-guardian round 4 on #19 ---
+
+    def test_keyed_finding_never_uses_the_fallback(self):
+        p = prior(finding("R-001", thread_key="R-007", posted="thread"))  # its R-007 thread is gone
+        r = pub.plan(doc(finding("R-002", status="fixed", prior_id="R-001")), p, [thread("R-003")], DIFF)
+        self.assertEqual(r["actions"]["resolve"], [])
+        self.assertEqual(len(r["actions"]["unmatched"]), 1)
+
+    def test_split_continuation_does_not_fall_back_to_a_nearby_thread(self):
+        p = prior(finding("R-008", status="still_open", prior_id="R-001"))  # legacy
+        t = [thread("R-001"), thread("R-004", line=4)]
+        d = doc(finding("R-002", status="still_open", prior_id="R-008"),
+                finding("R-003", status="fixed", prior_id="R-008", start=4, end=4))
+        r = pub.plan(d, p, t, DIFF)
+        self.assertEqual(r["actions"]["resolve"], [])
+        self.assertEqual(r["actions"]["unmatched"], [])  # its sibling holds the thread
+
+    def test_closed_prior_findings_threads_are_reserved(self):
+        p = prior(finding("R-001", status="fixed", thread_key="R-001"),
+                  finding("R-008", status="still_open", prior_id="R-006", start=4, end=4))
+        r = pub.plan(doc(finding("R-002", status="still_open", prior_id="R-008", start=4, end=4)), p,
+                     [thread("R-001", resolved=True)], DIFF)
+        self.assertEqual(r["actions"]["unresolve"], [])
+
+    def test_unknown_prior_id_is_not_reported_unmatched(self):
+        r = pub.plan(doc(finding("R-002", status="fixed", prior_id="R-001")), st.empty_state(), [], DIFF)
+        self.assertEqual(r["actions"]["unmatched"], [])
+
+    def test_carried_legacy_finding_gets_only_a_verified_key(self):
+        p = prior(finding("R-008", status="still_open", prior_id="R-005"))  # legacy, app.py CWE-89
+        other = thread("R-005", path="other.py", rule="CWE-79", line=300)
+        r3 = pub.plan(doc(), p, [other], DIFF)
+        self.assertNotEqual(r3["state"]["findings"][0].get("thread_key"), "R-005")
+        carried = r3["state"]["findings"][0]["id"]
+        r4 = pub.plan(doc(finding("R-002", status="fixed", prior_id=carried)), next_round(r3), [other], DIFF)
+        self.assertEqual(r4["actions"]["resolve"], [])
+
 
 class ThreadErrorTest(unittest.TestCase):
     """Unmatched findings and failed (un)resolves are reported, not swallowed (#16)."""
