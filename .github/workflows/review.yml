@@ -173,6 +173,8 @@ jobs:
           done
           "$HOME/.local/bin/agy" --version || true
       - name: Install Claude Code (rate-limit fallback)
+        # Optional: if this fails, Gemini still reviews and run_model reports a missing claude.
+        continue-on-error: true
         # npm ci checks every package against the committed lockfile hashes; the package's own
         # installer then links the platform binary that the lockfile already verified.
         run: |

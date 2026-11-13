@@ -67,40 +67,82 @@ class RateLimitTest(unittest.TestCase):
 class ClaudeFallbackTest(unittest.TestCase):
     """A Gemini rate limit hands the retry to Claude Code when ANTHROPIC_API_KEY is set."""
 
-    def run_main(self, tmp, env):
+    def run_main(self, tmp, env, *, which="/usr/bin/claude", agy_side_effect=None,
+                 claude_side_effect=None, validate_side_effect=None):
         import json
         from pathlib import Path
         from unittest import mock
         quota = RuntimeError("agy ERROR (exit 3): Error 429, Status: RESOURCE_EXHAUSTED")
         claude = {"status": "SUCCESS", "structured_output": {"findings": []},
                   "usage": {"input_tokens": 10, "output_tokens": 5}, "cost_usd": 0.42}
-        lib = mock.Mock(build_schema=lambda: {}, validate=lambda doc: [])
+        lib = mock.Mock(build_schema=lambda: {},
+                        validate=validate_side_effect or (lambda doc: []))
         Path(tmp, "ctx.md").write_text("x")
         Path(tmp, "triage.json").write_text("{}")
         argv = ["run_model.py", "--context", f"{tmp}/ctx.md", "--triage", f"{tmp}/triage.json",
                 "--findings-lib", "unused", "--out", f"{tmp}/f.json", "--usage-out", f"{tmp}/u.json"]
         with mock.patch.dict(rm.os.environ, env, clear=True), \
-                mock.patch.object(rm, "run_agy", side_effect=[quota, quota]) as agy, \
-                mock.patch.object(rm, "run_claude", return_value=claude) as cc, \
+                mock.patch.object(rm.shutil, "which", return_value=which), \
+                mock.patch.object(rm, "run_agy", side_effect=agy_side_effect or [quota, quota]) as agy, \
+                mock.patch.object(rm, "run_claude", side_effect=claude_side_effect or [claude]) as cc, \
                 mock.patch.object(rm.time, "sleep") as sleep, \
                 mock.patch.object(rm, "load_findings_lib", return_value=lib), \
                 mock.patch.object(rm.sys, "argv", argv), mock.patch("builtins.print"):
             code = rm.main()
-        return code, agy.call_count, cc.call_count, sleep.call_count, json.loads(Path(tmp, "u.json").read_text())
+        return code, agy, cc, sleep.call_count, json.loads(Path(tmp, "u.json").read_text())
 
     def test_rate_limit_falls_back_to_claude_with_key(self):
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:
             code, agy, cc, slept, usage = self.run_main(tmp, {"ANTHROPIC_API_KEY": "k"})
-        self.assertEqual((code, agy, cc, slept), (0, 1, 1, 0))
+        self.assertEqual((code, agy.call_count, cc.call_count, slept), (0, 1, 1, 0))
         self.assertEqual((usage["engine"], usage["cost_usd"]), ("claude", 0.42))
 
     def test_rate_limit_without_key_waits_and_retries_gemini(self):
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:
             code, agy, cc, slept, usage = self.run_main(tmp, {})
-        self.assertEqual((code, agy, cc, slept), (1, 2, 0, 1))
+        self.assertEqual((code, agy.call_count, cc.call_count, slept), (1, 2, 0, 1))
         self.assertEqual(usage["engine"], "agy")
+        self.assertNotIn("failed validation", agy.call_args_list[1].args[0])
+
+    def test_missing_claude_binary_falls_back_to_gemini_wait(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            code, agy, cc, slept, usage = self.run_main(tmp, {"ANTHROPIC_API_KEY": "k"}, which=None)
+        self.assertEqual((code, agy.call_count, cc.call_count, slept), (1, 2, 0, 1))
+        self.assertEqual(usage["engine"], "agy")
+
+    def test_claude_fallback_gets_its_own_validation_retry_and_clean_prompt(self):
+        import tempfile
+        quota = RuntimeError("agy ERROR (exit 3): Error 429, Status: RESOURCE_EXHAUSTED")
+        agy_bad = {"status": "SUCCESS", "structured_output": {"findings": []}}
+        cc_bad = {"status": "SUCCESS", "structured_output": {"findings": []}, "cost_usd": 0.2}
+        cc_good = {"status": "SUCCESS", "structured_output": {"findings": []}, "cost_usd": 0.3}
+        validations = iter([["agy-schema-err"], ["claude-schema-err"], []])
+        with tempfile.TemporaryDirectory() as tmp:
+            code, agy, cc, slept, usage = self.run_main(
+                tmp, {"ANTHROPIC_API_KEY": "k"},
+                agy_side_effect=[agy_bad, quota],
+                claude_side_effect=[cc_bad, cc_good],
+                validate_side_effect=lambda doc: next(validations),
+            )
+        self.assertEqual((code, agy.call_count, cc.call_count, slept), (0, 2, 2, 0))
+        self.assertNotIn("agy-schema-err", cc.call_args_list[0].args[0])
+        self.assertIn("claude-schema-err", cc.call_args_list[1].args[0])
+        self.assertNotIn("agy-schema-err", cc.call_args_list[1].args[0])
+        self.assertEqual(usage["cost_usd"], 0.5)
+
+    def test_finalize_rate_limit_falls_back_to_claude(self):
+        import tempfile
+        empty = {"status": "SUCCESS", "response": "", "conversation_id": "c1"}
+        quota = RuntimeError("agy ERROR (exit 3): Error 429, Status: RESOURCE_EXHAUSTED")
+        with tempfile.TemporaryDirectory() as tmp:
+            code, agy, cc, slept, usage = self.run_main(
+                tmp, {"ANTHROPIC_API_KEY": "k"}, agy_side_effect=[empty, quota]
+            )
+        self.assertEqual((code, agy.call_count, cc.call_count, slept), (0, 2, 1, 0))
+        self.assertEqual(usage["engine"], "claude")
 
     def test_claude_result_is_normalised_to_agy_shape(self):
         import json
@@ -114,16 +156,26 @@ class ClaudeFallbackTest(unittest.TestCase):
                 mock.patch.object(rm.Path, "read_text", return_value="{}"):
             out = rm.run_claude("p", "s.json", "claude-opus-5-5", ".", "/ctx")
         cmd = run.call_args.args[0]
-        self.assertNotIn("Bash", cmd[cmd.index("--allowedTools"):cmd.index("--disallowedTools")])
+        self.assertIn("--restricted", cmd)
+        self.assertIn("--strict-mcp-config", cmd)
+        self.assertEqual(cmd[cmd.index("--tools") + 1], "Read,Grep,Glob")
+        self.assertEqual(cmd[cmd.index("--add-dir") + 1:cmd.index("--add-dir") + 3],
+                         ["/ctx", str(rm.CLAUDE_SKILLS)])
+        self.assertIn("review/SKILL.md", cmd[cmd.index("-p") + 1])
         self.assertEqual(out["status"], "SUCCESS")
         self.assertEqual(out["usage"], {"input_tokens": 152, "output_tokens": 7})
         self.assertEqual(out["cost_usd"], 0.5)
 
-    def test_claude_error_raises(self):
+    def test_claude_error_raises_from_result_or_errors_or_stderr(self):
         import json
         from unittest import mock
-        proc = mock.Mock(returncode=0, stdout=json.dumps({"is_error": True, "result": "overloaded"}), stderr="")
-        with mock.patch.object(rm.subprocess, "run", return_value=proc), \
-                mock.patch.object(rm.Path, "read_text", return_value="{}"):
-            with self.assertRaisesRegex(RuntimeError, "overloaded"):
-                rm.run_claude("p", "s.json", "claude-opus-5-5", ".", "/ctx")
+        for payload, stderr, expected in [
+            ({"is_error": True, "result": "overloaded"}, "", "overloaded"),
+            ({"is_error": True, "errors": ["bad schema"]}, "", "bad schema"),
+            ({"is_error": True}, "fatal stderr", "fatal stderr"),
+        ]:
+            proc = mock.Mock(returncode=1, stdout=json.dumps(payload), stderr=stderr)
+            with mock.patch.object(rm.subprocess, "run", return_value=proc), \
+                    mock.patch.object(rm.Path, "read_text", return_value="{}"):
+                with self.assertRaisesRegex(RuntimeError, expected):
+                    rm.run_claude("p", "s.json", "claude-opus-5-5", ".", "/ctx")

@@ -20,6 +20,7 @@ import argparse
 import importlib.util
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -33,8 +34,15 @@ RATE_LIMIT_WAIT_S = 120
 # The fallback reviewer. agy serves Claude only to Google-account logins, not API keys,
 # so the fallback runs through Claude Code instead.
 FALLBACK_MODEL = "claude-opus-5-5"
-CLAUDE_TOOLS = ["Read", "Grep", "Glob", "Skill"]
-CLAUDE_DENIED = ["Bash", "Edit", "Write", "NotebookEdit", "WebFetch", "WebSearch", "Task"]
+# --restricted ignores user, project and local settings files, so hooks, apiKeyHelper or
+# permissions a PR adds under .claude/ never load, and it removes the code-running tools.
+# It also drops user skills, so the prompt points Claude at the skill files instead.
+CLAUDE_TOOLS = "Read,Grep,Glob"
+CLAUDE_SKILLS = Path.home() / ".claude" / "skills"
+CLAUDE_SKILLS_NOTE = ("\n\nThe skills are not loaded as tools in this session. Read {d}/review/SKILL.md and "
+                      "{d}/security-review/SKILL.md first, with the references they point to, and "
+                      "follow them exactly as if they had been invoked.\n")
+RUN_ERRORS = (RuntimeError, json.JSONDecodeError, subprocess.TimeoutExpired, OSError)
 
 
 def load_findings_lib(path: str):
@@ -96,9 +104,10 @@ def run_agy(prompt: str, schema: str, model: str, workdir: str, extra_dir: str,
 
 def run_claude(prompt: str, schema: str, model: str, workdir: str, extra_dir: str) -> dict[str, Any]:
     """Run Claude Code read-only and return the result in agy's shape."""
-    cmd = ["claude", "-p", prompt, "--model", model, "--output-format", "json",
-           "--json-schema", Path(schema).read_text(encoding="utf-8"), "--add-dir", extra_dir,
-           "--allowedTools", *CLAUDE_TOOLS, "--disallowedTools", *CLAUDE_DENIED]
+    cmd = ["claude", "-p", prompt + CLAUDE_SKILLS_NOTE.format(d=CLAUDE_SKILLS), "--model", model,
+           "--output-format", "json", "--json-schema", Path(schema).read_text(encoding="utf-8"),
+           "--restricted", "--strict-mcp-config", "--tools", CLAUDE_TOOLS,
+           "--add-dir", extra_dir, str(CLAUDE_SKILLS)]
     proc = subprocess.run(cmd, capture_output=True, text=True, shell=False, cwd=workdir,
                           timeout=TIMEOUT_S)
     try:
@@ -106,7 +115,8 @@ def run_claude(prompt: str, schema: str, model: str, workdir: str, extra_dir: st
     except json.JSONDecodeError:
         raise RuntimeError(f"claude exited {proc.returncode}: {proc.stderr.strip()[-1500:]}") from None
     if proc.returncode != 0 or raw.get("is_error"):
-        raise RuntimeError(f"claude error (exit {proc.returncode}): {str(raw.get('result'))[:1000]}")
+        detail = raw.get("result") or raw.get("errors") or proc.stderr.strip()[-1000:]
+        raise RuntimeError(f"claude error (exit {proc.returncode}): {str(detail)[:1000]}")
     u = raw.get("usage") or {}
     return {"status": "SUCCESS", "structured_output": raw.get("structured_output"),
             "response": raw.get("result"), "num_turns": raw.get("num_turns"),
@@ -115,6 +125,10 @@ def run_claude(prompt: str, schema: str, model: str, workdir: str, extra_dir: st
                       + u.get("cache_creation_input_tokens", 0),
                       "output_tokens": u.get("output_tokens", 0)},
             "cost_usd": raw.get("total_cost_usd")}
+
+
+def can_fall_back() -> bool:
+    return bool(os.environ.get("ANTHROPIC_API_KEY") and shutil.which("claude"))
 
 
 def is_rate_limited(error: str) -> bool:
@@ -170,31 +184,32 @@ def main() -> int:
     schema = Path(args.out).with_name("findings.schema.json")
     schema.write_text(json.dumps(lib.build_schema()), encoding="utf-8")
     base = (ROOT / "prompts" / "review.md").read_text(encoding="utf-8")
-    prompt = f"{base}\n\nContext file: {Path(args.context).resolve()}\n"
+    base_prompt = f"{base}\n\nContext file: {Path(args.context).resolve()}\n"
 
     errors: list[str] = []
+    fix_errors: list[str] = []
     engine = "agy"
     cost_usd = 0.0
-    for attempt in (1, 2):
-        if errors:
-            prompt += ("\n\nYour previous output failed validation. Fix exactly these problems and "
-                       "return the whole document again:\n- " + "\n- ".join(errors[:40]))
+    ctx_dir = str(Path(args.context).resolve().parent)
+    attempt, last = 0, 2
+    while attempt < last:
+        attempt += 1
+        prompt = (base_prompt + "\n\nYour previous output failed validation. Fix exactly these problems and "
+                  "return the whole document again:\n- " + "\n- ".join(fix_errors[:40])
+                  if fix_errors else base_prompt)
         try:
             if engine == "claude":
-                result = run_claude(prompt, str(schema), FALLBACK_MODEL, args.workdir,
-                                    str(Path(args.context).resolve().parent))
+                result = run_claude(prompt, str(schema), FALLBACK_MODEL, args.workdir, ctx_dir)
             else:
-                result = run_agy(prompt, str(schema), args.model, args.workdir,
-                                 str(Path(args.context).resolve().parent))
-        except (RuntimeError, json.JSONDecodeError, subprocess.TimeoutExpired) as exc:
-            errors = [f"run failed: {exc}"]
+                result = run_agy(prompt, str(schema), args.model, args.workdir, ctx_dir)
+        except RUN_ERRORS as exc:
+            errors, fix_errors = [f"run failed: {exc}"], []
             print(f"run_model: attempt {attempt}: {exc}", file=sys.stderr)
-            if attempt == 1 and is_rate_limited(str(exc)):
-                if os.environ.get("ANTHROPIC_API_KEY"):
-                    engine = "claude"
-                    errors = []  # a fresh reviewer, not a correction
+            if engine == "agy" and is_rate_limited(str(exc)):
+                if can_fall_back():
+                    engine, errors, last = "claude", [], attempt + 2  # a fresh reviewer with its own retry
                     print(f"run_model: rate limited; falling back to {FALLBACK_MODEL}", file=sys.stderr)
-                else:
+                elif attempt == 1:
                     # Per-minute quotas (RESOURCE_EXHAUSTED) refill; an immediate retry just fails again.
                     print(f"run_model: rate limited; waiting {RATE_LIMIT_WAIT_S}s", file=sys.stderr)
                     time.sleep(RATE_LIMIT_WAIT_S)
@@ -206,20 +221,30 @@ def main() -> int:
             # Seen in CI: status SUCCESS, thousands of output tokens, but no final message.
             # Ask the same conversation for the answer instead of paying for a fresh review.
             try:
-                result = run_agy(FINALIZE, str(schema), args.model, args.workdir,
-                                 str(Path(args.context).resolve().parent), result["conversation_id"])
+                result = run_agy(FINALIZE, str(schema), args.model, args.workdir, ctx_dir,
+                                 result["conversation_id"])
                 add_usage(usage, result.get("usage"))
                 record_raw(args.out, f"{attempt}-finalize", result)
-            except (RuntimeError, json.JSONDecodeError, subprocess.TimeoutExpired) as exc:
+            except RUN_ERRORS as exc:
                 print(f"run_model: attempt {attempt}: finalize failed: {exc}", file=sys.stderr)
+                if is_rate_limited(str(exc)):
+                    if can_fall_back():
+                        engine, errors, fix_errors, last = "claude", [], [], attempt + 2
+                        print(f"run_model: rate limited; falling back to {FALLBACK_MODEL}", file=sys.stderr)
+                        continue
+                    if attempt == 1:
+                        errors, fix_errors = [f"finalize failed: {exc}"], []
+                        print(f"run_model: rate limited; waiting {RATE_LIMIT_WAIT_S}s", file=sys.stderr)
+                        time.sleep(RATE_LIMIT_WAIT_S)
+                        continue
         try:
             doc = extract(result)
         except (json.JSONDecodeError, TypeError, ValueError) as exc:
-            errors = [f"output is not a JSON document: {exc}. End your final turn with only the "
-                      "complete findings JSON object, no prose and no tool calls"]
+            errors = fix_errors = [f"output is not a JSON document: {exc}. End your final turn with only the "
+                                   "complete findings JSON object, no prose and no tool calls"]
             print(f"run_model: attempt {attempt}: {exc}", file=sys.stderr)
             continue
-        errors = lib.validate(doc)
+        errors = fix_errors = lib.validate(doc)
         if not errors:
             Path(args.out).write_text(json.dumps(doc, indent=1), encoding="utf-8")
             Path(args.usage_out).write_text(json.dumps(usage_record(usage, engine, cost_usd, attempts=attempt)))
@@ -228,7 +253,7 @@ def main() -> int:
         print(f"run_model: attempt {attempt}: {len(errors)} validation errors", file=sys.stderr)
 
     Path(args.usage_out).write_text(json.dumps(usage_record(usage, engine, cost_usd, errors=errors[:40])))
-    print("run_model: no valid findings document after 2 attempts:\n- " + "\n- ".join(errors[:20]),
+    print(f"run_model: no valid findings document after {attempt} attempts:\n- " + "\n- ".join(errors[:20]),
           file=sys.stderr)
     return 1
 
