@@ -221,10 +221,14 @@ def empty_doc(reason: str) -> dict[str, Any]:
 
 def _escalation_reason(triage: dict[str, Any]) -> str | None:
     raw = triage.get("escalate_reason")
-    if isinstance(raw, str) and raw.strip():
-        return raw.strip()
-    if raw:
-        return str(raw)
+    if isinstance(raw, str):
+        stripped = raw.strip()
+        if stripped:
+            return stripped
+    elif raw and not isinstance(raw, bool):
+        stripped = str(raw).strip()
+        if stripped:
+            return stripped
     if triage.get("size_exceeded"):
         return "PR exceeded configured size limit"
     if triage.get("cost_exceeded"):
@@ -248,7 +252,7 @@ def _pick_escalation_id(triage: dict[str, Any]) -> str:
 
 def escalation_doc(reason: str, triage: dict[str, Any] | None = None) -> dict[str, Any]:
     """Build a schema-valid P2 findings document representing a pre-model escalation."""
-    clean_reason = scrub_secrets((reason or "automated review budget or size limit exceeded").strip())
+    clean_reason = scrub_secrets((reason or "").strip()).strip() or "automated review budget or size limit exceeded"
     fid = _pick_escalation_id(triage or {})
     title = f"Review escalated: {clean_reason}"
     if len(title) > 120:
@@ -317,9 +321,17 @@ FINALIZE = ("Your previous turn ended without a final answer. Do not investigate
             "call tools. Return the complete findings JSON document for the review you just did.")
 
 
+def validate_model_slug(model: Any, engine: str = "model") -> str:
+    """Validate a CLI model slug against MODEL_SLUG_RE to prevent option injection."""
+    if not isinstance(model, str) or not model or not MODEL_SLUG_RE.match(model):
+        raise ValueError(f"invalid model slug for {engine}: {model!r}")
+    return model
+
+
 def run_agy(prompt: str, schema: str, model: str, workdir: str, extra_dir: str,
             conversation: str | None = None, *, timeout_s: int | None = None) -> dict[str, Any]:
     """Run Antigravity CLI read-only and return parsed JSON output or raise ModelInvocationError."""
+    validate_model_slug(model, "agy")
     eff = _effective_timeout(timeout_s)
     # The Argon slugs carry their effort (-high/-medium/-low); agy rejects --effort with them.
     cmd = ["agy", "-p", prompt, "--add-dir", extra_dir, "--model", model,
@@ -357,6 +369,7 @@ def run_claude(prompt: str, schema: str, model: str, workdir: str, extra_dir: st
                *, timeout_s: int | None = None, max_turns: int | None = None,
                max_budget_usd: float | None = None) -> dict[str, Any]:
     """Run Claude Code read-only and return the result in agy's shape."""
+    validate_model_slug(model, "claude")
     eff = _effective_timeout(timeout_s)
     turns = (max_turns if max_turns is not None
              else (_ACTIVE_CLAUDE_TURNS if _ACTIVE_CLAUDE_TURNS is not None else CLAUDE_MAX_TURNS))
@@ -436,8 +449,7 @@ def parse_engine_chain(raw_specs: str | list[str] | tuple[str, ...] | None, *,
             model = defaults.get(engine, "")
         if engine not in VALID_ENGINES:
             raise ValueError(f"unknown engine: {engine!r}")
-        if not model or not MODEL_SLUG_RE.match(model):
-            raise ValueError(f"invalid model slug for {engine}: {model!r}")
+        validate_model_slug(model, engine)
         spec = EngineSpec(engine=engine, model=model)
         if spec not in seen:
             seen.add(spec)
@@ -475,6 +487,14 @@ def is_rate_limited(error: str) -> bool:
     return "RESOURCE_EXHAUSTED" in error and "spending cap" not in error.lower()
 
 
+def _has_status_code(lower: str, codes_re: str, reason_re: str) -> bool:
+    if re.search(rf"(?:\b(?:http(?:/\d(?:\.\d)?)?|error|err|status(?:_?code)?|code)\s*[:=]?\s*|\A)(?:{codes_re})\b", lower):
+        return True
+    if re.search(rf":\s+(?:{codes_re})\s*$", lower):
+        return True
+    return bool(re.search(rf"(?<![:\w./-])(?:{codes_re})\s*,?\s*(?:{reason_re})\b", lower))
+
+
 def classify_error(exc: BaseException | str) -> str:
     """Classify an invocation failure into a deterministic failover category."""
     if isinstance(exc, FileNotFoundError):
@@ -498,15 +518,18 @@ def classify_error(exc: BaseException | str) -> str:
             "unauthenticated", "permission_denied", "api_key_invalid", "api key not valid",
             "authentication failed", "authentication_error", "invalid x-api-key",
             "invalid_api_key", "missing api key", "not logged in"))
-            or re.search(r"(?:\bhttp\s*|\berror\s*|\bstatus\s*|\bcode\s*|:\s*|\A)(?:401|403)\b", lower)
-            or re.search(r"\b(?:401|403)\s+(?:unauthorized|forbidden)\b", lower)):
+            or _has_status_code(lower, "401|403", "unauthorized|forbidden")):
         return "auth"
 
     if (is_rate_limited(msg)
             or any(tok in lower for tok in (
                 "rate_limit_error", "rate limit", "overloaded_error", "overloaded",
-                "too many requests", "error 429", "http 429"))
-            or re.search(r"\b(?:429|529)\b", lower)):
+                "too many requests"))
+            or _has_status_code(
+                lower,
+                "429|529",
+                r"too\s+many\s+requests|rate\s*limit|overloaded(?:_error)?|resource_exhausted",
+            )):
         return "rate_limit"
 
     if ("deadline_exceeded" in lower
@@ -520,7 +543,11 @@ def classify_error(exc: BaseException | str) -> str:
             or any(tok in lower for tok in (
                 "bad gateway", "service unavailable", "api_error",
                 "internal server error", "internal error", "unavailable"))
-            or re.search(r"\b(?:500|502|503|504)\b", lower)):
+            or _has_status_code(
+                lower,
+                "500|502|503|504",
+                r"internal\s+server\s+error|internal\s+error|bad\s+gateway|(?:service\s+)?unavailable|gateway\s+time[- ]?out",
+            )):
         return "server_error"
 
     if ("output is not a json document" in lower
@@ -589,9 +616,13 @@ def add_usage(total: dict[str, int], usage: dict[str, Any] | None) -> None:
 def usage_record(usage: dict[str, int], engine: str, cost_usd: float, **extra: Any) -> dict[str, Any]:
     """Build agy.json telemetry preserving backward-compatible keys and total_cost_usd."""
     total = round(float(cost_usd or 0.0), 4)
-    rec: dict[str, Any] = {"usage": usage, "engine": engine, "total_cost_usd": total, **extra}
-    if engine == "claude":
-        rec["cost_usd"] = total
+    rec: dict[str, Any] = {
+        "usage": usage,
+        "engine": engine,
+        "cost_usd": total,
+        "total_cost_usd": total,
+        **extra,
+    }
     return rec
 
 
@@ -680,8 +711,7 @@ def build_verifier_prompt(candidates: list[dict[str, Any]], context_path: Path) 
         "For each candidate finding id, return a verdict:\n"
         "- verdict='confirmed', action='keep': the defect exists at the cited location.\n"
         "- verdict='unsure', action='keep': evidence is ambiguous or insufficient to refute.\n"
-        "- verdict='refuted', action='drop': concrete code proves the finding is a false positive "
-        "(only drops findings without prior_id; continued findings downgrade to nit).\n"
+        "- verdict='refuted', action='drop': concrete code proves the finding is a false positive.\n"
         "- verdict='refuted', action='downgrade_nit': blocking claim is refuted, leaving at most a nit.\n\n"
         "Return strictly a JSON object matching the verifier schema.\n\n"
         f"Context file: {context_path}\n\n"
@@ -713,6 +743,11 @@ def apply_verifier_verdicts(doc: dict[str, Any], candidates: list[dict[str, Any]
     for f in mutated.get("findings", []):
         fid = f.get("id") if isinstance(f, dict) else None
         if not isinstance(fid, str) or fid not in candidate_ids:
+            kept_findings.append(f)
+            continue
+        # Continued/prior findings already have threads or prior state and can only close via fixed/wontfix.
+        if f.get("prior_id") or f.get("status") != "new":
+            confirmed.append(fid)
             kept_findings.append(f)
             continue
         v = by_id.get(fid)
@@ -760,16 +795,15 @@ def _select_verifier_target(verify_mode: str, winning: EngineSpec, *,
 
 
 def _record_result(label: str, result: dict[str, Any], engine: str, model: str,
-                   usage: dict[str, int], usage_by_engine: dict[str, dict[str, int]],
+                   usage_by_engine: dict[str, dict[str, int]],
                    attempt_details: list[dict[str, Any]]) -> float:
-    add_usage(usage, result.get("usage"))
     add_usage(usage_by_engine.setdefault(engine, {}), result.get("usage"))
     attempt_details.append(attempt_meta(label, result, engine=engine, model=model))
     return _attempt_cost_raw(engine, result)
 
 
 def _record_partial(exc: BaseException, label: str, engine: str, model: str,
-                    usage: dict[str, int], usage_by_engine: dict[str, dict[str, int]],
+                    usage_by_engine: dict[str, dict[str, int]],
                     attempt_details: list[dict[str, Any]]) -> float:
     partial = getattr(exc, "partial", None)
     if not isinstance(partial, dict):
@@ -777,7 +811,7 @@ def _record_partial(exc: BaseException, label: str, engine: str, model: str,
             "status": "TIMEOUT" if isinstance(exc, subprocess.TimeoutExpired) else "ERROR",
             "error": scrub_secrets(str(exc)),
         }
-    return _record_result(label, partial, engine, model, usage, usage_by_engine, attempt_details)
+    return _record_result(label, partial, engine, model, usage_by_engine, attempt_details)
 
 
 def _verifier_fallback_meta(effective_mode: str, v_engine: str, v_model: str,
@@ -797,14 +831,15 @@ def _verifier_fallback_meta(effective_mode: str, v_engine: str, v_model: str,
 def run_verifier_pass(doc: dict[str, Any], *, verify_mode: str, winning: EngineSpec,
                       agy_model: str, claude_model: str, out_path: Path,
                       context_path: Path, workdir: str, ctx_dir: str, lib: Any,
-                      usage: dict[str, int], usage_by_engine: dict[str, dict[str, int]],
+                      usage_by_engine: dict[str, dict[str, int]],
                       attempt_details: list[dict[str, Any]]) -> tuple[dict[str, Any], dict[str, Any], float]:
-    """Optionally verify new/reopened P0/P1 findings and return (doc, verifier_meta, added_cost_raw)."""
+    """Optionally verify new P0/P1 findings and return (doc, verifier_meta, added_cost_raw)."""
     candidates = [
         f for f in doc.get("findings", [])
         if isinstance(f, dict)
         and f.get("severity") in ("P0", "P1")
-        and f.get("status") in ("new", "reopened")
+        and f.get("status") == "new"
+        and not f.get("prior_id")
     ]
     if not candidates:
         return doc, {"mode": verify_mode, "checked": [], "confirmed": [], "downgraded": [], "dropped": []}, 0.0
@@ -821,6 +856,7 @@ def run_verifier_pass(doc: dict[str, Any], *, verify_mode: str, winning: EngineS
     v_engine, v_model, effective_mode = _select_verifier_target(
         verify_mode, winning, agy_model=agy_model, claude_model=claude_model,
     )
+    validate_model_slug(v_model, v_engine)
     v_schema = out_path.with_name("verifier.schema.json")
     v_schema.write_text(json.dumps(build_verifier_schema()), encoding="utf-8")
     v_prompt = build_verifier_prompt(candidates, context_path)
@@ -834,12 +870,12 @@ def run_verifier_pass(doc: dict[str, Any], *, verify_mode: str, winning: EngineS
             else:
                 v_res = run_agy(v_prompt, str(v_schema), v_model, workdir, ctx_dir)
     except RUN_ERRORS as exc:
-        added_cost += _record_partial(exc, "verifier", v_engine, v_model, usage, usage_by_engine, attempt_details)
+        added_cost += _record_partial(exc, "verifier", v_engine, v_model, usage_by_engine, attempt_details)
         err_str = scrub_secrets(str(exc))[:300]
         _err(f"run_model: verifier failed ({v_engine}/{v_model}): {err_str}; keeping primary findings")
         return doc, _verifier_fallback_meta(effective_mode, v_engine, v_model, candidates, error=err_str), added_cost
 
-    added_cost += _record_result("verifier", v_res, v_engine, v_model, usage, usage_by_engine, attempt_details)
+    added_cost += _record_result("verifier", v_res, v_engine, v_model, usage_by_engine, attempt_details)
 
     try:
         v_payload = scrub_secrets(extract(v_res))
@@ -925,12 +961,11 @@ def _failover_from(chain: list[EngineSpec], spec: EngineSpec, chain_idx: int,
 
 def _handle_run_error(exc: BaseException, *, label: str, log_prefix: str, err_prefix: str,
                       spec: EngineSpec, chain: list[EngineSpec], chain_idx: int,
-                      eng_attempt: int, usage: dict[str, int],
-                      usage_by_engine: dict[str, dict[str, int]],
+                      eng_attempt: int, usage_by_engine: dict[str, dict[str, int]],
                       attempt_details: list[dict[str, Any]],
                       failover_reasons: list[dict[str, str]]) -> tuple[str, int | None, list[str], float]:
     """Record partial telemetry on failure and decide 'retry', 'failover', or 'abort'."""
-    added_cost = _record_partial(exc, label, spec.engine, spec.model, usage, usage_by_engine, attempt_details)
+    added_cost = _record_partial(exc, label, spec.engine, spec.model, usage_by_engine, attempt_details)
     category = classify_error(exc)
     exc_text = scrub_secrets(str(exc))
     errors = [scrub_secrets(f"{err_prefix}: {exc_text}")]
@@ -940,9 +975,10 @@ def _handle_run_error(exc: BaseException, *, label: str, log_prefix: str, err_pr
     if rem is not None and rem < MIN_ATTEMPT_BUDGET_S:
         return "abort", None, errors, added_cost
 
-    nxt = _failover_from(chain, spec, chain_idx, category, exc_text, failover_reasons)
-    if nxt is not None:
-        return "failover", nxt, errors, added_cost
+    if category not in ("runtime_error", "validation_failure") or eng_attempt >= MAX_ENGINE_ATTEMPTS:
+        nxt = _failover_from(chain, spec, chain_idx, category, exc_text, failover_reasons)
+        if nxt is not None:
+            return "failover", nxt, errors, added_cost
     if category in _IMMEDIATE_NO_RETRY_CATEGORIES:
         return "abort", None, errors, added_cost
     if category == "rate_limit" and eng_attempt == 1:
@@ -983,6 +1019,8 @@ def main() -> int:
         else (os.environ.get("PRG_ENGINES") or cfg.get("engines") or "agy,claude")
     )
     try:
+        validate_model_slug(args.model, "agy")
+        validate_model_slug(args.claude_model, "claude")
         if args.engines is not None:
             parse_engine_chain(args.engines, agy_model=args.model, claude_model=args.claude_model)
         short_code = _handle_triage_short_circuit(triage, lib, out_path, usage_out_path)
@@ -1002,7 +1040,6 @@ def main() -> int:
     base = (ROOT / "prompts" / "review.md").read_text(encoding="utf-8")
     base_prompt = f"{base}\n\nContext file: {context_path}\n"
 
-    usage: dict[str, int] = {}
     usage_by_engine: dict[str, dict[str, int]] = {}
     attempt_details: list[dict[str, Any]] = []
     engines_tried: list[str] = []
@@ -1050,7 +1087,7 @@ def main() -> int:
                         exc, label=str(total_attempts),
                         log_prefix=f"run_model: attempt {total_attempts}", err_prefix="run failed",
                         spec=spec, chain=chain, chain_idx=chain_idx, eng_attempt=eng_attempt,
-                        usage=usage, usage_by_engine=usage_by_engine,
+                        usage_by_engine=usage_by_engine,
                         attempt_details=attempt_details, failover_reasons=failover_reasons,
                     )
                     total_cost_raw += added
@@ -1065,7 +1102,7 @@ def main() -> int:
 
                 total_cost_raw += _record_result(
                     str(total_attempts), result, spec.engine, spec.model,
-                    usage, usage_by_engine, attempt_details,
+                    usage_by_engine, attempt_details,
                 )
 
                 if spec.engine == "agy" and is_empty(result) and result.get("conversation_id"):
@@ -1083,7 +1120,7 @@ def main() -> int:
                                          result["conversation_id"])
                         total_cost_raw += _record_result(
                             f"{total_attempts}-finalize", result, spec.engine, spec.model,
-                            usage, usage_by_engine, attempt_details,
+                            usage_by_engine, attempt_details,
                         )
                     except RUN_ERRORS as exc:
                         action, nxt, errors, added = _handle_run_error(
@@ -1091,7 +1128,7 @@ def main() -> int:
                             log_prefix=f"run_model: attempt {total_attempts}: finalize failed",
                             err_prefix="finalize failed",
                             spec=spec, chain=chain, chain_idx=chain_idx, eng_attempt=eng_attempt,
-                            usage=usage, usage_by_engine=usage_by_engine,
+                            usage_by_engine=usage_by_engine,
                             attempt_details=attempt_details, failover_reasons=failover_reasons,
                         )
                         total_cost_raw += added
@@ -1145,14 +1182,18 @@ def main() -> int:
                     agy_model=agy_m, claude_model=claude_m,
                     out_path=out_path, context_path=context_path,
                     workdir=args.workdir, ctx_dir=ctx_dir, lib=lib,
-                    usage=usage, usage_by_engine=usage_by_engine,
+                    usage_by_engine=usage_by_engine,
                     attempt_details=attempt_details,
                 )
                 total_cost_raw += v_cost
+                v_eng = verifier_meta.get("engine") if isinstance(verifier_meta, dict) else None
+                if isinstance(v_eng, str) and v_eng and v_eng not in engines_tried:
+                    engines_tried.append(v_eng)
 
+            reported_usage = dict(usage_by_engine.get(winning_spec.engine, {}))
             out_path.write_text(json.dumps(scrub_secrets(doc), indent=1), encoding="utf-8")
             rec = scrub_secrets(usage_record(
-                usage, winning_spec.engine, total_cost_raw,
+                reported_usage, winning_spec.engine, total_cost_raw,
                 model=winning_spec.model,
                 usage_by_engine=usage_by_engine,
                 engines_tried=engines_tried,
@@ -1162,11 +1203,12 @@ def main() -> int:
                 verifier=verifier_meta,
             ))
             usage_out_path.write_text(json.dumps(rec), encoding="utf-8")
-            print(f"run_model: {len(doc['findings'])} findings after {total_attempts} attempt(s); usage {usage}")
+            print(f"run_model: {len(doc['findings'])} findings after {total_attempts} attempt(s); usage {reported_usage}")
             return 0
 
+    reported_usage = dict(usage_by_engine.get(last_spec.engine, {}))
     rec = scrub_secrets(usage_record(
-        usage, last_spec.engine, total_cost_raw,
+        reported_usage, last_spec.engine, total_cost_raw,
         model=last_spec.model,
         usage_by_engine=usage_by_engine,
         engines_tried=engines_tried,

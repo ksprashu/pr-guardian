@@ -1031,6 +1031,43 @@ class MultiEngineCostPreservationTest(unittest.TestCase):
                 rm.run_agy("p", "s.json", "gemini-4-argon-high", ".", "/ctx")
         self.assertEqual(ctx.exception.partial["usage"], {"input_tokens": 50_000, "output_tokens": 5_000})
 
+    def test_agy_winner_keeps_claude_tokens_out_of_top_level_usage_and_sets_cost_usd(self):
+        import tempfile
+
+        claude_partial = rm.ModelInvocationError(
+            "claude error (exit 1): 529 overloaded_error",
+            partial={
+                "status": "ERROR",
+                "usage": {"input_tokens": 50_000, "output_tokens": 1_000},
+                "num_turns": 4,
+                "duration_seconds": 6.0,
+                "cost_usd": 0.25,
+                "error": "529 overloaded_error",
+            },
+        )
+        agy_good = {
+            "status": "SUCCESS",
+            "structured_output": _valid_doc(),
+            "usage": {"input_tokens": 20_000, "output_tokens": 2_000},
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            res = _run_main_cli(
+                tmp,
+                argv_extra=["--engines", "claude,agy"],
+                env={"GEMINI_API_KEY": "g-key", "ANTHROPIC_API_KEY": "a-key"},
+                claude_side_effect=[claude_partial],
+                agy_side_effect=[agy_good],
+            )
+
+        expected_total = round(0.25 + rm.agy_cost(agy_good["usage"]), 4)
+        self.assertEqual(res.code, 0)
+        self.assertEqual(res.usage["engine"], "agy")
+        self.assertEqual(res.usage["usage"], agy_good["usage"])
+        self.assertEqual(res.usage["usage_by_engine"]["agy"], agy_good["usage"])
+        self.assertEqual(res.usage["usage_by_engine"]["claude"], {"input_tokens": 50_000, "output_tokens": 1_000})
+        self.assertEqual(res.usage["total_cost_usd"], expected_total)
+        self.assertEqual(res.usage["cost_usd"], expected_total)
+
 
 class EngineChainAndClassifierTest(unittest.TestCase):
     """#33: configurable --engines chain, precedence, error classifier, and failover matrix."""
@@ -1185,6 +1222,64 @@ class EngineChainAndClassifierTest(unittest.TestCase):
             )
         self.assertEqual((res.code, res.agy.call_count, res.cc.call_count), (0, 2, 0))
 
+        # R-003: runtime_error must still retry the same engine first even when a fallback engine is usable.
+        with tempfile.TemporaryDirectory() as tmp:
+            res_fb_ok = _run_main_cli(
+                tmp,
+                env={"GEMINI_API_KEY": "g-key", "ANTHROPIC_API_KEY": "a-key"},
+                agy_side_effect=[io_err, {"status": "SUCCESS", "structured_output": _valid_doc()}],
+                claude_side_effect=[{"status": "SUCCESS", "structured_output": _valid_doc(), "cost_usd": 0.1}],
+            )
+        self.assertEqual((res_fb_ok.code, res_fb_ok.agy.call_count, res_fb_ok.cc.call_count), (0, 2, 0))
+
+        # After exhausting MAX_ENGINE_ATTEMPTS on runtime_error, fail over to the next engine.
+        with tempfile.TemporaryDirectory() as tmp:
+            res_fb_failover = _run_main_cli(
+                tmp,
+                env={"GEMINI_API_KEY": "g-key", "ANTHROPIC_API_KEY": "a-key"},
+                agy_side_effect=[io_err, io_err],
+                claude_side_effect=[{"status": "SUCCESS", "structured_output": _valid_doc(), "cost_usd": 0.1}],
+            )
+        self.assertEqual((res_fb_failover.code, res_fb_failover.agy.call_count, res_fb_failover.cc.call_count),
+                         (0, 2, 1))
+        self.assertEqual(res_fb_failover.usage["failover_reasons"][0]["category"], "runtime_error")
+
+    def test_classify_error_does_not_misclassify_line_numbers_or_bare_counts(self):
+        import tempfile
+
+        for msg in (
+            "agy exited 1: traceback at runner.py:401",
+            "agy exited 1: error in client.js:403: forbidden",
+            "agy exited 1: failed at app.py:429 in main",
+            "agy exited 1: panic at worker.py:529",
+            "agy exited 1: error at srv.go:503",
+            "agy exited 1: processed 429 tokens in 529ms",
+            "agy exited 1: 500 items checked",
+            "agy exited 1: failed: 401, 402",
+        ):
+            self.assertEqual(rm.classify_error(RuntimeError(msg)), "runtime_error", msg)
+
+        for expected, msg in (
+            ("auth", "HTTP/2 401"),
+            ("auth", "status:403"),
+            ("auth", "401 Unauthorized"),
+            ("auth", "agy ERROR (exit 3): 403"),
+            ("rate_limit", "status=429"),
+            ("rate_limit", "429 Too Many Requests"),
+            ("server_error", "status_code: 503"),
+            ("server_error", "502 Bad Gateway"),
+        ):
+            self.assertEqual(rm.classify_error(RuntimeError(msg)), expected, msg)
+
+        trace_err = RuntimeError("agy exited 1: traceback at runner.py:401")
+        with tempfile.TemporaryDirectory() as tmp:
+            res = _run_main_cli(
+                tmp,
+                env={},
+                agy_side_effect=[trace_err, {"status": "SUCCESS", "structured_output": _valid_doc()}],
+            )
+        self.assertEqual((res.code, res.agy.call_count, res.sleep.call_count), (0, 2, 0))
+
     def test_validation_failure_retries_once_then_fails_over_with_clean_prompt(self):
         import tempfile
         from types import SimpleNamespace
@@ -1219,6 +1314,33 @@ class EngineChainAndClassifierTest(unittest.TestCase):
 
         deduped = rm.parse_engine_chain("agy, agy, claude, agy", agy_model="m1", claude_model="m2")
         self.assertEqual(deduped, [rm.EngineSpec("agy", "m1"), rm.EngineSpec("claude", "m2")])
+
+    def test_rejects_malformed_fallback_verifier_model_slugs(self):
+        import tempfile
+        from unittest import mock
+
+        for bad in ("--bad-flag", "", "bad slug", "x" * 129):
+            with self.assertRaisesRegex(ValueError, "invalid model slug"):
+                rm.validate_model_slug(bad, "claude")
+
+        for argv_extra, env in (
+            (["--engines", "agy", "--claude-model=--bad-flag", "--verify", "cross"], {"ANTHROPIC_API_KEY": "a"}),
+            (["--engines", "agy", "--verify", "cross"], {"PRG_CLAUDE_MODEL": "--bad-flag", "ANTHROPIC_API_KEY": "a"}),
+            (["--engines", "claude", "--model=--bad-flag", "--verify", "cross"], {"GEMINI_API_KEY": "g"}),
+            (["--engines", "agy", "--claude-model", "bad slug", "--verify", "cross"], {"ANTHROPIC_API_KEY": "a"}),
+            (["--engines", "agy:gemini-4-argon-high", "--claude-model", "", "--verify", "auto"], {}),
+        ):
+            with tempfile.TemporaryDirectory() as tmp:
+                res = _run_main_cli(tmp, argv_extra=argv_extra, env=env)
+            self.assertEqual(res.code, 1, argv_extra)
+            self.assertEqual((res.agy.call_count, res.cc.call_count), (0, 0), argv_extra)
+
+        with mock.patch.object(rm.subprocess, "run") as sub:
+            with self.assertRaises(ValueError):
+                rm.run_agy("p", "s.json", "--bad-flag", ".", "/ctx")
+            with self.assertRaises(ValueError):
+                rm.run_claude("p", "s.json", "--bad-flag", ".", "/ctx")
+        self.assertEqual(sub.call_count, 0)
 
 
 class TriageEscalationAndCarryForwardTest(unittest.TestCase):
@@ -1260,6 +1382,31 @@ class TriageEscalationAndCarryForwardTest(unittest.TestCase):
         self.assertEqual((res.agy.call_count, res.cc.call_count), (0, 0))
         self.assertEqual(_strict_findings_validate(res.findings), [])
         self.assertTrue(res.usage["escalated"])
+
+    def test_whitespace_escalate_reason_ignored_and_doc_fallback_valid(self):
+        import tempfile
+
+        # Whitespace-only escalate_reason must not trigger escalation.
+        with tempfile.TemporaryDirectory() as tmp:
+            res = _run_main_cli(
+                tmp,
+                triage={"escalate_reason": "   "},
+                agy_side_effect=[{"status": "SUCCESS", "structured_output": _valid_doc()}],
+            )
+        self.assertEqual((res.code, res.agy.call_count), (0, 1))
+        self.assertNotIn("escalated", res.usage)
+
+        # Whitespace-only escalate_reason must not mask size_exceeded default reason.
+        with tempfile.TemporaryDirectory() as tmp:
+            res_sz = _run_main_cli(tmp, triage={"escalate_reason": "  \t ", "size_exceeded": True})
+        self.assertEqual((res_sz.code, res_sz.agy.call_count), (0, 0))
+        self.assertEqual(_strict_findings_validate(res_sz.findings), [])
+        self.assertEqual(res_sz.usage["escalate_reason"], "PR exceeded configured size limit")
+
+        # Direct escalation_doc("   ") must still emit schema-valid non-empty reason.
+        doc = rm.escalation_doc("   ")
+        self.assertEqual(_strict_findings_validate(doc), [])
+        self.assertEqual(doc["not_inspected"][0]["reason"], "automated review budget or size limit exceeded")
 
     def test_noop_rebase_carry_forward_and_invalid_fallback(self):
         import tempfile
@@ -1365,18 +1512,68 @@ class BlockingFindingVerifierTest(unittest.TestCase):
         self.assertEqual(by_id["S-002"]["security_verdict"], "needs_validation")
         self.assertIn("[Verifier downgraded from P1:", by_id["S-002"]["rationale"])
         self.assertNotIn(tok, by_id["S-002"]["rationale"])
-        # Continued finding with prior_id must downgrade rather than drop
-        self.assertEqual(by_id["R-004"]["severity"], "nit")
+        # Reopened / prior findings must never enter verifier candidates or be downgraded.
+        self.assertEqual(by_id["R-004"]["severity"], "P0")
+        self.assertEqual(by_id["R-004"]["status"], "reopened")
         self.assertEqual(by_id["R-004"]["prior_id"], "R-001")
         # Non-candidate P2 untouched
         self.assertEqual(by_id["R-005"]["severity"], "P2")
 
-        self.assertEqual(res.usage["verifier"]["checked"], ["S-001", "S-002", "R-003", "R-004"])
+        self.assertEqual(res.usage["verifier"]["checked"], ["S-001", "S-002", "R-003"])
         self.assertEqual(res.usage["verifier"]["confirmed"], ["S-001"])
-        self.assertEqual(res.usage["verifier"]["downgraded"], ["S-002", "R-004"])
+        self.assertEqual(res.usage["verifier"]["downgraded"], ["S-002"])
         self.assertEqual(res.usage["verifier"]["dropped"], ["R-003"])
         self.assertEqual(res.usage["usage"], {"input_tokens": 2500, "output_tokens": 300})
         self.assertEqual(res.usage["attempt_details"][1]["label"], "verifier")
+
+    def test_verifier_never_downgrades_reopened_or_prior_findings(self):
+        import tempfile
+        import publish_review as pub
+        import state as st
+        import verdict
+
+        reopened = _valid_finding("R-010", severity="P1", status="reopened", prior_id="R-001")
+        with_prior = _valid_finding("R-011", severity="P0", status="new", prior_id="R-002")
+        primary = {"status": "SUCCESS", "structured_output": _valid_doc(reopened, with_prior)}
+        with tempfile.TemporaryDirectory() as tmp:
+            res = _run_main_cli(tmp, argv_extra=["--verify", "self"], agy_side_effect=[primary])
+        self.assertEqual((res.code, res.agy.call_count, res.cc.call_count), (0, 1, 0))
+        self.assertEqual(res.usage["verifier"]["checked"], [])
+        self.assertEqual(res.findings["findings"][0]["severity"], "P1")
+        self.assertEqual(res.findings["findings"][1]["severity"], "P0")
+
+        # Direct apply_verifier_verdicts call also refuses to drop or downgrade continued findings.
+        mut, summary = rm.apply_verifier_verdicts(
+            _valid_doc(reopened, with_prior),
+            [reopened, with_prior],
+            [
+                {"id": "R-010", "verdict": "refuted", "action": "downgrade_nit", "explanation": "false"},
+                {"id": "R-011", "verdict": "refuted", "action": "drop", "explanation": "false"},
+            ],
+        )
+        self.assertEqual([f["severity"] for f in mut["findings"]], ["P1", "P0"])
+        self.assertEqual(summary["downgraded"], [])
+        self.assertEqual(summary["dropped"], [])
+
+        # Confirm publish_review + verdict keep reopened finding blocking and unresolve its thread.
+        prior_state = st.empty_state()
+        prior_state.update(
+            round=1,
+            findings=[_valid_finding("R-001", severity="P1", status="new", prior_id="")],
+        )
+        plan_res = pub.plan(
+            _valid_doc(res.findings["findings"][0]),
+            prior_state,
+            [thread("R-001", resolved=True)],
+            DIFF,
+        )
+        self.assertEqual(len(plan_res["actions"]["unresolve"]), 1)
+        plan_res["state"].update(last_reviewed_sha="abc123", last_reviewed_base="main")
+        dec = verdict.decide(
+            state=plan_res["state"], sha="abc123", labels=[], events=[], owner="o",
+            escalate=False, reason="", review_result="success", fork=False, base_ref="main",
+        )
+        self.assertEqual(dec["state"], "failure")
 
     def test_p2_only_findings_skip_verifier_subprocess(self):
         import tempfile
@@ -1426,8 +1623,12 @@ class BlockingFindingVerifierTest(unittest.TestCase):
         self.assertEqual((res.code, res.agy.call_count, res.cc.call_count), (0, 1, 1))
         self.assertEqual(res.usage["verifier"]["mode"], "cross")
         self.assertEqual(res.usage["verifier"]["engine"], "claude")
+        self.assertEqual(res.usage["usage"], primary["usage"])
+        self.assertEqual(res.usage["usage_by_engine"]["claude"], cc_verify["usage"])
+        self.assertEqual(res.usage["engines_tried"], ["agy", "claude"])
         self.assertAlmostEqual(res.usage["total_cost_usd"],
                                round(rm.agy_cost(primary["usage"]) + 0.15, 4), places=4)
+        self.assertEqual(res.usage["cost_usd"], res.usage["total_cost_usd"])
 
         # Fallback to self when claude unavailable
         with tempfile.TemporaryDirectory() as tmp:
