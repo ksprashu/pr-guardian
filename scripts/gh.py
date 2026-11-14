@@ -42,6 +42,24 @@ def api(path: str, method: str = "GET", body: dict[str, Any] | None = None,
     return data
 
 
+def pr_files(repo: str, pr: int, token: str | None = None) -> list[dict[str, Any]]:
+    """Every changed file of a PR, all pages, as REST returns them.
+
+    Each entry keeps `filename`, `previous_filename` (renames), `status`, `additions` and
+    `deletions`. `gh pr view --json files` stops at 100 files; this does not, though the
+    API itself stops at 3000. A malformed page raises rather than yielding a short list.
+    """
+    data = api(f"repos/{repo}/pulls/{pr}/files?per_page=100", paginate=True, token=token)
+    if data is None:
+        return []
+    if not isinstance(data, list):
+        raise GhError(f"pulls/{pr}/files: expected a list, got {type(data).__name__}")
+    for item in data:
+        if not isinstance(item, dict) or not isinstance(item.get("filename"), str):
+            raise GhError(f"pulls/{pr}/files: malformed entry {str(item)[:200]}")
+    return data
+
+
 def graphql(query: str, **variables: Any) -> Any:
     body = {"query": query, "variables": variables}
     out = _run(["api", "graphql", "--input", "-"], json.dumps(body))

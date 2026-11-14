@@ -19,13 +19,33 @@ def doc(*findings):
             "inspected": [], "not_inspected": [], "findings": list(findings)}
 
 
-def thread(fid, tid=None, resolved=False, last_author="github-actions", severity="P1"):
-    nodes = [{"author": {"login": "github-actions"},
-              "body": f"<!-- pr-guardian:finding id={fid} severity={severity} -->\nbody"}]
-    if last_author != "github-actions":
-        nodes.append({"author": {"login": last_author}, "body": "/ai-review wontfix: because"})
+BOT = "github-actions"
+
+
+def comment(login="dev", body="/ai-review wontfix: because", typename=None, association=None):
+    """One review-thread comment as GraphQL returns it. login=None is a deleted (ghost) user."""
+    if typename is None:
+        typename = "Bot" if login in (BOT, "github-actions[bot]") else "User"
+    if association is None:
+        association = "NONE" if typename == "Bot" else "COLLABORATOR"
+    author = None if login is None else {"__typename": typename, "login": login}
+    return {"author": author, "authorAssociation": association, "body": body, "createdAt": ""}
+
+
+def thread(fid, tid=None, resolved=False, last_author=BOT, severity="P1", last_type=None,
+           last_association=None, last_body="/ai-review wontfix: because", opener=None, replies=None,
+           has_next_page=False):
+    """A finding thread opened by the bot. `replies` (a list of comment()) replaces the
+    default single reply from `last_author`; `opener` replaces the bot's opening comment."""
+    first = opener or comment(BOT, f"<!-- pr-guardian:finding id={fid} severity={severity} -->\nbody")
+    nodes = [first]
+    if replies is not None:
+        nodes += replies
+    elif last_author != BOT:
+        nodes.append(comment(last_author, last_body, last_type, last_association))
     return {"id": tid or f"T-{fid}", "isResolved": resolved, "isOutdated": False,
-            "path": "app.py", "line": 3, "comments": {"nodes": nodes}}
+            "path": "app.py", "line": 3,
+            "comments": {"pageInfo": {"hasNextPage": has_next_page}, "nodes": nodes}}
 
 
 DIFF = """diff --git a/app.py b/app.py
