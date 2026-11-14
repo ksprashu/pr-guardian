@@ -40,8 +40,10 @@ jobs:
     outputs:
       action: ${{ steps.route.outputs.action }}
       pr: ${{ steps.route.outputs.pr }}
+      head_sha: ${{ steps.route.outputs.head_sha }}
       escalate: ${{ steps.route.outputs.escalate }}
       reason: ${{ steps.route.outputs.reason }}
+      bind_override: ${{ steps.route.outputs.bind_override }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -62,6 +64,9 @@ jobs:
       pull-requests: read
     outputs:
       head_sha: ${{ steps.pr.outputs.head_sha }}
+      # The base this scan diffed against; publish records it so a retarget leaves the
+      # verdict pending until a review runs against the new base (GHSA-6h55-p37r-jc34).
+      base_ref: ${{ steps.pr.outputs.base_ref }}
     steps:
       - id: pr
         env:
@@ -242,9 +247,10 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           PR: ${{ needs.route.outputs.pr }}
           SHA: ${{ needs.scan.outputs.head_sha }}
+          BASE: ${{ needs.scan.outputs.base_ref }}
         run: |
           python3 .prg/scripts/publish_review.py --repo "$GITHUB_REPOSITORY" --pr "$PR" --sha "$SHA" \
-            --findings "$RUNNER_TEMP/out/findings.json" \
+            --base="$BASE" --findings "$RUNNER_TEMP/out/findings.json" \
             --usage "$RUNNER_TEMP/out/agy.json"
 
   verdict:
@@ -269,7 +275,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           PR: ${{ needs.route.outputs.pr }}
-          SHA: ${{ needs.scan.outputs.head_sha }}
+          # The event's head when scan did not run or failed early, so verdict.py checks it
+          # against the live head instead of judging whatever was pushed since.
+          SHA: ${{ needs.scan.outputs.head_sha || needs.route.outputs.head_sha }}
           ESCALATE: ${{ needs.route.outputs.escalate }}
           REASON: ${{ needs.route.outputs.reason }}
           # First non-success of scan -> review -> publish, so a failed review reads as an error,
@@ -279,7 +287,11 @@ jobs:
             || needs.scan.result != 'success' && needs.scan.result
             || needs.review.result != 'success' && needs.review.result
             || needs.publish.result }}
-          CLEAR: ${{ needs.route.outputs.reason == 'pull_request.synchronize' }}
+          # true only for the owner's own human-override application: bind it to SHA + base.
+          # Stale overrides are removed on every verdict run, not only on synchronize
+          # (GHSA-q4j9-99qr-cfhw).
+          BIND_OVERRIDE: ${{ needs.route.outputs.bind_override }}
         run: |
           python3 .prg/scripts/verdict.py --repo "$GITHUB_REPOSITORY" --pr "$PR" --sha "$SHA" \
-            --escalate "$ESCALATE" --reason "$REASON" --review-result "$RESULT" --clear-override "$CLEAR"
+            --escalate "$ESCALATE" --reason "$REASON" --review-result "$RESULT" \
+            --bind-override "$BIND_OVERRIDE"
