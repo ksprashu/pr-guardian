@@ -41,6 +41,10 @@ A PR merges only when all of these hold:
 - Every action is pinned by SHA, and every scanner binary is checked against its release SHA-256 (`scripts/install_scanners.sh`).
 - Claude Code installs with `npm ci` from `config/claude-code/package-lock.json`, so its packages are checked against the lockfile hashes.
 - Known gap: agy installs through its official bootstrapper and updates itself, so it is not pinned.
+- Known gap (`GHSA-v7qp-pmhq-cf47`): the ruleset requires `pr-guardian/verdict` from `integration_id: 15368`, which is GitHub Actions itself. Any workflow that runs in the repo with `statuses: write` can post that status, and a same-repo PR runs its own copy of the workflow files, so a writer can forge a green verdict. pr-guardian narrows this but cannot close it yet:
+  - **Workflow tripwire (detection only).** `publish` escalates to `needs-human` when a PR adds, edits, deletes or renames anything under `.github/workflows/` or `.github/actions/`, or when its file list cannot be read in full. The owner reviews the change and applies `human-override`. The only exemption is the governor's own rollout PR, whose caller must be byte for byte the template rendered with the run's 40-hex `guardian_ref`. A PR that edits its caller to skip pr-guardian never reaches the tripwire, and a branch workflow can still post the status directly, so treat every workflow change as owner-review-only.
+  - **Agent identity.** The owner checks (`human-override`, bare `/ai-review`) trust the owner's login. Local coding agents that run `gh` as the owner pass them. Run agents under a separate GitHub account or fine-grained token with no Administration or Workflows access.
+  - **Phase 2.** The real fix posts the verdict as a check run from a dedicated GitHub App, from a default-branch `workflow_run` caller the PR cannot edit, with the app key in a main-only Environment, and pins that app's id in the ruleset (`PRG_VERDICT_APP_ID`).
 
 ## Governor
 
@@ -62,7 +66,10 @@ Never store `GOVERNOR_TOKEN` as a plain repository secret. Any workflow on any b
 
 The governor still writes `GEMINI_API_KEY` as a repository secret on every governed repo, this one included, because the review caller needs it. Anyone who can push a branch to a governed repo can read that copy, so use a key with a spending cap.
 
-Optionally, set the `PRG_REF` variable to the tag or SHA that callers should pin.
+Optionally, set these variables:
+
+- `PRG_REF`: the pr-guardian ref callers pin. Use a full 40-hex commit SHA. The workflow tripwire exempts the caller rollout PR only when the caller pins a commit SHA, so a tag or branch makes every rollout PR wait for the owner's `human-override`.
+- `PRG_VERDICT_APP_ID`: the app id the ruleset requires `pr-guardian/verdict` from. Leave it unset, which keeps `15368` (GitHub Actions), until the Phase 2 verdict app posts the status. Setting it earlier makes every governed PR wait on a status nobody sends. The governor exits with code 2, before touching any repo, if the value is not a positive integer.
 
 ## Development
 

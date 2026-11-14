@@ -6,7 +6,10 @@ Usage:
 
 Needs GH_TOKEN = a fine-grained PAT on all repos with Administration, Secrets,
 Contents, Pull requests and Workflows (read/write), and GEMINI_API_KEY in the
-environment to distribute. PRG_REF pins the reusable workflow ref the callers use.
+environment to distribute. PRG_REF pins the reusable workflow ref the callers use
+(a 40-hex commit SHA, so the publish job can exempt the caller rollout PR from its
+workflow tripwire). PRG_VERDICT_APP_ID optionally overrides the app id the ruleset
+pins pr-guardian/verdict to (default 15368, GitHub Actions; GHSA-v7qp-pmhq-cf47).
 
 Per repo, in this order (so no repo ever requires a check that cannot run):
   1. settings   squash-only, delete merged branches, auto-merge on
@@ -27,6 +30,7 @@ import argparse
 import base64
 import json
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -39,11 +43,28 @@ INSTALL_BRANCH = "pr-guardian/install"
 RULESET_NAME = "main-via-pr"
 VERDICT_CONTEXT = "pr-guardian/verdict"
 ACTIONS_APP_ID = 15368
+APP_ID_RE = re.compile(r"\A[1-9][0-9]*\Z")
 SECRET = "GEMINI_API_KEY"
 HOME_REPO = "pr-guardian"
 
 SETTINGS = {"allow_squash_merge": True, "allow_merge_commit": False, "allow_rebase_merge": False,
             "delete_branch_on_merge": True, "allow_auto_merge": True}
+
+
+def verdict_app_id() -> int:
+    """The integration the ruleset requires pr-guardian/verdict from.
+
+    PRG_VERDICT_APP_ID unset or blank keeps GitHub Actions (15368), which any workflow in
+    the repo shares (GHSA-v7qp-pmhq-cf47); set it only once a dedicated app posts the
+    verdict, or every governed PR waits on a status nobody sends. Raises ValueError on
+    anything but a positive ASCII integer.
+    """
+    raw = (os.environ.get("PRG_VERDICT_APP_ID") or "").strip()
+    if not raw:
+        return ACTIONS_APP_ID
+    if not APP_ID_RE.match(raw):
+        raise ValueError(f"PRG_VERDICT_APP_ID={raw[:40]!r} is not a positive integer app id")
+    return int(raw)
 
 
 def desired_ruleset() -> dict[str, Any]:
@@ -65,7 +86,7 @@ def desired_ruleset() -> dict[str, Any]:
             {"type": "required_status_checks", "parameters": {
                 "strict_required_status_checks_policy": False,
                 "do_not_enforce_on_create": False,
-                "required_status_checks": [{"context": VERDICT_CONTEXT, "integration_id": ACTIONS_APP_ID}]}},
+                "required_status_checks": [{"context": VERDICT_CONTEXT, "integration_id": verdict_app_id()}]}},
         ],
     }
 
@@ -258,6 +279,12 @@ def main() -> int:
     ap.add_argument("--offset", type=int, default=0)
     ap.add_argument("--report-issue", action="store_true")
     args = ap.parse_args()
+
+    try:  # once, before any repo is touched: a bad id must not half-apply a ruleset
+        verdict_app_id()
+    except ValueError as exc:
+        print(f"::error::{exc}", file=sys.stderr)
+        return 2
 
     owner = os.environ.get("PRG_OWNER") or gh.api("user")["login"]
     ref = os.environ.get("PRG_REF", "v1")

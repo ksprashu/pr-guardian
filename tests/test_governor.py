@@ -106,3 +106,59 @@ class GitlessRepoTest(unittest.TestCase):
             out = g.reconcile(repo, "v1", dry=True, have_key=False)
         self.assertIn("empty repo: caller and ruleset wait for the first commit", out["drift"])
         self.assertFalse(out["errors"][1:], out["errors"])
+
+
+class VerdictAppIdTest(unittest.TestCase):
+    """GHSA-v7qp-pmhq-cf47: the verdict's required integration is configurable, validated up front."""
+
+    def env(self, value):
+        env = {k: v for k, v in g.os.environ.items() if k != "PRG_VERDICT_APP_ID"}
+        if value is not None:
+            env["PRG_VERDICT_APP_ID"] = value
+        return mock.patch.dict(g.os.environ, env, clear=True)
+
+    def pinned(self):
+        return g.desired_ruleset()["rules"][4]["parameters"]["required_status_checks"]
+
+    def test_unset_or_blank_keeps_github_actions(self):
+        for value in (None, "", "   ", "\n"):
+            with self.subTest(value=value), self.env(value):
+                self.assertEqual(g.verdict_app_id(), g.ACTIONS_APP_ID)
+                self.assertEqual(self.pinned(), [{"context": g.VERDICT_CONTEXT, "integration_id": 15368}])
+
+    def test_positive_integer_overrides_dynamically(self):
+        for value, want in (("123456", 123456), (" 987\n", 987), ("1", 1)):
+            with self.subTest(value=value), self.env(value):
+                self.assertEqual(g.verdict_app_id(), want)
+                self.assertEqual(self.pinned()[0]["integration_id"], want)
+
+    def test_override_makes_actions_pinned_ruleset_drift(self):
+        with self.env(None):
+            have = copy.deepcopy(g.desired_ruleset())
+        with self.env("123456"):
+            self.assertIn("ruleset rule required_status_checks differs", g.ruleset_drift(have))
+        with self.env(None):
+            self.assertEqual(g.ruleset_drift(have), [])
+
+    def test_invalid_values_raise(self):
+        for value in ("0", "00", "007", "-5", "+5", "1.5", "1e3", "1_000", "0x10", "12a", "abc",
+                      "١٢٣", "²", "１２", "1 2", "15368;", "None"):
+            with self.subTest(value=value), self.env(value), self.assertRaises(ValueError):
+                g.verdict_app_id()
+
+    def test_main_exits_2_before_any_api_call(self):
+        with self.env("not-an-id"), mock.patch.object(g.gh, "api") as api, \
+                mock.patch.object(g, "list_repos") as lr, \
+                mock.patch.object(g.sys, "argv", ["governor.py", "--dry-run"]), \
+                mock.patch("sys.stderr"), mock.patch("builtins.print"):
+            self.assertEqual(g.main(), 2)
+        api.assert_not_called()
+        lr.assert_not_called()
+
+    def test_main_runs_with_valid_override(self):
+        with self.env("123456"), mock.patch.dict(g.os.environ, {"PRG_OWNER": "o", "GEMINI_API_KEY": ""}), \
+                mock.patch.object(g, "list_repos", return_value=[]) as lr, \
+                mock.patch.object(g.sys, "argv", ["governor.py", "--dry-run"]), \
+                mock.patch("builtins.print"):
+            self.assertEqual(g.main(), 0)
+        lr.assert_called_once_with("o")
