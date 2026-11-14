@@ -841,3 +841,39 @@ class ReviewedBaseWiring(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class VerdictForgeryWiring(unittest.TestCase):
+    """GHSA-v7qp-pmhq-cf47: the publish tripwire and governor app id are wired through the workflows."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.review = REVIEW.read_text()
+        cls.publish = _job_block(cls.review, "publish")
+        cls.governor = (ROOT / ".github" / "workflows" / "governor.yml").read_text()
+        cls.reconcile = _job_block(cls.governor, "reconcile")
+
+    def test_publish_passes_guardian_ref_as_one_value(self):
+        self.assertEqual(_step_env(self.publish, "GUARDIAN_REF"), "${{ inputs.guardian_ref }}")
+        call = [ln for ln in logical_lines(self.publish) if "publish_review.py" in ln]
+        self.assertEqual(len(call), 1, call)
+        args = _tokens(call[0])
+        self.assertIn("--guardian-ref=$GUARDIAN_REF", args)
+        self.assertNotIn("--guardian-ref", args)
+        self.assertNotIn("inputs.guardian_ref", call[0], "inputs reach the script through env, not the shell")
+
+    def test_publish_loads_the_template_from_the_same_ref(self):
+        # The exemption compares against .prg/templates/pr-guardian.yml, so .prg must be guardian_ref.
+        m = re.search(r"repository: ksprashu/pr-guardian\n\s+ref: (.*)\n\s+path: \.prg\n", self.publish)
+        self.assertIsNotNone(m)
+        self.assertEqual(m.group(1).strip(), "${{ inputs.guardian_ref }}")
+
+    def test_template_pins_one_ref_in_both_places(self):
+        text = TEMPLATE.read_text()
+        self.assertIn("review.yml@{{REF}}\n", text)
+        self.assertIn("guardian_ref: {{REF}}\n", text)
+        self.assertEqual(text.count("{{REF}}"), 2)
+
+    def test_governor_passes_verdict_app_id_variable(self):
+        self.assertEqual(_step_env(self.reconcile, "PRG_VERDICT_APP_ID"), "${{ vars.PRG_VERDICT_APP_ID }}")
+        self.assertEqual(_step_env(self.reconcile, "PRG_REF"), "${{ vars.PRG_REF || 'v1' }}")
