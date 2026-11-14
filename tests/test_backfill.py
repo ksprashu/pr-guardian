@@ -135,6 +135,34 @@ class BackfillThreadsTest(unittest.TestCase):
         # PR #3 had only a forged comment -> has_state False, 0 candidates; PR #4 matched R-005 via thread_key!
         self.assertEqual([(c["pr"], c["marker_id"]) for c in report["candidates"]], [(4, "R-005")])
 
+    def test_earlier_round_fixed_finding_survives_subsequent_round_for_backfill(self):
+        import backfill_threads as bf
+        import publish_review as pub
+        from tests.helpers import DIFF, doc
+
+        r1 = pub.plan(
+            doc(finding("R-001", start=2, end=2), finding("R-002", start=3, end=3)),
+            st.empty_state(),
+            [],
+            DIFF,
+        )
+        r2 = pub.plan(
+            doc(finding("R-010", status="fixed", prior_id="R-001"),
+                finding("R-011", status="still_open", prior_id="R-002")),
+            r1["state"],
+            [thread("R-001"), thread("R-002")],
+            DIFF,
+        )
+        r3 = pub.plan(
+            doc(finding("R-020", status="fixed", prior_id="R-011")),
+            r2["state"],
+            [thread("R-001", resolved=False), thread("R-002", resolved=False)],
+            DIFF,
+        )
+        plan = bf.plan_pr(7, r3["state"], [thread("R-001", resolved=False), thread("R-002", resolved=False)])
+        self.assertEqual({c["marker_id"] for c in plan["candidates"]}, {"R-001", "R-002"})
+        self.assertEqual(plan["orphans"], [])
+
 
 if __name__ == "__main__":
     unittest.main()

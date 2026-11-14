@@ -574,6 +574,17 @@ def workflow_signals(files: Any, changed_count: Any,
                "same-repo PR runs its own workflows, so it can rewrite the checks that judge it")
 
 
+def _prior_thread_key(f: dict[str, Any], prior_by_id: dict[str, dict[str, Any]]) -> str:
+    """Root finding id owning a continuation finding's GitHub thread across rounds."""
+    prior_id = f.get("prior_id") or ""
+    old_f = prior_by_id.get(prior_id) if prior_id else None
+    if old_f:
+        tkey = old_f.get("thread_key") or old_f.get("prior_id") or old_f["id"]
+        if isinstance(tkey, str) and tkey:
+            return tkey
+    return prior_id or f["id"]
+
+
 def plan(doc: dict[str, Any], prior: dict[str, Any], thread_list: list[dict[str, Any]],
          diff: str, files: Any = None, changed_count: Any = None,
          caller_ok: Callable[[], bool] | None = None, *,
@@ -595,7 +606,7 @@ def plan(doc: dict[str, Any], prior: dict[str, Any], thread_list: list[dict[str,
                    if isinstance(old, dict) and isinstance(old.get("id"), str)}
     seen_prior: set[str] = set()
     # Strip internal / provenance keys from untrusted model output.
-    findings = [{k: v for k, v in f.items() if k not in ("raised_by", "_anchor")}
+    findings = [{k: v for k, v in f.items() if k not in ("raised_by", "_anchor", "thread_key", "posted")}
                 for f in doc["findings"]]
     for f in findings:
         check_finding(f)
@@ -624,32 +635,37 @@ def plan(doc: dict[str, Any], prior: dict[str, Any], thread_list: list[dict[str,
 
     r_cap = BODY_CAPS["rationale"]
     for f in findings:
-        if f.get("prior_id"):
-            seen_prior.add(f["prior_id"])
+        prior_id = f.get("prior_id") or ""
+        if prior_id:
+            seen_prior.add(prior_id)
         if f["severity"] == "nit":
             if f["status"] not in st_closed():
                 actions["nits"].append(f)
             continue
-        thread = threads.get(f["prior_id"] or f["id"])
+        old_f = prior_by_id.get(prior_id) if (f.get("status") != "new" and prior_id) else None
+        tkey = f["id"] if f.get("status") == "new" else _prior_thread_key(f, prior_by_id)
+        thread = threads.get(tkey)
         status = f["status"]
         coerced = False
 
         # The model's say-so is not pushback: only a writer's wontfix in the finding's own
         # thread, after the bot's last word, can close a blocking finding. Otherwise it stays
         # open (and blocking in state) and the summary says why (GHSA-j3g5-fvc6-rrjw).
-        if status == "accepted_pushback" and not (f.get("prior_id") and thread and has_writer_wontfix(thread)):
+        if status == "accepted_pushback" and not (prior_id and thread and has_writer_wontfix(thread)):
             status = f["status"] = "still_open"
             coerced = True
             actions["signals"].append(f"{UNAUTH_PUSHBACK}: {inline(f['id'])} was marked accepted_pushback "
                                       "without a writer's /ai-review wontfix in its thread; kept open")
 
         if status in st_closed():
+            if tkey and (thread or (old_f and old_f.get("thread_key")) or prior_id):
+                f["thread_key"] = tkey
             if thread and not thread["isResolved"]:
                 verb = "Verified fixed" if status == "fixed" else "Pushback accepted"
                 actions["resolve"].append({"thread": thread["id"], "body": _status(f, status)
                                            + f"✅ {verb}: {clean(f['rationale'])[:r_cap]}"})
             if status == "accepted_pushback":
-                new_state["accepted"].append({"id": f["prior_id"], "file": f["file"], "rule": f["rule"]})
+                new_state["accepted"].append({"id": tkey, "file": f["file"], "rule": f["rule"]})
             continue
 
         if status == "new" and (f["file"], f["rule"]) in accepted_keys:
@@ -657,8 +673,9 @@ def plan(doc: dict[str, Any], prior: dict[str, Any], thread_list: list[dict[str,
                                       f"({inline(f['file'])}, {inline(f['rule'])})")
 
         if thread:
+            f["thread_key"] = tkey
             if status == "reopened":
-                key = f["prior_id"]
+                key = tkey
                 new_state["reopen_counts"][key] = new_state["reopen_counts"].get(key, 0) + 1
                 if new_state["reopen_counts"][key] >= REOPEN_ESCALATION:
                     actions["signals"].append(f"{inline(key)} reopened {new_state['reopen_counts'][key]} times")
@@ -673,19 +690,34 @@ def plan(doc: dict[str, Any], prior: dict[str, Any], thread_list: list[dict[str,
 
         if anchorable(f, lines):
             f["_anchor"] = anchor(f, lines)
+            f["thread_key"] = f["id"]
             actions["comments"].append(f)
         else:
+            if old_f and isinstance(old_f.get("thread_key"), str) and old_f["thread_key"]:
+                f["thread_key"] = old_f["thread_key"]
             actions["outside"].append(f)
 
     has_fresh_gate = any(f.get("rule") == "PRG-GATE" and f.get("status") not in st_closed() for f in findings)
+    existing_ids = {f["id"] for f in findings}
     for old in prior["findings"]:
-        if (old.get("severity") in BLOCKING and old.get("status") not in st_closed()
-                and old["id"] not in seen_prior
-                and old["id"] not in {f["id"] for f in findings}):
+        if not isinstance(old, dict):
+            continue
+        oid = old.get("id")
+        if not isinstance(oid, str) or oid in seen_prior or oid in existing_ids:
+            continue
+        if old.get("status") in st_closed():
+            findings.append(dict(old))
+            existing_ids.add(oid)
+            continue
+        if old.get("severity") in BLOCKING:
+            old_tkey = old.get("thread_key") or old.get("prior_id") or oid
             if old.get("rule") == "PRG-GATE" and (not has_budget_reason or has_fresh_gate):
-                closed_gate = dict(old, status="fixed", prior_id=old["id"])
+                closed_gate = dict(old, status="fixed", prior_id=oid)
+                gate_thread = threads.get(old_tkey)
+                if old_tkey and (old.get("thread_key") or gate_thread):
+                    closed_gate["thread_key"] = old_tkey
                 findings.append(closed_gate)
-                gate_thread = threads.get(old["id"])
+                existing_ids.add(oid)
                 if gate_thread and not gate_thread["isResolved"]:
                     actions["resolve"].append({
                         "thread": gate_thread["id"],
@@ -693,9 +725,12 @@ def plan(doc: dict[str, Any], prior: dict[str, Any], thread_list: list[dict[str,
                         + "✅ Verified fixed: PR gate condition cleared.",
                     })
                 continue
-            carried = dict(old, status="still_open", prior_id=old["id"])
+            carried = dict(old, status="still_open", prior_id=oid)
+            if old_tkey and (old.get("thread_key") or threads.get(old_tkey)):
+                carried["thread_key"] = old_tkey
             findings.append(carried)
-            actions["signals"].append(f"unaccounted: reviewer dropped {inline(old['id'])} without a status; kept open")
+            existing_ids.add(oid)
+            actions["signals"].append(f"unaccounted: reviewer dropped {inline(oid)} without a status; kept open")
 
     new_state["id_high_water"] = high_water([*used, *(f["id"] for f in findings)], hw)
 
@@ -727,7 +762,8 @@ def plan(doc: dict[str, Any], prior: dict[str, Any], thread_list: list[dict[str,
 
 
 def _status(f: dict[str, Any], status: str) -> str:
-    return STATUS_MARKER.format(id=_marker_id(f["prior_id"] or f["id"]), status=_marker_id(status)) + "\n"
+    tid = f.get("thread_key") or f["prior_id"] or f["id"]
+    return STATUS_MARKER.format(id=_marker_id(tid), status=_marker_id(status)) + "\n"
 
 
 def st_closed() -> tuple[str, ...]:
@@ -1147,6 +1183,12 @@ def execute(repo: str, pr: int, sha: str, doc: dict[str, Any], result: dict[str,
                       f"listed in summary ({why})", file=sys.stderr)
                 if "posted" in f_item:
                     f_item["posted"] = "summary"
+                f_item.pop("thread_key", None)
+                for sf in s.get("findings", []):
+                    if isinstance(sf, dict) and sf.get("id") == f_item["id"]:
+                        sf.pop("thread_key", None)
+                        if "posted" in sf:
+                            sf["posted"] = "summary"
                 a["outside"].append(f_item)
                 degraded_ids.add(f_item["id"])
 

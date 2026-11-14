@@ -102,7 +102,7 @@ def summarize_pr(repo: str, pr_meta: dict[str, Any], state: dict[str, Any]) -> d
             fixed += 1
         elif st_val == "accepted_pushback":
             accepted_pushback += 1
-            for k in ("id", "prior_id"):
+            for k in ("id", "prior_id", "thread_key"):
                 if isinstance(f.get(k), str) and f[k]:
                     seen_accepted_ids.add(f[k])
         elif sev in BLOCKING:

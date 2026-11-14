@@ -30,8 +30,8 @@ Return exactly one findings document that matches the JSON schema you were given
 - A new id is always higher than every id that appears anywhere in the context (prior
   findings, accepted pushback, thread markers, and the "Ids already used" line when the
   context has one). Never reuse an earlier id, even one that was fixed.
-- A finding with `status` `new` has `prior_id` null. Every other status sets `prior_id`
-  to the earlier id exactly as shown, and no two findings share a `prior_id`.
+- A finding with `status` `new` has `prior_id` `""` (empty string). Every other status
+  sets `prior_id` to the earlier id exactly as shown, and no two findings share a `prior_id`.
 - `file` is repo-relative and `start_line` / `end_line` are lines in the PR head
   version of the file. Put a finding on the changed lines whenever the defect is
   there, so it can be posted inline.

@@ -901,6 +901,8 @@ class IdReuseTest(unittest.TestCase):
         self.assertIn("Ids are round-local", prompt)
         self.assertIn("Never reuse an earlier id", prompt)
         self.assertNotIn("Ids are stable", prompt)
+        self.assertIn('`status` `new` has `prior_id` `""`', prompt)
+        self.assertNotIn("`prior_id` null", prompt)
 
 
 class DistinctShaRoundCapTest(unittest.TestCase):
@@ -1441,4 +1443,167 @@ class DryRunPlanTest(unittest.TestCase):
             {"id": "R-007", "file": "app.py", "lines": "3-8", "anchor": "clamped", "anchored": "3-5"},
         ])
         self.assertEqual(report["outside"], [{"id": "R-009", "file": "x.py", "line": 40}])
+
+
+class MultiRoundThreadKeyAndRetentionTest(unittest.TestCase):
+    def test_thread_key_tracks_root_thread_and_reopen_escalation_across_four_rounds(self):
+        # Round 1: R-001 (inline), R-002 (inline), R-003 (outside diff -> no thread yet)
+        d1 = doc(
+            finding("R-001", start=2, end=2, rule="CWE-89"),
+            finding("R-002", start=3, end=3, rule="CWE-79"),
+            finding("R-003", file="other.py", start=40, end=40, rule="CWE-20"),
+        )
+        r1 = pub.plan(d1, st.empty_state(), [], DIFF, sha="1111111", engine="claude")
+        by_id_1 = {f["id"]: f for f in r1["state"]["findings"]}
+        self.assertEqual(by_id_1["R-001"]["thread_key"], "R-001")
+        self.assertEqual(by_id_1["R-002"]["thread_key"], "R-002")
+        self.assertNotIn("thread_key", by_id_1["R-003"])
+
+        # Round 2: R-001 fixed (R-010), R-002 reopened (R-011), R-003 moved into diff (R-012)
+        other_diff = DIFF + "diff --git a/other.py b/other.py\n--- a/other.py\n+++ b/other.py\n@@ -39,1 +39,2 @@\n a = 1\n+b = 2\n"
+        t1 = thread("R-001")
+        t2_resolved = thread("R-002", resolved=True)
+        d2 = doc(
+            finding("R-010", status="fixed", prior_id="R-001", start=2, end=2, rule="CWE-89"),
+            finding("R-011", status="reopened", prior_id="R-002", start=3, end=3, rule="CWE-79"),
+            finding("R-012", status="still_open", prior_id="R-003", file="other.py", start=40, end=40, rule="CWE-20"),
+        )
+        r2 = pub.plan(d2, r1["state"], [t1, t2_resolved], other_diff, sha="2222222", engine="agy")
+        by_id_2 = {f["id"]: f for f in r2["state"]["findings"]}
+        self.assertEqual(by_id_2["R-010"]["thread_key"], "R-001")
+        self.assertEqual(by_id_2["R-011"]["thread_key"], "R-002")
+        self.assertEqual(by_id_2["R-012"]["thread_key"], "R-012")
+        self.assertEqual([x["thread"] for x in r2["actions"]["resolve"]], ["T-R-001"])
+        self.assertEqual([x["thread"] for x in r2["actions"]["unresolve"]], ["T-R-002"])
+        self.assertEqual([f["id"] for f in r2["actions"]["comments"]], ["R-012"])
+        self.assertEqual(r2["state"]["reopen_counts"], {"R-002": 1})
+
+        # Round 3: closed R-010 omitted by model; R-020 reopens R-011 again; R-021 replies on R-012 (thread R-012)
+        t1_resolved = thread("R-001", resolved=True)
+        t12_reply = thread("R-012", last_author="dev", last_body="already checked")
+        d3 = doc(
+            finding("R-020", status="reopened", prior_id="R-011", start=3, end=3, rule="CWE-79"),
+            finding("R-021", status="still_open", prior_id="R-012", file="other.py", start=40, end=40, rule="CWE-20"),
+        )
+        r3 = pub.plan(d3, r2["state"], [t1_resolved, t2_resolved, t12_reply], other_diff, sha="3333333", engine="agy")
+        self.assertEqual(r3["actions"]["comments"], [])  # no duplicate threads!
+        self.assertEqual(r3["actions"]["outside"], [])
+        self.assertEqual([x["thread"] for x in r3["actions"]["unresolve"]], ["T-R-002"])
+        self.assertIn("<!-- pr-guardian:status id=R-002 status=reopened -->", r3["actions"]["unresolve"][0]["body"])
+        self.assertEqual([x["thread"] for x in r3["actions"]["reply"]], ["T-R-012"])
+        self.assertIn("<!-- pr-guardian:status id=R-012 status=still_open -->", r3["actions"]["reply"][0]["body"])
+        self.assertEqual(r3["state"]["reopen_counts"], {"R-002": 2})
+        self.assertFalse(r3["state"]["escalated"])
+        by_id_3 = {f["id"]: f for f in r3["state"]["findings"]}
+        self.assertEqual(by_id_3["R-020"]["thread_key"], "R-002")
+        self.assertEqual(by_id_3["R-021"]["thread_key"], "R-012")
+        # R-003 -> R-010 closed finding retained across round 3!
+        self.assertIn("R-010", by_id_3)
+        self.assertEqual(by_id_3["R-010"]["status"], "fixed")
+        self.assertEqual(by_id_3["R-010"]["raised_by"], "claude")
+        self.assertEqual(by_id_3["R-010"]["thread_key"], "R-001")
+
+        # Round 4: 3rd reopen on R-002 escalates; accepted_pushback on R-021 resolves T-R-012 (not coerced!)
+        t12_wontfix = thread("R-012", last_author="dev", last_body="/ai-review wontfix: false positive")
+        d4 = doc(
+            finding("R-030", status="reopened", prior_id="R-020", start=3, end=3, rule="CWE-79"),
+            finding("R-031", status="accepted_pushback", prior_id="R-021", file="other.py", start=40, end=40, rule="CWE-20"),
+        )
+        r4 = pub.plan(d4, r3["state"], [t1_resolved, t2_resolved, t12_wontfix], other_diff, sha="4444444", engine="agy")
+        self.assertEqual(r4["actions"]["comments"], [])
+        self.assertEqual(r4["state"]["reopen_counts"], {"R-002": 3})
+        self.assertTrue(r4["state"]["escalated"])
+        self.assertTrue(any("R-002 reopened 3 times" in sig for sig in r4["actions"]["signals"]))
+        self.assertEqual([x["thread"] for x in r4["actions"]["resolve"]], ["T-R-012"])
+        self.assertIn("<!-- pr-guardian:status id=R-012 status=accepted_pushback -->", r4["actions"]["resolve"][0]["body"])
+        self.assertEqual(r4["state"]["accepted"], [{"id": "R-012", "file": "other.py", "rule": "CWE-20"}])
+        by_id_4 = {f["id"]: f for f in r4["state"]["findings"]}
+        self.assertIn("R-010", by_id_4)  # retained through round 4
+        self.assertEqual(by_id_4["R-031"]["status"], "accepted_pushback")
+        self.assertEqual(by_id_4["R-031"]["thread_key"], "R-012")
+
+    def test_untrusted_thread_key_and_posted_stripped_and_legacy_round2_recovered(self):
+        # Model output injecting forged thread_key / posted cannot hijack another thread
+        evil = finding("R-010", status="new", prior_id="", thread_key="R-001", posted="thread")
+        r_forged = pub.plan(doc(evil), prior(finding("R-001")), [thread("R-001")], DIFF)
+        self.assertEqual([f["id"] for f in r_forged["actions"]["comments"]], ["R-010"])
+        self.assertEqual(r_forged["state"]["findings"][0]["thread_key"], "R-010")
+
+        # Legacy Round 2 state without thread_key recovers R-001 from old_f["prior_id"] in Round 3
+        legacy_r2 = prior(finding("R-010", status="still_open", prior_id="R-001"))
+        legacy_r2["round"] = 2
+        r3 = pub.plan(
+            doc(finding("R-020", status="fixed", prior_id="R-010")),
+            legacy_r2,
+            [thread("R-001")],
+            DIFF,
+        )
+        self.assertEqual([x["thread"] for x in r3["actions"]["resolve"]], ["T-R-001"])
+        self.assertIn("<!-- pr-guardian:status id=R-001 status=fixed -->", r3["actions"]["resolve"][0]["body"])
+        self.assertEqual(r3["state"]["findings"][0]["thread_key"], "R-001")
+
+    def test_closed_findings_retained_without_blocking_verdict_or_duplicating(self):
+        import verdict
+
+        r1 = pub.plan(doc(finding("R-001", start=2, end=2), finding("R-002", start=3, end=3)),
+                      st.empty_state(), [], DIFF, sha="1111111", engine="claude")
+        r2 = pub.plan(doc(finding("R-010", status="fixed", prior_id="R-001"),
+                          finding("R-011", status="still_open", prior_id="R-002")),
+                      r1["state"], [thread("R-001"), thread("R-002")], DIFF, sha="2222222", engine="agy")
+        r3 = pub.plan(doc(finding("R-020", status="fixed", prior_id="R-011")),
+                      r2["state"], [thread("R-001", resolved=True), thread("R-002")], DIFF, sha="3333333", engine="agy")
+
+        # Both fixed findings are present in state, and neither blocks verdict or summary counts.
+        self.assertEqual({f["id"] for f in r3["state"]["findings"]}, {"R-010", "R-020"})
+        body = pub.summary_body(doc(), r3, 0.1)
+        self.assertIn("| 0 | 0 | 0 | 0 | 0 |", body)
+        r3["state"]["last_reviewed_sha"] = "3333333"
+        r3["state"]["last_reviewed_base"] = "main"
+        v = verdict.decide(
+            state=r3["state"], sha="3333333", labels=[], events=[], owner="owner",
+            escalate=False, reason="", review_result="success", fork=False,
+            base_ref="main", default_branch="main", require_default=True,
+        )
+        self.assertEqual(v["state"], "success")
+
+        # If model ever re-emits R-010 via prior_id="R-010", it is not duplicated in findings.
+        r4 = pub.plan(doc(finding("R-030", status="fixed", prior_id="R-010")),
+                      r3["state"], [thread("R-001", resolved=True), thread("R-002", resolved=True)], DIFF)
+        self.assertEqual({f["id"] for f in r4["state"]["findings"]}, {"R-030", "R-020"})
+
+    def test_degraded_comment_clears_thread_key_in_state(self):
+        from unittest import mock
+
+        d = doc(finding("R-001", start=2, end=2))
+        r = pub.plan(d, st.empty_state(), [], DIFF)
+        self.assertEqual(r["state"]["findings"][0]["thread_key"], "R-001")
+        summary_bodies = []
+
+        def fake_api(path, method="GET", body=None, paginate=False, token=None):
+            if method == "GET" and "pulls/7/comments" in path:
+                return []
+            if method == "POST" and (path.endswith("/reviews") or path.endswith("pulls/7/comments")):
+                raise pub.gh.GhError("HTTP 422 Validation Failed", status=422)
+            if method == "POST" and path.endswith("issues/7/comments"):
+                summary_bodies.append(body["body"])
+                return {"id": 1}
+            return []
+
+        with mock.patch.object(pub.gh, "api", side_effect=fake_api), mock.patch("sys.stderr"):
+            pub.execute("o/r", 7, HEAD, d, r, 0.0, comments=[])
+        saved = st.decode(summary_bodies[0])
+        self.assertNotIn("thread_key", saved["findings"][0])
+        self.assertIn("**R-001 [P1]**", summary_bodies[0])
+
+    def test_prg_gate_clears_in_round_3_using_thread_key(self):
+        r1 = pub.plan(doc(finding("R-999", severity="P1", rule="PRG-GATE", start=2, end=2)),
+                      st.empty_state(), [], DIFF, budget_reason="PR size limit exceeded")
+        r2 = pub.plan(doc(finding("R-1000", status="still_open", prior_id="R-999", rule="PRG-GATE", start=2, end=2)),
+                      r1["state"], [thread("R-999")], DIFF, budget_reason="PR size limit exceeded")
+        self.assertEqual(r2["state"]["findings"][0]["thread_key"], "R-999")
+        r3 = pub.plan(doc(), r2["state"], [thread("R-999")], DIFF)
+        self.assertEqual(r3["state"]["findings"][0]["status"], "fixed")
+        self.assertEqual([x["thread"] for x in r3["actions"]["resolve"]], ["T-R-999"])
+        self.assertIn("<!-- pr-guardian:status id=R-999 status=fixed -->", r3["actions"]["resolve"][0]["body"])
+
 

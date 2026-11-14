@@ -199,6 +199,60 @@ class LedgerTest(unittest.TestCase):
         writes = [c for c in calls if c[1] in ("POST", "PATCH")]
         self.assertEqual(writes[0][:2], ("repos/o/gov/issues/21", "PATCH"))
 
+    def test_multi_round_retains_earlier_fixed_and_dedups_accepted_by_thread_key(self):
+        import ledger
+        import publish_review as pub
+        from tests.helpers import DIFF, doc, thread
+
+        r1 = pub.plan(
+            doc(
+                finding("R-001", severity="P1", start=2, end=2, rule="CWE-89"),
+                finding("R-002", severity="P2", start=3, end=3, rule="CWE-79"),
+            ),
+            st.empty_state(),
+            [],
+            DIFF,
+            sha="1111111",
+            engine="claude",
+        )
+        r2 = pub.plan(
+            doc(
+                finding("R-010", status="fixed", prior_id="R-001", severity="P1", start=2, end=2, rule="CWE-89"),
+                finding("R-011", status="still_open", prior_id="R-002", severity="P2", start=3, end=3, rule="CWE-79"),
+            ),
+            r1["state"],
+            [thread("R-001"), thread("R-002")],
+            DIFF,
+            sha="2222222",
+            engine="agy",
+        )
+        r3 = pub.plan(
+            doc(
+                finding("R-020", status="accepted_pushback", prior_id="R-011", severity="P2", start=3, end=3, rule="CWE-79"),
+            ),
+            r2["state"],
+            [thread("R-001", resolved=True), thread("R-002", last_author="dev", last_body="/ai-review wontfix: false positive")],
+            DIFF,
+            sha="3333333",
+            engine="agy",
+        )
+        rec = ledger.summarize_pr(
+            "o/r",
+            {"number": 9, "closed_at": "2026-11-12T00:00:00Z", "merged_at": "2026-11-12T00:00:00Z"},
+            r3["state"],
+        )
+        self.assertEqual(rec["fixed"], 1)
+        self.assertEqual(rec["accepted_pushback"], 1)
+        self.assertEqual(rec["open_at_close"], 0)
+        self.assertEqual(rec["by_severity"]["P1"], 1)
+        self.assertEqual(rec["by_severity"]["P2"], 1)
+        self.assertAlmostEqual(rec["false_positive_proxy"], 0.5, places=4)
+        rep = ledger.build_report(["o/r"], [rec], dt.date(2026, 11, 1), None)
+        self.assertEqual(rep["by_rule"]["CWE-89"]["fixed"], 1)
+        self.assertEqual(rep["by_rule"]["CWE-79"]["accepted_pushback"], 1)
+        self.assertEqual(rep["by_engine"]["claude"]["fixed"], 1)
+        self.assertEqual(rep["by_engine"]["claude"]["accepted_pushback"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()
