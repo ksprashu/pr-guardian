@@ -3,7 +3,7 @@
 
 Usage:
   publish_review.py --repo owner/name --pr N --sha HEAD --findings findings.json
-                    --prior prior.json [--usage agy.json] [--dry-run]
+                    [--prior prior.json] [--usage agy.json] [--dry-run]
 
 The model never runs in this job and this job is the only one holding
 `pull-requests: write`. Everything the model wrote is treated as untrusted
@@ -308,14 +308,19 @@ def main() -> int:
     ap.add_argument("--pr", required=True, type=int)
     ap.add_argument("--sha", required=True)
     ap.add_argument("--findings", required=True)
-    ap.add_argument("--prior", required=True)
+    ap.add_argument("--prior", default=None, help="optional prior state JSON; defaults to live summary comment")
     ap.add_argument("--usage", help="agy --output-format json result, for cost")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
     doc = json.loads(Path(args.findings).read_text(encoding="utf-8"))
-    prior = st.empty_state()
-    prior.update(json.loads(Path(args.prior).read_text(encoding="utf-8")))
+    if args.prior:
+        prior = st.empty_state()
+        prior.update(json.loads(Path(args.prior).read_text(encoding="utf-8")))
+    else:
+        comments = gh.api(f"repos/{args.repo}/issues/{args.pr}/comments", paginate=True) or []
+        summary = st.find_summary_comment(comments)
+        prior = (st.decode(summary["body"]) if summary else None) or st.empty_state()
     record: dict[str, Any] = {}
     if args.usage and Path(args.usage).is_file():
         record = json.loads(Path(args.usage).read_text(encoding="utf-8"))

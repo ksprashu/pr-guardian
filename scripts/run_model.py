@@ -17,9 +17,11 @@ skipped, an empty, valid document is written instead and the reason is recorded.
 from __future__ import annotations
 
 import argparse
+import base64
 import importlib.util
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -65,6 +67,59 @@ def _engine_env(engine: str) -> dict[str, str]:
     if engine == "claude":
         env["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] = "1"
     return env
+
+
+_SECRET_PATTERNS = (
+    re.compile(r"AIza[0-9A-Za-z_-]{35}"),
+    re.compile(r"sk-ant-[0-9A-Za-z_-]{20,}"),
+    re.compile(r"gh[pousr]_[0-9A-Za-z]{36,}"),
+    re.compile(r"github_pat_[0-9A-Za-z_]{22,}"),
+)
+
+
+def _literal_secrets() -> list[str]:
+    vals: list[str] = []
+    for env_name in ("GEMINI_API_KEY", "ANTHROPIC_API_KEY"):
+        val = os.environ.get(env_name, "")
+        if len(val) < 8:
+            continue
+        raw = val.encode("utf-8")
+        b64 = base64.b64encode(raw).decode("ascii")
+        ub64 = base64.urlsafe_b64encode(raw).decode("ascii")
+        for candidate in (val, b64, b64.rstrip("="), ub64, ub64.rstrip("=")):
+            if candidate and candidate not in vals:
+                vals.append(candidate)
+    vals.sort(key=len, reverse=True)
+    return vals
+
+
+def scrub_secrets(obj: Any) -> Any:
+    """Recursively replace env model keys (and base64 forms) and token patterns with [REDACTED]."""
+    literals = _literal_secrets()
+    lit_re = re.compile("|".join(re.escape(s) for s in literals)) if literals else None
+
+    def _walk(item: Any) -> Any:
+        if isinstance(item, str):
+            text = lit_re.sub("[REDACTED]", item) if lit_re else item
+            for pat in _SECRET_PATTERNS:
+                text = pat.sub("[REDACTED]", text)
+            return text
+        if isinstance(item, list):
+            return [_walk(x) for x in item]
+        if isinstance(item, tuple):
+            return tuple(_walk(x) for x in item)
+        if isinstance(item, dict):
+            return {
+                (_walk(k) if isinstance(k, str) else k): _walk(v)
+                for k, v in item.items()
+            }
+        return item
+
+    return _walk(obj)
+
+
+def _err(msg: str) -> None:
+    print(scrub_secrets(msg), file=sys.stderr)
 
 
 def load_findings_lib(path: str):
@@ -115,12 +170,14 @@ def run_agy(prompt: str, schema: str, model: str, workdir: str, extra_dir: str,
     try:
         result = json.loads(proc.stdout)
     except json.JSONDecodeError:
-        raise RuntimeError(f"agy exited {proc.returncode}: {proc.stderr.strip()[-1500:]}") from None
+        stderr = scrub_secrets(proc.stderr).strip()[-1500:]
+        raise RuntimeError(f"agy exited {proc.returncode}: {stderr}") from None
     if proc.returncode != 0 or result.get("status") != "SUCCESS":
         # agy prints a structured AGY_ERROR {...} line on stderr; it carries the real cause.
-        detail = [ln for ln in proc.stderr.splitlines() if ln.startswith("AGY_ERROR")]
+        detail = [ln for ln in scrub_secrets(proc.stderr).splitlines() if ln.startswith("AGY_ERROR")]
+        err_msg = scrub_secrets(str(result.get("error")))[:1000]
         raise RuntimeError(f"agy {result.get('status')} (exit {proc.returncode}): "
-                           f"{str(result.get('error'))[:1000]} {' '.join(detail)[:1000]}".rstrip())
+                           f"{err_msg} {' '.join(detail)[:1000]}".rstrip())
     return result
 
 
@@ -135,10 +192,11 @@ def run_claude(prompt: str, schema: str, model: str, workdir: str, extra_dir: st
     try:
         raw = json.loads(proc.stdout)
     except json.JSONDecodeError:
-        raise RuntimeError(f"claude exited {proc.returncode}: {proc.stderr.strip()[-1500:]}") from None
+        stderr = scrub_secrets(proc.stderr).strip()[-1500:]
+        raise RuntimeError(f"claude exited {proc.returncode}: {stderr}") from None
     if proc.returncode != 0 or raw.get("is_error"):
-        detail = raw.get("result") or raw.get("errors") or proc.stderr.strip()[-1000:]
-        raise RuntimeError(f"claude error (exit {proc.returncode}): {str(detail)[:1000]}")
+        detail = raw.get("result") or raw.get("errors") or proc.stderr.strip()
+        raise RuntimeError(f"claude error (exit {proc.returncode}): {scrub_secrets(str(detail))[:1000]}")
     u = raw.get("usage") or {}
     return {"status": "SUCCESS", "structured_output": raw.get("structured_output"),
             "response": raw.get("result"), "num_turns": raw.get("num_turns"),
@@ -162,11 +220,18 @@ def is_empty(result: dict[str, Any]) -> bool:
     return not isinstance(result.get("structured_output"), dict) and not (result.get("response") or "").strip()
 
 
-def record_raw(out: str, label: str, result: dict[str, Any]) -> None:
-    raw = {k: result.get(k) for k in ("status", "num_turns", "duration_seconds", "error", "usage")}
-    raw["response_head"] = (result.get("response") or "")[:4000]
-    raw["has_structured_output"] = isinstance(result.get("structured_output"), dict)
-    Path(out).with_name(f"agy-raw-{label}.json").write_text(json.dumps(raw, indent=1))
+def attempt_meta(label: str, result: dict[str, Any]) -> dict[str, Any]:
+    """Return scrubbed per-attempt metadata without raw response text."""
+    err = result.get("error")
+    return scrub_secrets({
+        "label": label,
+        "status": result.get("status"),
+        "num_turns": result.get("num_turns"),
+        "duration_seconds": result.get("duration_seconds"),
+        "has_structured_output": isinstance(result.get("structured_output"), dict),
+        "error": scrub_secrets(str(err))[:500] if err is not None else None,
+        "usage": result.get("usage"),
+    })
 
 
 def add_usage(total: dict[str, int], usage: dict[str, Any] | None) -> None:
@@ -198,9 +263,12 @@ def main() -> int:
     triage = json.loads(Path(args.triage).read_text(encoding="utf-8"))
     usage: dict[str, int] = {}
     if triage.get("skip_model"):
-        Path(args.out).write_text(json.dumps(empty_doc(triage["reason"])), encoding="utf-8")
-        Path(args.usage_out).write_text(json.dumps({"usage": usage, "skipped": triage["reason"]}))
-        print(f"run_model: skipped ({triage['reason']})")
+        Path(args.out).write_text(json.dumps(scrub_secrets(empty_doc(triage["reason"]))), encoding="utf-8")
+        Path(args.usage_out).write_text(
+            json.dumps(scrub_secrets({"usage": usage, "skipped": triage["reason"]})),
+            encoding="utf-8",
+        )
+        print(scrub_secrets(f"run_model: skipped ({triage['reason']})"))
         return 0
 
     schema = Path(args.out).with_name("findings.schema.json")
@@ -210,6 +278,7 @@ def main() -> int:
 
     errors: list[str] = []
     fix_errors: list[str] = []
+    attempt_details: list[dict[str, Any]] = []
     engine = "agy"
     cost_usd = 0.0
     ctx_dir = str(Path(args.context).resolve().parent)
@@ -225,20 +294,20 @@ def main() -> int:
             else:
                 result = run_agy(prompt, str(schema), args.model, args.workdir, ctx_dir)
         except RUN_ERRORS as exc:
-            errors, fix_errors = [f"run failed: {exc}"], []
-            print(f"run_model: attempt {attempt}: {exc}", file=sys.stderr)
+            errors, fix_errors = [scrub_secrets(f"run failed: {exc}")], []
+            _err(f"run_model: attempt {attempt}: {exc}")
             if engine == "agy" and is_rate_limited(str(exc)):
                 if can_fall_back():
                     engine, errors, last = "claude", [], attempt + 2  # a fresh reviewer with its own retry
-                    print(f"run_model: rate limited; falling back to {FALLBACK_MODEL}", file=sys.stderr)
+                    _err(f"run_model: rate limited; falling back to {FALLBACK_MODEL}")
                 elif attempt == 1:
                     # Per-minute quotas (RESOURCE_EXHAUSTED) refill; an immediate retry just fails again.
-                    print(f"run_model: rate limited; waiting {RATE_LIMIT_WAIT_S}s", file=sys.stderr)
+                    _err(f"run_model: rate limited; waiting {RATE_LIMIT_WAIT_S}s")
                     time.sleep(RATE_LIMIT_WAIT_S)
             continue
         add_usage(usage, result.get("usage"))
         cost_usd += result.get("cost_usd") or 0.0
-        record_raw(args.out, str(attempt), result)
+        attempt_details.append(attempt_meta(str(attempt), result))
         if engine == "agy" and is_empty(result) and result.get("conversation_id"):
             # Seen in CI: status SUCCESS, thousands of output tokens, but no final message.
             # Ask the same conversation for the answer instead of paying for a fresh review.
@@ -246,37 +315,43 @@ def main() -> int:
                 result = run_agy(FINALIZE, str(schema), args.model, args.workdir, ctx_dir,
                                  result["conversation_id"])
                 add_usage(usage, result.get("usage"))
-                record_raw(args.out, f"{attempt}-finalize", result)
+                attempt_details.append(attempt_meta(f"{attempt}-finalize", result))
             except RUN_ERRORS as exc:
-                print(f"run_model: attempt {attempt}: finalize failed: {exc}", file=sys.stderr)
+                _err(f"run_model: attempt {attempt}: finalize failed: {exc}")
                 if is_rate_limited(str(exc)):
                     if can_fall_back():
                         engine, errors, fix_errors, last = "claude", [], [], attempt + 2
-                        print(f"run_model: rate limited; falling back to {FALLBACK_MODEL}", file=sys.stderr)
+                        _err(f"run_model: rate limited; falling back to {FALLBACK_MODEL}")
                         continue
                     if attempt == 1:
-                        errors, fix_errors = [f"finalize failed: {exc}"], []
-                        print(f"run_model: rate limited; waiting {RATE_LIMIT_WAIT_S}s", file=sys.stderr)
+                        errors, fix_errors = [scrub_secrets(f"finalize failed: {exc}")], []
+                        _err(f"run_model: rate limited; waiting {RATE_LIMIT_WAIT_S}s")
                         time.sleep(RATE_LIMIT_WAIT_S)
                         continue
         try:
-            doc = extract(result)
+            doc = scrub_secrets(extract(result))
         except (json.JSONDecodeError, TypeError, ValueError) as exc:
-            errors = fix_errors = [f"output is not a JSON document: {exc}. End your final turn with only the "
-                                   "complete findings JSON object, no prose and no tool calls"]
-            print(f"run_model: attempt {attempt}: {exc}", file=sys.stderr)
+            errors = fix_errors = [scrub_secrets(
+                f"output is not a JSON document: {exc}. End your final turn with only the "
+                "complete findings JSON object, no prose and no tool calls"
+            )]
+            _err(f"run_model: attempt {attempt}: {exc}")
             continue
-        errors = fix_errors = lib.validate(doc)
+        errors = fix_errors = scrub_secrets(lib.validate(doc))
         if not errors:
             Path(args.out).write_text(json.dumps(doc, indent=1), encoding="utf-8")
-            Path(args.usage_out).write_text(json.dumps(usage_record(usage, engine, cost_usd, attempts=attempt)))
+            rec = scrub_secrets(usage_record(usage, engine, cost_usd, attempts=attempt,
+                                             attempt_details=attempt_details))
+            Path(args.usage_out).write_text(json.dumps(rec), encoding="utf-8")
             print(f"run_model: {len(doc['findings'])} findings after {attempt} attempt(s); usage {usage}")
             return 0
-        print(f"run_model: attempt {attempt}: {len(errors)} validation errors", file=sys.stderr)
+        _err(f"run_model: attempt {attempt}: {len(errors)} validation errors")
 
-    Path(args.usage_out).write_text(json.dumps(usage_record(usage, engine, cost_usd, errors=errors[:40])))
-    print(f"run_model: no valid findings document after {attempt} attempts:\n- " + "\n- ".join(errors[:20]),
-          file=sys.stderr)
+    rec = scrub_secrets(usage_record(usage, engine, cost_usd, errors=errors[:40],
+                                     attempt_details=attempt_details))
+    Path(args.usage_out).write_text(json.dumps(rec), encoding="utf-8")
+    _err("run_model: no valid findings document after "
+         f"{attempt} attempts:\n- " + "\n- ".join(errors[:20]))
     return 1
 
 
