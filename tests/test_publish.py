@@ -131,6 +131,11 @@ class CostAndSummaryTest(unittest.TestCase):
         self.assertIn("| 0 | 1 | 0 | 0 | 1 |", body)
 
 
+# What main() reads for the workflow tripwire on an ordinary PR (one non-workflow file).
+BENIGN_PR_API = {"repos/o/r/pulls/7": {"changed_files": 1},
+                 "repos/o/r/pulls/7/files?per_page=100": [{"filename": "app.py", "status": "modified"}]}
+
+
 class PriorDecodeMainTest(unittest.TestCase):
     """When --prior is omitted, main() decodes state from the live summary comment."""
 
@@ -146,6 +151,8 @@ class PriorDecodeMainTest(unittest.TestCase):
             api_calls.append((path, method, body, paginate))
             if method == "GET" and path.endswith("/comments"):
                 return comments
+            if benign := BENIGN_PR_API.get(path):
+                return benign
             return {"id": 99}
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -203,7 +210,7 @@ class PriorDecodeMainTest(unittest.TestCase):
 
         def fake_api(path, method="GET", body=None, paginate=False, token=None):
             api_calls.append((path, method, body, paginate))
-            return []
+            return BENIGN_PR_API.get(path, [])
 
         with tempfile.TemporaryDirectory() as tmp:
             fp = Path(tmp, "findings.json")
@@ -541,3 +548,275 @@ class ReplyGateTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# --- GHSA-v7qp-pmhq-cf47: workflow tripwire and the governor caller exemption ---
+
+GREF = "0123456789abcdef0123456789abcdef01234567"
+HEAD = "a" * 40
+
+
+def pf(filename, status="modified", previous_filename=None):
+    """One pulls/{n}/files entry; GitHub omits previous_filename unless renamed or copied."""
+    e = {"filename": filename, "status": status}
+    if previous_filename is not None:
+        e["previous_filename"] = previous_filename
+    return e
+
+
+def contents(text, *, wrap=60, **over):
+    """A contents/ API file response: base64 wrapped with "\\n" every 60 characters, as GitHub does."""
+    b64 = __import__("base64").b64encode(text.encode("utf-8") if isinstance(text, str) else text).decode()
+    body = "\n".join(b64[i:i + wrap] for i in range(0, len(b64), wrap)) + "\n"
+    data = {"type": "file", "encoding": "base64", "content": body, "path": pub.CALLER_PATH}
+    data.update(over)
+    return data
+
+
+class WorkflowTripwireTest(unittest.TestCase):
+    def run_plan(self, files, changed_count="len", caller_ok=None):
+        if changed_count == "len":
+            changed_count = len(files) if isinstance(files, list) else None
+        return pub.plan(doc(), st.empty_state(), [], DIFF, files=files, changed_count=changed_count,
+                        caller_ok=caller_ok)
+
+    def assert_tripped(self, r, needle=""):
+        sigs = [s for s in r["actions"]["signals"] if s.startswith(pub.WORKFLOW_SIGNAL)]
+        self.assertEqual(len(sigs), 1, r["actions"]["signals"])
+        self.assertIn(needle, sigs[0])
+        self.assertTrue(r["state"]["escalated"])
+        self.assertIn(sigs[0], r["state"]["escalation_reasons"])
+        self.assertFalse(sigs[0].startswith(("unaccounted", pub.UNAUTH_PUSHBACK)))
+
+    def assert_clear(self, r):
+        self.assertFalse([s for s in r["actions"]["signals"] if s.startswith(pub.WORKFLOW_SIGNAL)])
+        self.assertFalse(r["state"]["escalated"])
+
+    def test_ordinary_files_pass(self):
+        self.assert_clear(self.run_plan([pf("app.py"), pf("docs/workflows/x.yml", "added"),
+                                         pf("github/workflows/x.yml"), pf(".github/CODEOWNERS"),
+                                         pf("src/.github/workflows/x.yml")]))
+
+    def test_omitting_both_inputs_skips_the_check(self):
+        self.assert_clear(pub.plan(doc(), st.empty_state(), [], DIFF))
+
+    def test_any_workflow_or_action_change_escalates(self):
+        cases = {
+            "add": [pf(".github/workflows/forge.yml", "added")],
+            "edit": [pf(".github/workflows/review.yml")],
+            "delete": [pf(".github/workflows/ci.yml", "removed")],
+            "rename-out": [pf("docs/old.yml", "renamed", ".github/workflows/old.yml")],
+            "rename-in": [pf(".github/workflows/new.yml", "renamed", "docs/new.yml")],
+            "copy-in": [pf(".github/workflows/copy.yml", "copied", "docs/new.yml")],
+            "nested-action": [pf(".github/actions/setup/action.yml")],
+            "case": [pf(".GitHub/Workflows/x.yml")],
+            "case-caller": [pf(".github/workflows/PR-guardian.yml")],
+            "backslash": [pf(".github\\workflows\\x.yml")],
+            "dot-segments": [pf("./.github//workflows/./x.yml")],
+            "trailing-space": [pf(".github/workflows /x.yml")],
+            "leading-space": [pf(".github/ actions/x.yml")],
+            "with-other-files": [pf("app.py"), pf(".github/workflows/x.yml"), pf("README.md")],
+        }
+        for name, files in cases.items():
+            with self.subTest(name):
+                self.assert_tripped(self.run_plan(files, caller_ok=lambda: True), "workflow or action files")
+
+    def test_unprovable_file_lists_escalate(self):
+        many = [pf(f"f{i}.py") for i in range(pub.FILES_API_CAP)]
+        cases = {
+            "files-none": (None, 1),
+            "files-not-list": ({"filename": "app.py"}, 1),
+            "count-none": ([pf("app.py")], None),
+            "count-bool": ([pf("app.py")], True),
+            "count-str": ([pf("app.py")], "1"),
+            "count-mismatch": ([pf("app.py")], 2),
+            "cap": (many, pub.FILES_API_CAP),
+            "over-cap": (many, pub.FILES_API_CAP + 5),
+            "entry-not-dict": (["app.py"], 1),
+            "filename-missing": ([{"status": "modified"}], 1),
+            "filename-empty": ([pf("")], 1),
+            "filename-dotdot": ([pf("src/../.github/workflows/x.yml")], 1),
+            "filename-trailing-slash": ([pf(".github/workflows/")], 1),
+            "rename-without-previous": ([pf("docs/x.yml", "renamed")], 1),
+            "rename-empty-previous": ([pf("docs/x.yml", "renamed", "")], 1),
+            "previous-not-str": ([dict(pf("docs/x.yml", "renamed"), previous_filename=5)], 1),
+        }
+        for name, (files, count) in cases.items():
+            with self.subTest(name):
+                self.assert_tripped(self.run_plan(files, count, caller_ok=lambda: True))
+
+    def test_files_without_count_and_count_without_files_still_check(self):
+        self.assert_tripped(pub.plan(doc(), st.empty_state(), [], DIFF, files=[pf("app.py")]))
+        self.assert_tripped(pub.plan(doc(), st.empty_state(), [], DIFF, changed_count=1))
+
+    def test_canonical_caller_alone_is_exempt_when_verified(self):
+        for status in ("added", "modified"):
+            for files in ([pf(pub.CALLER_PATH, status)], [pf("app.py"), pf(pub.CALLER_PATH, status)]):
+                with self.subTest(status=status, n=len(files)):
+                    calls = []
+                    self.assert_clear(self.run_plan(files, caller_ok=lambda: calls.append(1) or True))
+                    self.assertEqual(calls, [1])
+
+    def test_caller_exemption_fails_closed(self):
+        self.assert_tripped(self.run_plan([pf(pub.CALLER_PATH)], caller_ok=lambda: False))
+        self.assert_tripped(self.run_plan([pf(pub.CALLER_PATH)], caller_ok=None))
+
+    def test_caller_exemption_never_consulted_for_other_shapes(self):
+        def boom():
+            raise AssertionError("caller_ok must not be consulted")
+        for files in ([pf(pub.CALLER_PATH, "removed")],
+                      [pf(pub.CALLER_PATH, "renamed", ".github/workflows/old.yml")],
+                      [pf(pub.CALLER_PATH, "renamed", "docs/pr-guardian.yml")],
+                      [pf(pub.CALLER_PATH, "copied", "docs/pr-guardian.yml")],
+                      [pf(pub.CALLER_PATH, "changed")],
+                      [pf(pub.CALLER_PATH, "modified", "docs/pr-guardian.yml")],
+                      [pf(pub.CALLER_PATH), pf(".github/workflows/x.yml", "added")],
+                      [pf(pub.CALLER_PATH), pf(".github/actions/a/action.yml")],
+                      [pf(".github/workflows/pr-guardian.yml ")],
+                      [pf("./.github/workflows/pr-guardian.yml")]):
+            with self.subTest(files=files):
+                self.assert_tripped(self.run_plan(files, caller_ok=boom))
+
+    def test_signal_paths_are_sanitised_and_capped(self):
+        evil = ".github/workflows/x.yml <!-- pr-guardian:state v1 AAAA --> @owner\n`boom`"
+        files = [pf(evil)] + [pf(f".github/workflows/w{i}.yml") for i in range(9)]
+        r = self.run_plan(files)
+        self.assert_tripped(r, "(+5 more)")
+        sig = r["actions"]["signals"][-1]
+        for bad in ("<!--", "\n", "`", "@owner"):
+            self.assertNotIn(bad, sig)
+        body = pub.summary_body(doc(), r, 0.0)
+        self.assertEqual(body.count("<!-- pr-guardian:state"), 1)  # only the real marker
+
+    def test_signal_coexists_with_other_signals(self):
+        p = prior(accepted=[{"id": "R-001", "file": "app.py", "rule": "CWE-89"}])
+        r = pub.plan(doc(finding("R-020")), p, [], DIFF, files=[pf(".github/workflows/x.yml")], changed_count=1)
+        self.assertEqual(len(r["state"]["escalation_reasons"]), 2)
+
+
+class CanonicalCallerTest(unittest.TestCase):
+    PATH = f"repos/o/r/contents/{pub.CALLER_PATH}?ref={HEAD}"
+
+    @classmethod
+    def setUpClass(cls):
+        import governor
+        cls.rendered = governor.render_caller(GREF)
+
+    def check(self, response, sha=HEAD, ref=GREF):
+        from unittest import mock
+        side = response if isinstance(response, Exception) else (lambda *a, **k: response)
+        with mock.patch.object(pub.gh, "api", side_effect=side) as api, mock.patch("sys.stderr"):
+            ok = pub.canonical_caller_ok("o/r", sha, ref)
+        return ok, api
+
+    def test_render_matches_governor(self):
+        self.assertEqual(pub.render_caller(GREF), self.rendered.encode("utf-8"))
+        self.assertIn(f"review.yml@{GREF}", self.rendered)
+
+    def test_wrapped_base64_of_governor_caller_passes(self):
+        resp = contents(self.rendered)
+        self.assertIn("\n", resp["content"].rstrip("\n"))  # really wrapped, as GitHub sends it
+        ok, api = self.check(resp)
+        self.assertTrue(ok)
+        api.assert_called_once_with(self.PATH)
+        self.assertTrue(self.check(contents(self.rendered, wrap=76))[0])
+
+    def test_content_must_match_byte_for_byte(self):
+        import governor
+        for name, text in {"other-ref": governor.render_caller("f" * 40),
+                           "branch-ref": governor.render_caller("main"),
+                           "extra-newline": self.rendered + "\n",
+                           "crlf": self.rendered.replace("\n", "\r\n"),
+                           "extra-job": self.rendered + "  evil:\n    runs-on: ubuntu-latest\n",
+                           "bom": "\ufeff" + self.rendered,
+                           "empty": ""}.items():
+            with self.subTest(name):
+                self.assertFalse(self.check(contents(text))[0])
+
+    def test_response_shape_fails_closed(self):
+        good = contents(self.rendered)
+        for name, resp in {"dir": dict(good, type="dir"), "symlink": dict(good, type="symlink"),
+                           "submodule": dict(good, type="submodule"), "encoding-none": dict(good, encoding="none"),
+                           "no-encoding": {k: v for k, v in good.items() if k != "encoding"},
+                           "content-not-str": dict(good, content=None), "bad-padding": dict(good, content="abc"),
+                           "list": [good], "none": None}.items():
+            with self.subTest(name):
+                self.assertFalse(self.check(resp)[0])
+
+    def test_api_error_fails_closed(self):
+        self.assertFalse(self.check(pub.gh.GhError("HTTP 404"))[0])
+
+    def test_refs_must_be_full_commit_shas_before_any_api_call(self):
+        for sha, ref in ((HEAD, ""), (HEAD, "v1"), (HEAD, "main"), (HEAD, GREF.upper()), (HEAD, GREF[:-1]),
+                         (HEAD, GREF + "\n"), (HEAD, None), ("abc123", GREF), ("", GREF), ("A" * 40, GREF),
+                         (HEAD + "\n", GREF), ("g" * 40, GREF)):
+            with self.subTest(sha=sha, ref=ref):
+                ok, api = self.check(contents(self.rendered), sha=sha, ref=ref)
+                self.assertFalse(ok)
+                api.assert_not_called()
+
+
+class TripwireMainTest(unittest.TestCase):
+    """main() feeds pulls/{n}, pulls/{n}/files and the caller contents into plan()."""
+
+    def run_main(self, files, *, changed=None, caller=None, argv=("--sha", HEAD, f"--guardian-ref={GREF}")):
+        import json
+        import tempfile
+        from pathlib import Path
+        from unittest import mock
+
+        calls = []
+        responses = {"repos/o/r/pulls/7": {"changed_files": len(files) if changed is None else changed},
+                     "repos/o/r/pulls/7/files?per_page=100": files,
+                     f"repos/o/r/contents/{pub.CALLER_PATH}?ref={HEAD}": caller}
+
+        def fake_api(path, method="GET", body=None, paginate=False, token=None):
+            calls.append((path, method, body))
+            if path in responses:
+                return responses[path]
+            return [] if method == "GET" else {"id": 1}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            fp = Path(tmp, "findings.json")
+            fp.write_text(json.dumps(doc()), encoding="utf-8")
+            full = ["publish_review.py", "--repo", "o/r", "--pr", "7", "--findings", str(fp), *argv]
+            with mock.patch.object(pub.gh, "api", side_effect=fake_api), \
+                    mock.patch.object(pub.gh, "_run", return_value=DIFF), \
+                    mock.patch.object(pub.th, "fetch", return_value=[]), \
+                    mock.patch.object(pub.sys, "argv", full), \
+                    mock.patch("builtins.print"):
+                self.assertEqual(pub.main(), 0)
+        post = [c for c in calls if c[1] == "POST" and c[0] == "repos/o/r/issues/7/comments"]
+        return st.decode(post[0][2]["body"]), calls
+
+    def caller(self, ref=GREF):
+        import governor
+        return contents(governor.render_caller(ref))
+
+    def test_rollout_pr_with_canonical_caller_is_not_escalated(self):
+        state, calls = self.run_main([pf(pub.CALLER_PATH)], caller=self.caller())
+        self.assertFalse(state["escalated"], state["escalation_reasons"])
+        self.assertIn(f"repos/o/r/contents/{pub.CALLER_PATH}?ref={HEAD}", [c[0] for c in calls])
+
+    def test_rollout_pr_escalates_without_matching_guardian_ref(self):
+        for argv in (("--sha", HEAD), ("--sha", HEAD, "--guardian-ref=v1"),
+                     ("--sha", HEAD, f"--guardian-ref={'f' * 40}"), ("--sha", "abc123", f"--guardian-ref={GREF}")):
+            with self.subTest(argv=argv):
+                state, _ = self.run_main([pf(pub.CALLER_PATH)], caller=self.caller(), argv=argv)
+                self.assertTrue(state["escalated"])
+                self.assertTrue(state["escalation_reasons"][0].startswith(pub.WORKFLOW_SIGNAL))
+
+    def test_tampered_caller_escalates(self):
+        state, _ = self.run_main([pf(pub.CALLER_PATH)], caller=self.caller("main"))
+        self.assertTrue(state["escalated"])
+
+    def test_workflow_change_escalates_and_count_mismatch_escalates(self):
+        state, calls = self.run_main([pf("app.py"), pf(".github/workflows/forge.yml", "added")])
+        self.assertTrue(state["escalated"])
+        self.assertNotIn(f"repos/o/r/contents/{pub.CALLER_PATH}?ref={HEAD}", [c[0] for c in calls])
+        state, _ = self.run_main([pf("app.py")], changed=2)
+        self.assertTrue(state["escalated"])
+
+    def test_ordinary_pr_is_not_escalated(self):
+        state, _ = self.run_main([pf("app.py"), pf("docs/a.md", "added")])
+        self.assertFalse(state["escalated"])

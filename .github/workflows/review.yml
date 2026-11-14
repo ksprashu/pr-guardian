@@ -248,9 +248,12 @@ jobs:
           PR: ${{ needs.route.outputs.pr }}
           SHA: ${{ needs.scan.outputs.head_sha }}
           BASE: ${{ needs.scan.outputs.base_ref }}
+          # The governor's caller rollout PR is exempt from the workflow tripwire only when
+          # its caller is the template rendered with exactly this ref (GHSA-v7qp-pmhq-cf47).
+          GUARDIAN_REF: ${{ inputs.guardian_ref }}
         run: |
           python3 .prg/scripts/publish_review.py --repo "$GITHUB_REPOSITORY" --pr "$PR" --sha "$SHA" \
-            --base="$BASE" --findings "$RUNNER_TEMP/out/findings.json" \
+            --base="$BASE" --guardian-ref="$GUARDIAN_REF" --findings "$RUNNER_TEMP/out/findings.json" \
             --usage "$RUNNER_TEMP/out/agy.json"
 
   verdict:

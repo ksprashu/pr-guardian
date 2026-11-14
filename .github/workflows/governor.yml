@@ -43,6 +43,8 @@ jobs:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           PRG_OWNER: ${{ github.repository_owner }}
           PRG_REF: ${{ vars.PRG_REF || 'v1' }}
+          # Unset = GitHub Actions (15368). Set only once a dedicated verdict app exists (README).
+          PRG_VERDICT_APP_ID: ${{ vars.PRG_VERDICT_APP_ID }}
           DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
           REPOS: ${{ inputs.repos }}
           BATCH: ${{ inputs.batch || 0 }}

@@ -3,7 +3,7 @@
 
 Usage:
   publish_review.py --repo owner/name --pr N --sha HEAD --findings findings.json
-                    [--prior prior.json] [--usage agy.json] [--dry-run]
+                    [--guardian-ref SHA] [--prior prior.json] [--usage agy.json] [--dry-run]
 
 The model never runs in this job and this job is the only one holding
 `pull-requests: write`. Everything the model wrote is treated as untrusted
@@ -22,17 +22,28 @@ Thread policy:
     last comment in the finding's thread  -> kept open (still_open), signalled
   prior open id missing from this round    -> kept open, flagged as unaccounted
   nit                            -> summary comment only, never a thread
+
+Workflow tripwire (GHSA-v7qp-pmhq-cf47): a PR that adds, edits, deletes or renames
+anything under .github/workflows/ or .github/actions/ escalates to needs-human,
+because a same-repo PR runs its own workflow files and can rewrite the checks that
+judge it. The one exemption is the governor's rollout PR: the PR changes only
+.github/workflows/pr-guardian.yml and its content at the reviewed SHA is byte for
+byte templates/pr-guardian.yml rendered with this run's 40-hex guardian ref. This
+is detection, not enforcement: a PR that edits its own caller can drop pr-guardian
+from the run entirely, and any workflow in the repo can still post the status.
 """
 
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 import datetime as dt
 import json
 import re
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import gh
 import state as st
@@ -48,6 +59,14 @@ COERCED_NOTE = ("Still open: pushback is accepted only after someone with write 
                 "`/ai-review wontfix: <reason>` in this thread after pr-guardian's last comment.")
 REOPEN_ESCALATION = 3
 ROUND_CAP = 6
+
+ROOT = Path(__file__).resolve().parent.parent
+CALLER_PATH = ".github/workflows/pr-guardian.yml"
+WORKFLOW_DIRS = ("workflows", "actions")
+WORKFLOW_SIGNAL = "workflow modified"
+FILES_API_CAP = 3000  # pulls/{n}/files silently stops here
+SHA_RE = re.compile(r"\A[0-9a-f]{40}\Z")
+LISTED_PATHS = 5
 
 # Gemini 4 Argon standard pricing, USD per 1M tokens (thinking billed as output).
 PRICES = [(dt.date(2026, 12, 1), 4.0, 20.0), (dt.date(1970, 1, 1), 2.0, 10.0)]
@@ -174,8 +193,114 @@ def has_writer_wontfix(thread: dict[str, Any]) -> bool:
     return any(th.is_writer(c) and WONTFIX_RE.match((c.get("body") or "").strip()) for c in after)
 
 
+# --- workflow tripwire (GHSA-v7qp-pmhq-cf47) ---------------------------------
+
+def _segments(path: Any) -> list[str] | None:
+    """A repo path as its segments, or None when it is not a plain relative file path."""
+    if not isinstance(path, str) or not path or path.endswith(("/", "\\")):
+        return None
+    segs = [s for s in path.replace("\\", "/").split("/") if s not in ("", ".")]
+    if not segs or ".." in segs:
+        return None
+    return segs
+
+
+def is_workflow_path(segs: list[str]) -> bool:
+    """Under .github/workflows/ or .github/actions/, ignoring case and stray whitespace."""
+    return (len(segs) >= 2 and segs[0].strip().lower() == ".github"
+            and segs[1].strip().lower() in WORKFLOW_DIRS)
+
+
+def _show(paths: list[str]) -> str:
+    shown = [inline(p).replace("`", "")[:200] for p in paths[:LISTED_PATHS]]
+    more = len(paths) - len(shown)
+    return ", ".join(shown) + (f" (+{more} more)" if more > 0 else "")
+
+
+def render_caller(guardian_ref: str) -> bytes:
+    """The caller the governor installs for this ref (governor.render_caller), as bytes."""
+    text = (ROOT / "templates" / "pr-guardian.yml").read_text(encoding="utf-8")
+    return text.replace("{{REF}}", guardian_ref).encode("utf-8")
+
+
+def canonical_caller_ok(repo: str, sha: str, guardian_ref: str) -> bool:
+    """The PR's caller at `sha` is byte for byte the governor's caller for `guardian_ref`.
+
+    Both refs must be full commit SHAs, so a mutable branch or tag can never vouch for
+    itself. Any API error or unexpected shape means no exemption.
+    """
+    if not (isinstance(sha, str) and SHA_RE.match(sha)
+            and isinstance(guardian_ref, str) and SHA_RE.match(guardian_ref)):
+        return False
+    try:
+        data = gh.api(f"repos/{repo}/contents/{CALLER_PATH}?ref={sha}")
+    except gh.GhError as exc:
+        print(f"::warning::could not read {CALLER_PATH} at {sha}: {exc}", file=sys.stderr)
+        return False
+    if not (isinstance(data, dict) and data.get("type") == "file" and data.get("encoding") == "base64"
+            and isinstance(data.get("content"), str)):
+        return False
+    try:
+        # GitHub wraps the base64 at 60 columns with "\n", so no validate=True here.
+        have = base64.b64decode(data["content"])
+    except (binascii.Error, ValueError):
+        return False
+    return have == render_caller(guardian_ref)
+
+
+def workflow_signals(files: Any, changed_count: Any,
+                     caller_ok: Callable[[], bool] | None = None) -> list[str]:
+    """Escalating signals for a PR that touches workflow or action files, or whose file
+    list cannot prove that it does not. `caller_ok` is asked only for the one exemptable
+    shape (the governor's caller, alone); None means nothing is exempt."""
+    def sig(why: str) -> list[str]:
+        return [f"{WORKFLOW_SIGNAL}: {why}; the owner must review it and apply human-override"]
+
+    if not isinstance(files, list):
+        return sig("the PR file list is unavailable or malformed, so workflow changes cannot be ruled out")
+    if not isinstance(changed_count, int) or isinstance(changed_count, bool):
+        return sig("the PR's changed-file count is unavailable, so workflow changes cannot be ruled out")
+    if len(files) >= FILES_API_CAP:
+        return sig(f"the PR changes {len(files)}+ files, past what the files API lists")
+    if len(files) != changed_count:
+        return sig(f"the files API listed {len(files)} files but the PR reports {changed_count}")
+
+    hits: list[tuple[dict[str, Any], str]] = []
+    bad: list[str] = []
+    for entry in files:
+        if not isinstance(entry, dict):
+            bad.append(str(entry)[:80])
+            continue
+        name, prev = entry.get("filename"), entry.get("previous_filename")
+        if entry.get("status") in ("renamed", "copied") and not (isinstance(prev, str) and prev):
+            bad.append(str(name)[:200])
+            continue
+        for path in ((name, prev) if prev is not None else (name,)):
+            segs = _segments(path)
+            if segs is None:
+                bad.append(str(path)[:200])
+            elif is_workflow_path(segs):
+                hits.append((entry, path))
+    if bad:
+        return sig(f"unreadable file entries ({_show(bad)}), so workflow changes cannot be ruled out")
+    if not hits:
+        return []
+    if len(hits) == 1:
+        entry, path = hits[0]
+        if (path == CALLER_PATH and entry.get("filename") == CALLER_PATH
+                and entry.get("previous_filename") is None
+                and entry.get("status") in ("added", "modified")
+                and caller_ok is not None and caller_ok()):
+            return []
+    return sig(f"this PR changes CI workflow or action files ({_show([p for _, p in hits])}), and a "
+               "same-repo PR runs its own workflows, so it can rewrite the checks that judge it")
+
+
 def plan(doc: dict[str, Any], prior: dict[str, Any], thread_list: list[dict[str, Any]],
-         diff: str) -> dict[str, Any]:
+         diff: str, files: Any = None, changed_count: Any = None,
+         caller_ok: Callable[[], bool] | None = None) -> dict[str, Any]:
+    """`files`/`changed_count` (pulls/{n}/files and the PR's changed_files) arm the workflow
+    tripwire; omitting both skips it, for callers that only exercise thread planning."""
     lines = commentable_lines(diff)
     threads = th.by_finding(thread_list)
     actions: dict[str, Any] = {"comments": [], "outside": [], "unresolve": [], "reply": [],
@@ -250,6 +375,9 @@ def plan(doc: dict[str, Any], prior: dict[str, Any], thread_list: list[dict[str,
             carried = dict(old, status="still_open", prior_id=old["id"])
             findings.append(carried)
             actions["signals"].append(f"unaccounted: reviewer dropped {inline(old['id'])} without a status; kept open")
+
+    if files is not None or changed_count is not None:
+        actions["signals"] += workflow_signals(files, changed_count, caller_ok)
 
     if new_state["round"] >= ROUND_CAP:
         actions["signals"].append(f"round cap: {new_state['round']} rounds")
@@ -390,6 +518,9 @@ def main() -> int:
     ap.add_argument("--pr", required=True, type=int)
     ap.add_argument("--sha", required=True)
     ap.add_argument("--base", default="", help="base ref the scan reviewed against (scan job output)")
+    ap.add_argument("--guardian-ref", default="",
+                    help="pr-guardian commit this run loaded (40-hex); the governor's caller rollout is "
+                         "exempt from the workflow tripwire only when it pins exactly this")
     ap.add_argument("--findings", required=True)
     ap.add_argument("--prior", default=None, help="optional prior state JSON; defaults to live summary comment")
     ap.add_argument("--usage", help="agy --output-format json result, for cost")
@@ -408,8 +539,13 @@ def main() -> int:
     record: dict[str, Any] = {}
     if args.usage and Path(args.usage).is_file():
         record = json.loads(Path(args.usage).read_text(encoding="utf-8"))
+    # The tripwire's inputs come after --prior is validated, so a bad --prior makes no API call.
+    pr = gh.api(f"repos/{args.repo}/pulls/{args.pr}")
+    changed_count = pr.get("changed_files") if isinstance(pr, dict) else None
+    files = gh.pr_files(args.repo, args.pr)
     diff = gh._run(["pr", "diff", str(args.pr), "-R", args.repo])
-    result = plan(doc, prior, th.fetch(args.repo, args.pr), diff)
+    result = plan(doc, prior, th.fetch(args.repo, args.pr), diff, files=files, changed_count=changed_count,
+                  caller_ok=lambda: canonical_caller_ok(args.repo, args.sha, args.guardian_ref))
     round_cost, reviewer = round_cost_of(record)
     if args.dry_run:
         print(json.dumps({"actions": {k: len(v) for k, v in result["actions"].items()},
