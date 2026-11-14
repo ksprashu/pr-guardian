@@ -103,11 +103,15 @@ jobs:
           python3 .forge/skills/security-review/scripts/run_scanners.py \
             --repo-root src --diff "origin/$BASE" \
             --json-out "$RUNNER_TEMP/scan.json" --sarif-out "$RUNNER_TEMP/scan.sarif" || echo "run_scanners exit $?"
-      - name: Linters and type checkers
+      # --no-exec: never run linters, formatters, type checkers or configs from the
+      # PR checkout (node_modules/.bin, eslint.config.*, conftest.py, ...). This
+      # job is unprivileged but shares $RUNNER_TEMP with the scanner outputs, so
+      # executing PR code here could forge scan.json/evidence.json (GHSA-7p2f-fx79-f4vw).
+      - name: Linters and type checkers (detection only)
         env:
           BASE: ${{ steps.pr.outputs.base_ref }}
         run: |
-          python3 .forge/skills/review/scripts/review_collector.py \
+          python3 .forge/skills/review/scripts/review_collector.py --no-exec \
             --path src --base "origin/$BASE" --out "$RUNNER_TEMP/evidence.json" || echo "collector exit $?"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -154,11 +158,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           PR: ${{ needs.route.outputs.pr }}
         run: |
-          mkdir -p "$RUNNER_TEMP/out"
+          mkdir -p "$RUNNER_TEMP/ctx" "$RUNNER_TEMP/out"
           python3 .prg/scripts/build_context.py --repo "$GITHUB_REPOSITORY" --pr "$PR" \
-            --out "$RUNNER_TEMP/context.md" --scan "$RUNNER_TEMP/scan/scan.json" \
+            --out "$RUNNER_TEMP/ctx/context.md" --scan "$RUNNER_TEMP/scan/scan.json" \
             --collector "$RUNNER_TEMP/scan/evidence.json" \
-            --prior-out "$RUNNER_TEMP/out/prior.json" --triage-out "$RUNNER_TEMP/triage.json"
+            --triage-out "$RUNNER_TEMP/triage.json"
           cat "$RUNNER_TEMP/triage.json"
       - name: Install Antigravity CLI and skills
         run: |
@@ -190,7 +194,7 @@ jobs:
         run: |
           test -n "$GEMINI_API_KEY" || { echo "::error::GEMINI_API_KEY secret is not set on this repo"; exit 1; }
           agy models || echo "::warning::agy models failed"
-          python3 .prg/scripts/run_model.py --context "$RUNNER_TEMP/context.md" \
+          python3 .prg/scripts/run_model.py --context "$RUNNER_TEMP/ctx/context.md" \
             --triage "$RUNNER_TEMP/triage.json" \
             --findings-lib .forge/skills/review/scripts/findings.py \
             --out "$RUNNER_TEMP/out/findings.json" --usage-out "$RUNNER_TEMP/out/agy.json" \
@@ -199,7 +203,10 @@ jobs:
         if: always()
         with:
           name: prg-review
-          path: ${{ runner.temp }}/out/
+          path: |
+            ${{ runner.temp }}/out/findings.json
+            ${{ runner.temp }}/out/agy.json
+          if-no-files-found: warn
           retention-days: 14
 
   publish:
@@ -237,7 +244,7 @@ jobs:
           SHA: ${{ needs.scan.outputs.head_sha }}
         run: |
           python3 .prg/scripts/publish_review.py --repo "$GITHUB_REPOSITORY" --pr "$PR" --sha "$SHA" \
-            --findings "$RUNNER_TEMP/out/findings.json" --prior "$RUNNER_TEMP/out/prior.json" \
+            --findings "$RUNNER_TEMP/out/findings.json" \
             --usage "$RUNNER_TEMP/out/agy.json"
 
   verdict:

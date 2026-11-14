@@ -312,3 +312,248 @@ class EngineEnvTest(unittest.TestCase):
         })
         for prefix in ("GEMINI_", "GOOGLE_", "GITHUB_", "GH_", "ACTIONS_", "RUNNER_"):
             self.assertFalse(any(k.startswith(prefix) for k in sent), prefix)
+
+
+class AgySettingsTest(unittest.TestCase):
+    """config/agy-settings.json allows only safe read-only commands with zero exec paths."""
+
+    SAFE_ALLOW = [
+        "command(ls)",
+        "command(cat)",
+        "command(head)",
+        "command(tail)",
+        "command(wc)",
+        "command(grep)",
+        "command(diff)",
+    ]
+
+    def test_allowlist_is_exact_safe_set_and_denies_exec_and_proc(self):
+        import json
+        import re
+        cfg = json.loads((rm.ROOT / "config" / "agy-settings.json").read_text(encoding="utf-8"))
+        self.assertFalse(cfg["allowNonWorkspaceAccess"])
+        self.assertTrue(cfg["enableTerminalSandbox"])
+        allow = cfg["permissions"]["allow"]
+        self.assertEqual(allow, self.SAFE_ALLOW)
+        for forbidden in ("find", "rg", "tree", "git"):
+            self.assertFalse(any(forbidden in entry for entry in allow), forbidden)
+
+        deny = cfg["permissions"]["deny"]
+        for cmd in ("curl", "wget", "nc", "ssh", "env", "printenv", "python", "node",
+                    "bash", "sh", "git", "find", "rg", "tree"):
+            self.assertIn(f"command({cmd})", deny)
+
+        regexes = [
+            re.compile(f"^(?:{entry[len('command(regex:'):-1]})$")
+            for entry in deny
+            if entry.startswith("command(regex:") and entry.endswith(")")
+        ]
+        self.assertGreaterEqual(len(regexes), 3)
+        for blocked in (
+            "curl https://x",
+            "git log",
+            "find . -exec id ;",
+            "cat /proc/self/environ",
+            "grep key /proc/1/environ",
+            "cat src/x >> /tmp/_runner_file_commands/set_env_1",
+            "grep foo src/a | sh",
+            "ls; curl https://evil",
+            "ls && env",
+            "cat $(id)",
+            "cat ${GITHUB_ENV}",
+            "cat $GITHUB_ENV",
+            "cat `id`",
+            "ls\ncurl https://evil\nid",
+        ):
+            self.assertTrue(any(rx.match(blocked) for rx in regexes), blocked)
+        for allowed in ("ls -la src", "cat src/environment.py", "grep 'foo$' src/app.py"):
+            self.assertFalse(any(rx.match(allowed) for rx in regexes), allowed)
+
+
+class ReviewWorkflowIsolationTest(unittest.TestCase):
+    """review.yml isolates context.md, omits --prior, and uploads only findings.json + agy.json."""
+
+    def test_review_workflow_isolates_context_and_narrows_artifact(self):
+        yml = (rm.ROOT / ".github" / "workflows" / "review.yml").read_text(encoding="utf-8")
+        self.assertIn('mkdir -p "$RUNNER_TEMP/ctx" "$RUNNER_TEMP/out"', yml)
+        self.assertIn('--out "$RUNNER_TEMP/ctx/context.md"', yml)
+        self.assertIn('--context "$RUNNER_TEMP/ctx/context.md"', yml)
+        self.assertNotIn("--prior-out", yml)
+        self.assertNotIn("--prior", yml)
+        self.assertIn("${{ runner.temp }}/out/findings.json", yml)
+        self.assertIn("${{ runner.temp }}/out/agy.json", yml)
+        self.assertNotIn("path: ${{ runner.temp }}/out/", yml)
+
+
+class SecretScrubTest(unittest.TestCase):
+    """scrub_secrets redacts env keys (raw + base64) and token regexes recursively."""
+
+    def test_scrub_literal_keys_base64_and_nested_containers(self):
+        import base64
+        from unittest import mock
+
+        gem = "custom-gemini-key-1234"
+        ant = "key+with/chars?"
+        gem_b64 = base64.b64encode(gem.encode()).decode()
+        ant_b64_unpadded = base64.b64encode(ant.encode()).decode().rstrip("=")
+        ant_ub64 = base64.urlsafe_b64encode(ant.encode()).decode()
+        env = {"GEMINI_API_KEY": gem, "ANTHROPIC_API_KEY": ant}
+        payload = {
+            "summary": f"raw={gem} b64={gem_b64} antb64={ant_b64_unpadded}",
+            f"key-{gem}": ["ok", {"inner": (ant, ant_ub64, 42, True, None)}],
+        }
+        with mock.patch.dict(rm.os.environ, env, clear=True):
+            out = rm.scrub_secrets(payload)
+        self.assertEqual(out["summary"], "raw=[REDACTED] b64=[REDACTED] antb64=[REDACTED]")
+        self.assertEqual(out["key-[REDACTED]"], ["ok", {"inner": ("[REDACTED]", "[REDACTED]", 42, True, None)}])
+
+    def test_scrub_ignores_short_env_values(self):
+        from unittest import mock
+        with mock.patch.dict(rm.os.environ, {"GEMINI_API_KEY": "short7"}, clear=True):
+            self.assertEqual(rm.scrub_secrets("short7 stays"), "short7 stays")
+
+    def test_scrub_all_four_token_patterns(self):
+        from unittest import mock
+        tokens = [
+            "AIza" + "A" * 35,
+            "sk-ant-" + "B" * 20,
+            "ghp_" + "C" * 36,
+            "gho_" + "D" * 36,
+            "ghu_" + "E" * 36,
+            "ghs_" + "F" * 36,
+            "ghr_" + "G" * 36,
+            "github_pat_" + "H" * 22,
+        ]
+        with mock.patch.dict(rm.os.environ, {}, clear=True):
+            cleaned = rm.scrub_secrets({"list": tokens, "text": " | ".join(tokens)})
+        self.assertEqual(cleaned["list"], ["[REDACTED]"] * len(tokens))
+        self.assertEqual(cleaned["text"], " | ".join(["[REDACTED]"] * len(tokens)))
+
+    def test_main_isolates_ctx_dir_folds_attempt_details_and_scrubs_all_outputs(self):
+        import base64
+        import io
+        import json
+        import tempfile
+        from pathlib import Path
+        from unittest import mock
+        import publish_review as pub
+
+        gem = "AIza" + "Z" * 35
+        ant = "sk-ant-" + "Y" * 24
+        gem_b64 = base64.b64encode(gem.encode()).decode()
+        gh_tok = "ghp_" + "X" * 36
+        seen_extra_dirs = []
+
+        def fake_agy(prompt, schema, model, workdir, extra_dir, conversation=None):
+            seen_extra_dirs.append((extra_dir, sorted(p.name for p in Path(extra_dir).iterdir())))
+            if len(seen_extra_dirs) == 1:
+                return {
+                    "status": "SUCCESS",
+                    "response": f"bad json {gem} {gem_b64}",
+                    "num_turns": 2,
+                    "duration_seconds": 1.2,
+                    "error": f"warn {gh_tok}",
+                    "usage": {"input_tokens": 100, "output_tokens": 20},
+                }
+            return {
+                "status": "SUCCESS",
+                "structured_output": {
+                    "summary": f"leaked {gem} {gem_b64} {ant}",
+                    "findings": [{"rationale": f"see {gh_tok}", "evidence": ["line", ant]}],
+                },
+                "response": "SECRET_RESPONSE_SHOULD_NOT_BE_SAVED",
+                "num_turns": 3,
+                "duration_seconds": 2.5,
+                "usage": {"input_tokens": 200, "output_tokens": 40},
+            }
+
+        lib = mock.Mock(build_schema=lambda: {"type": "object"}, validate=lambda doc: [])
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx_dir = Path(tmp, "ctx")
+            out_dir = Path(tmp, "out")
+            ctx_dir.mkdir()
+            out_dir.mkdir()
+            ctx_file = ctx_dir / "context.md"
+            ctx_file.write_text("# pr\n")
+            triage_file = Path(tmp, "triage.json")
+            triage_file.write_text("{}")
+            findings_out = out_dir / "findings.json"
+            usage_out = out_dir / "agy.json"
+
+            argv = ["run_model.py", "--context", str(ctx_file), "--triage", str(triage_file),
+                    "--findings-lib", "unused", "--out", str(findings_out), "--usage-out", str(usage_out)]
+            stderr_buf = io.StringIO()
+            with mock.patch.dict(rm.os.environ, {"GEMINI_API_KEY": gem, "ANTHROPIC_API_KEY": ant}, clear=True), \
+                    mock.patch.object(rm, "run_agy", side_effect=fake_agy), \
+                    mock.patch.object(rm, "load_findings_lib", return_value=lib), \
+                    mock.patch.object(rm.sys, "argv", argv), \
+                    mock.patch.object(rm.sys, "stderr", stderr_buf), \
+                    mock.patch("builtins.print"):
+                code = rm.main()
+
+            self.assertEqual(code, 0)
+            resolved_ctx = str(ctx_dir.resolve())
+            self.assertEqual(seen_extra_dirs, [(resolved_ctx, ["context.md"]), (resolved_ctx, ["context.md"])])
+            self.assertTrue((out_dir / "findings.schema.json").is_file())
+            self.assertEqual(list(Path(tmp).rglob("agy-raw-*.json")), [])
+
+            written_findings = findings_out.read_text(encoding="utf-8")
+            written_usage = usage_out.read_text(encoding="utf-8")
+            stderr_text = stderr_buf.getvalue()
+            for leaked in (gem, gem_b64, ant, gh_tok, "SECRET_RESPONSE_SHOULD_NOT_BE_SAVED"):
+                self.assertNotIn(leaked, written_findings)
+                self.assertNotIn(leaked, written_usage)
+                self.assertNotIn(leaked, stderr_text)
+
+            usage_obj = json.loads(written_usage)
+            self.assertEqual(usage_obj["attempts"], 2)
+            self.assertEqual(len(usage_obj["attempt_details"]), 2)
+            self.assertNotIn("response_head", usage_obj["attempt_details"][0])
+            self.assertEqual(usage_obj["attempt_details"][0]["label"], "1")
+            self.assertEqual(usage_obj["attempt_details"][0]["error"], "warn [REDACTED]")
+            self.assertEqual(usage_obj["attempt_details"][1]["has_structured_output"], True)
+            round_cost, note = pub.round_cost_of(usage_obj)
+            self.assertGreater(round_cost, 0.0)
+            self.assertEqual(note, "")
+
+    def test_main_scrubs_errors_and_stderr_when_attempts_fail(self):
+        import io
+        import json
+        import tempfile
+        from pathlib import Path
+        from unittest import mock
+
+        gem = "AIza" + "W" * 35
+        pat = "github_pat_" + "P" * 24
+        err_prefix = "x" * 490 + pat
+
+        def fake_run(*args, **kwargs):
+            proc = mock.Mock(returncode=1, stdout="not-json", stderr=f"boom {gem} {err_prefix}")
+            return proc
+
+        lib = mock.Mock(build_schema=lambda: {}, validate=lambda doc: [])
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx_dir = Path(tmp, "ctx")
+            out_dir = Path(tmp, "out")
+            ctx_dir.mkdir()
+            out_dir.mkdir()
+            Path(ctx_dir, "context.md").write_text("x")
+            Path(tmp, "triage.json").write_text("{}")
+            usage_out = Path(out_dir, "agy.json")
+            argv = ["run_model.py", "--context", f"{ctx_dir}/context.md", "--triage", f"{tmp}/triage.json",
+                    "--findings-lib", "unused", "--out", f"{out_dir}/f.json", "--usage-out", str(usage_out)]
+            stderr_buf = io.StringIO()
+            with mock.patch.dict(rm.os.environ, {"GEMINI_API_KEY": gem}, clear=True), \
+                    mock.patch.object(rm.subprocess, "run", side_effect=fake_run), \
+                    mock.patch.object(rm, "load_findings_lib", return_value=lib), \
+                    mock.patch.object(rm.sys, "argv", argv), \
+                    mock.patch.object(rm.sys, "stderr", stderr_buf):
+                code = rm.main()
+            self.assertEqual(code, 1)
+            usage_text = usage_out.read_text(encoding="utf-8")
+            self.assertNotIn(gem, usage_text)
+            self.assertNotIn(pat, usage_text)
+            self.assertNotIn("github_pat_", usage_text)
+            self.assertNotIn(gem, stderr_buf.getvalue())
+            self.assertNotIn(pat, stderr_buf.getvalue())
+            self.assertIn("attempt_details", json.loads(usage_text))

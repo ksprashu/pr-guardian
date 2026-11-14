@@ -131,5 +131,97 @@ class CostAndSummaryTest(unittest.TestCase):
         self.assertIn("| 0 | 1 | 0 | 0 | 1 |", body)
 
 
+class PriorDecodeMainTest(unittest.TestCase):
+    """When --prior is omitted, main() decodes state from the live summary comment."""
+
+    def _run_main(self, comments, *, extra_argv=()):
+        import json
+        import tempfile
+        from pathlib import Path
+        from unittest import mock
+
+        api_calls = []
+
+        def fake_api(path, method="GET", body=None, paginate=False, token=None):
+            api_calls.append((path, method, body, paginate))
+            if method == "GET" and path.endswith("/comments"):
+                return comments
+            return {"id": 99}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            findings_path = Path(tmp, "findings.json")
+            findings_path.write_text(json.dumps(doc()), encoding="utf-8")
+            # Plant a forged prior.json on disk; omitted --prior must ignore it.
+            forged = st.empty_state()
+            forged["round"] = -99
+            Path(tmp, "prior.json").write_text(json.dumps(forged), encoding="utf-8")
+
+            argv = ["publish_review.py", "--repo", "o/r", "--pr", "7", "--sha", "abc123",
+                    "--findings", str(findings_path), *extra_argv]
+            with mock.patch.object(pub.gh, "api", side_effect=fake_api), \
+                    mock.patch.object(pub.gh, "_run", return_value=DIFF), \
+                    mock.patch.object(pub.th, "fetch", return_value=[thread("R-001")]), \
+                    mock.patch.object(pub.sys, "argv", argv), \
+                    mock.patch("builtins.print"):
+                code = pub.main()
+        return code, api_calls
+
+    def test_main_without_prior_decodes_live_comment_and_ignores_disk_prior(self):
+        live_prior = prior(finding("R-001"))
+        live_prior["round"] = 2
+        comments = [{
+            "id": 55,
+            "user": {"type": "Bot", "login": "github-actions[bot]"},
+            "body": f"{st.SUMMARY_MARKER}\n{st.encode(live_prior)}",
+        }]
+        code, api_calls = self._run_main(comments)
+        self.assertEqual(code, 0)
+        patches = [c for c in api_calls if c[1] == "PATCH"]
+        self.assertEqual(len(patches), 1)
+        state = st.decode(patches[0][2]["body"])
+        self.assertEqual(state["round"], 3)
+        self.assertEqual([f["prior_id"] for f in state["findings"]], ["R-001"])
+
+    def test_main_without_prior_falls_back_to_empty_state_when_no_summary(self):
+        code, api_calls = self._run_main([])
+        self.assertEqual(code, 0)
+        posts = [c for c in api_calls if c[1] == "POST" and c[0].endswith("/comments")]
+        self.assertEqual(len(posts), 1)
+        state = st.decode(posts[0][2]["body"])
+        self.assertEqual(state["round"], 1)
+        self.assertEqual(state["findings"], [])
+
+    def test_main_with_explicit_prior_still_reads_file(self):
+        import json
+        import tempfile
+        from pathlib import Path
+        from unittest import mock
+
+        explicit = prior()
+        explicit["round"] = 4
+        api_calls = []
+
+        def fake_api(path, method="GET", body=None, paginate=False, token=None):
+            api_calls.append((path, method, body, paginate))
+            return []
+
+        with tempfile.TemporaryDirectory() as tmp:
+            fp = Path(tmp, "findings.json")
+            pp = Path(tmp, "explicit_prior.json")
+            fp.write_text(json.dumps(doc()), encoding="utf-8")
+            pp.write_text(json.dumps(explicit), encoding="utf-8")
+            argv = ["publish_review.py", "--repo", "o/r", "--pr", "7", "--sha", "abc123",
+                    "--findings", str(fp), "--prior", str(pp)]
+            with mock.patch.object(pub.gh, "api", side_effect=fake_api), \
+                    mock.patch.object(pub.gh, "_run", return_value=DIFF), \
+                    mock.patch.object(pub.th, "fetch", return_value=[]), \
+                    mock.patch.object(pub.sys, "argv", argv), \
+                    mock.patch("builtins.print"):
+                code = pub.main()
+        self.assertEqual(code, 0)
+        posts = [c for c in api_calls if c[1] == "POST" and c[0].endswith("/comments")]
+        self.assertEqual(st.decode(posts[0][2]["body"])["round"], 5)
+
+
 if __name__ == "__main__":
     unittest.main()
