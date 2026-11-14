@@ -7,7 +7,9 @@ Usage:
 
 The model gets the prompt in prompts/review.md plus the path to the context file.
 Its structured output is validated with the forge's findings.py; one retry is
-allowed with the validation errors fed back. If the second attempt still fails,
+allowed with the validation errors fed back. When Gemini is rate limited and
+ANTHROPIC_API_KEY is set, the retry runs Claude Code headless instead (same skills,
+prompt and schema); without the key it waits out the per-minute quota. If the second attempt still fails,
 this exits 1 and the verdict job fails closed. When triage says the model can be
 skipped, an empty, valid document is written instead and the reason is recorded.
 """
@@ -18,6 +20,7 @@ import argparse
 import importlib.util
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -28,6 +31,40 @@ ROOT = Path(__file__).resolve().parent.parent
 TIMEOUT_S = 40 * 60
 DEFAULT_MODEL = "gemini-4-argon-high"  # agy's slug for Gemini 4 Argon (High)
 RATE_LIMIT_WAIT_S = 120
+# The fallback reviewer. agy serves Claude only to Google-account logins, not API keys,
+# so the fallback runs through Claude Code instead.
+FALLBACK_MODEL = "claude-opus-5-5"
+# --bare skips CLAUDE.md auto-discovery, hooks, plugins, auto-memory and keychain reads.
+# --restricted ignores user, project and local settings files, so hooks, apiKeyHelper or
+# permissions a PR adds under .claude/ never load, and it removes the code-running tools.
+# It also drops user skills, so the prompt points Claude at the skill files instead.
+CLAUDE_TOOLS = "Read,Grep,Glob"
+CLAUDE_SKILLS = Path.home() / ".claude" / "skills"
+CLAUDE_SKILLS_NOTE = ("\n\nThe skills are not loaded as tools in this session. Read {d}/review/SKILL.md and "
+                      "{d}/security-review/SKILL.md first, with the references they point to, and "
+                      "follow them exactly as if they had been invoked.\n")
+RUN_ERRORS = (RuntimeError, json.JSONDecodeError, subprocess.TimeoutExpired, OSError)
+_BASE_ENV_KEYS = frozenset({
+    "PATH", "HOME", "USER", "LOGNAME", "SHELL",
+    "LANG", "LC_ALL", "LC_CTYPE", "TZ", "TMPDIR", "TERM",
+    "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY",
+    "SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE", "NODE_EXTRA_CA_CERTS",
+    "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_RUNTIME_DIR",
+})
+_ENGINE_KEY = {"agy": "GEMINI_API_KEY", "claude": "ANTHROPIC_API_KEY"}
+
+
+def _engine_env(engine: str) -> dict[str, str]:
+    """Build a minimal subprocess env for the chosen engine with only its own API key."""
+    if engine not in _ENGINE_KEY:
+        raise ValueError(f"unknown engine: {engine}")
+    env = {k: v for k, v in os.environ.items() if k in _BASE_ENV_KEYS}
+    key = _ENGINE_KEY[engine]
+    if key in os.environ:
+        env[key] = os.environ[key]
+    if engine == "claude":
+        env["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] = "1"
+    return env
 
 
 def load_findings_lib(path: str):
@@ -74,7 +111,7 @@ def run_agy(prompt: str, schema: str, model: str, workdir: str, extra_dir: str,
     if conversation:
         cmd += ["--conversation", conversation]
     proc = subprocess.run(cmd, capture_output=True, text=True, shell=False, cwd=workdir,
-                          timeout=TIMEOUT_S)
+                          env=_engine_env("agy"), timeout=TIMEOUT_S)
     try:
         result = json.loads(proc.stdout)
     except json.JSONDecodeError:
@@ -85,6 +122,35 @@ def run_agy(prompt: str, schema: str, model: str, workdir: str, extra_dir: str,
         raise RuntimeError(f"agy {result.get('status')} (exit {proc.returncode}): "
                            f"{str(result.get('error'))[:1000]} {' '.join(detail)[:1000]}".rstrip())
     return result
+
+
+def run_claude(prompt: str, schema: str, model: str, workdir: str, extra_dir: str) -> dict[str, Any]:
+    """Run Claude Code read-only and return the result in agy's shape."""
+    cmd = ["claude", "-p", prompt + CLAUDE_SKILLS_NOTE.format(d=CLAUDE_SKILLS), "--model", model,
+           "--output-format", "json", "--json-schema", Path(schema).read_text(encoding="utf-8"),
+           "--bare", "--restricted", "--strict-mcp-config", "--tools", CLAUDE_TOOLS,
+           "--add-dir", extra_dir, str(CLAUDE_SKILLS)]
+    proc = subprocess.run(cmd, capture_output=True, text=True, shell=False, cwd=workdir,
+                          env=_engine_env("claude"), timeout=TIMEOUT_S)
+    try:
+        raw = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        raise RuntimeError(f"claude exited {proc.returncode}: {proc.stderr.strip()[-1500:]}") from None
+    if proc.returncode != 0 or raw.get("is_error"):
+        detail = raw.get("result") or raw.get("errors") or proc.stderr.strip()[-1000:]
+        raise RuntimeError(f"claude error (exit {proc.returncode}): {str(detail)[:1000]}")
+    u = raw.get("usage") or {}
+    return {"status": "SUCCESS", "structured_output": raw.get("structured_output"),
+            "response": raw.get("result"), "num_turns": raw.get("num_turns"),
+            "duration_seconds": (raw.get("duration_ms") or 0) / 1000,
+            "usage": {"input_tokens": u.get("input_tokens", 0) + u.get("cache_read_input_tokens", 0)
+                      + u.get("cache_creation_input_tokens", 0),
+                      "output_tokens": u.get("output_tokens", 0)},
+            "cost_usd": raw.get("total_cost_usd")}
+
+
+def can_fall_back() -> bool:
+    return bool(os.environ.get("ANTHROPIC_API_KEY") and shutil.which("claude"))
 
 
 def is_rate_limited(error: str) -> bool:
@@ -107,6 +173,14 @@ def add_usage(total: dict[str, int], usage: dict[str, Any] | None) -> None:
     for k, v in (usage or {}).items():
         if isinstance(v, (int, float)):
             total[k] = total.get(k, 0) + v
+
+
+def usage_record(usage: dict[str, int], engine: str, cost_usd: float, **extra: Any) -> dict[str, Any]:
+    # Claude Code reports its own cost; publish_review prices agy usage at Gemini rates.
+    rec: dict[str, Any] = {"usage": usage, "engine": engine, **extra}
+    if engine == "claude":
+        rec["cost_usd"] = round(cost_usd, 4)
+    return rec
 
 
 def main() -> int:
@@ -132,53 +206,76 @@ def main() -> int:
     schema = Path(args.out).with_name("findings.schema.json")
     schema.write_text(json.dumps(lib.build_schema()), encoding="utf-8")
     base = (ROOT / "prompts" / "review.md").read_text(encoding="utf-8")
-    prompt = f"{base}\n\nContext file: {Path(args.context).resolve()}\n"
+    base_prompt = f"{base}\n\nContext file: {Path(args.context).resolve()}\n"
 
     errors: list[str] = []
-    for attempt in (1, 2):
-        if errors:
-            prompt += ("\n\nYour previous output failed validation. Fix exactly these problems and "
-                       "return the whole document again:\n- " + "\n- ".join(errors[:40]))
+    fix_errors: list[str] = []
+    engine = "agy"
+    cost_usd = 0.0
+    ctx_dir = str(Path(args.context).resolve().parent)
+    attempt, last = 0, 2
+    while attempt < last:
+        attempt += 1
+        prompt = (base_prompt + "\n\nYour previous output failed validation. Fix exactly these problems and "
+                  "return the whole document again:\n- " + "\n- ".join(fix_errors[:40])
+                  if fix_errors else base_prompt)
         try:
-            result = run_agy(prompt, str(schema), args.model, args.workdir,
-                             str(Path(args.context).resolve().parent))
-        except (RuntimeError, json.JSONDecodeError, subprocess.TimeoutExpired) as exc:
-            errors = [f"run failed: {exc}"]
+            if engine == "claude":
+                result = run_claude(prompt, str(schema), FALLBACK_MODEL, args.workdir, ctx_dir)
+            else:
+                result = run_agy(prompt, str(schema), args.model, args.workdir, ctx_dir)
+        except RUN_ERRORS as exc:
+            errors, fix_errors = [f"run failed: {exc}"], []
             print(f"run_model: attempt {attempt}: {exc}", file=sys.stderr)
-            if attempt == 1 and is_rate_limited(str(exc)):
-                # Per-minute quotas (RESOURCE_EXHAUSTED) refill; an immediate retry just fails again.
-                print(f"run_model: rate limited; waiting {RATE_LIMIT_WAIT_S}s", file=sys.stderr)
-                time.sleep(RATE_LIMIT_WAIT_S)
+            if engine == "agy" and is_rate_limited(str(exc)):
+                if can_fall_back():
+                    engine, errors, last = "claude", [], attempt + 2  # a fresh reviewer with its own retry
+                    print(f"run_model: rate limited; falling back to {FALLBACK_MODEL}", file=sys.stderr)
+                elif attempt == 1:
+                    # Per-minute quotas (RESOURCE_EXHAUSTED) refill; an immediate retry just fails again.
+                    print(f"run_model: rate limited; waiting {RATE_LIMIT_WAIT_S}s", file=sys.stderr)
+                    time.sleep(RATE_LIMIT_WAIT_S)
             continue
         add_usage(usage, result.get("usage"))
+        cost_usd += result.get("cost_usd") or 0.0
         record_raw(args.out, str(attempt), result)
-        if is_empty(result) and result.get("conversation_id"):
+        if engine == "agy" and is_empty(result) and result.get("conversation_id"):
             # Seen in CI: status SUCCESS, thousands of output tokens, but no final message.
             # Ask the same conversation for the answer instead of paying for a fresh review.
             try:
-                result = run_agy(FINALIZE, str(schema), args.model, args.workdir,
-                                 str(Path(args.context).resolve().parent), result["conversation_id"])
+                result = run_agy(FINALIZE, str(schema), args.model, args.workdir, ctx_dir,
+                                 result["conversation_id"])
                 add_usage(usage, result.get("usage"))
                 record_raw(args.out, f"{attempt}-finalize", result)
-            except (RuntimeError, json.JSONDecodeError, subprocess.TimeoutExpired) as exc:
+            except RUN_ERRORS as exc:
                 print(f"run_model: attempt {attempt}: finalize failed: {exc}", file=sys.stderr)
+                if is_rate_limited(str(exc)):
+                    if can_fall_back():
+                        engine, errors, fix_errors, last = "claude", [], [], attempt + 2
+                        print(f"run_model: rate limited; falling back to {FALLBACK_MODEL}", file=sys.stderr)
+                        continue
+                    if attempt == 1:
+                        errors, fix_errors = [f"finalize failed: {exc}"], []
+                        print(f"run_model: rate limited; waiting {RATE_LIMIT_WAIT_S}s", file=sys.stderr)
+                        time.sleep(RATE_LIMIT_WAIT_S)
+                        continue
         try:
             doc = extract(result)
         except (json.JSONDecodeError, TypeError, ValueError) as exc:
-            errors = [f"output is not a JSON document: {exc}. End your final turn with only the "
-                      "complete findings JSON object, no prose and no tool calls"]
+            errors = fix_errors = [f"output is not a JSON document: {exc}. End your final turn with only the "
+                                   "complete findings JSON object, no prose and no tool calls"]
             print(f"run_model: attempt {attempt}: {exc}", file=sys.stderr)
             continue
-        errors = lib.validate(doc)
+        errors = fix_errors = lib.validate(doc)
         if not errors:
             Path(args.out).write_text(json.dumps(doc, indent=1), encoding="utf-8")
-            Path(args.usage_out).write_text(json.dumps({"usage": usage, "attempts": attempt}))
+            Path(args.usage_out).write_text(json.dumps(usage_record(usage, engine, cost_usd, attempts=attempt)))
             print(f"run_model: {len(doc['findings'])} findings after {attempt} attempt(s); usage {usage}")
             return 0
         print(f"run_model: attempt {attempt}: {len(errors)} validation errors", file=sys.stderr)
 
-    Path(args.usage_out).write_text(json.dumps({"usage": usage, "errors": errors[:40]}))
-    print("run_model: no valid findings document after 2 attempts:\n- " + "\n- ".join(errors[:20]),
+    Path(args.usage_out).write_text(json.dumps(usage_record(usage, engine, cost_usd, errors=errors[:40])))
+    print(f"run_model: no valid findings document after {attempt} attempts:\n- " + "\n- ".join(errors[:20]),
           file=sys.stderr)
     return 1
 

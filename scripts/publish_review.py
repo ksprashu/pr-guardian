@@ -207,7 +207,14 @@ def cost(usage: dict[str, Any] | None, today: dt.date | None = None) -> float:
     return round(usage.get("input_tokens", 0) / 1e6 * pin + out_tokens / 1e6 * pout, 4)
 
 
-def summary_body(doc: dict[str, Any], result: dict[str, Any], round_cost: float) -> str:
+def round_cost_of(record: dict[str, Any]) -> tuple[float, str]:
+    """Cost of this round, and a note when the Claude fallback did the review."""
+    if record.get("engine") == "claude":
+        return float(record.get("cost_usd") or 0.0), "Gemini was rate limited; Claude Opus 5.5 reviewed this round"
+    return cost(record.get("usage")), ""
+
+
+def summary_body(doc: dict[str, Any], result: dict[str, Any], round_cost: float, note: str = "") -> str:
     s, a = result["state"], result["actions"]
     open_blocking = [f for f in s["findings"] if f["severity"] in BLOCKING and f["status"] not in st_closed()]
     counts = {sev: sum(1 for f in open_blocking if f["severity"] == sev) for sev in BLOCKING}
@@ -230,6 +237,8 @@ def summary_body(doc: dict[str, Any], result: dict[str, Any], round_cost: float)
         lines.append("\n</details>\n")
     if a["signals"]:
         lines.append("**Signals:** " + "; ".join(clean(x) for x in a["signals"]))
+    if note:
+        lines.append(f"_{clean(note)}._")
     total = round(sum(s["cost_usd"]), 2)
     lines.append(f"\n<sub>Round cost ≈ ${round_cost:.2f} · PR total ≈ ${total:.2f} · "
                  "commands: `/ai-review wontfix: <reason>` (in a thread), `/ai-review escalate: <why>`</sub>")
@@ -255,7 +264,7 @@ def toggle(mutation: str, thread: str) -> None:
 
 
 def execute(repo: str, pr: int, sha: str, doc: dict[str, Any], result: dict[str, Any],
-            round_cost: float) -> None:
+            round_cost: float, note: str = "") -> None:
     a = result["actions"]
     for item in a["unresolve"]:
         toggle(UNRESOLVE, item["thread"])
@@ -285,7 +294,7 @@ def execute(repo: str, pr: int, sha: str, doc: dict[str, Any], result: dict[str,
 
     result["state"]["cost_usd"] = list(result["state"]["cost_usd"]) + [round_cost]
     result["state"]["last_reviewed_sha"] = sha
-    body = summary_body(doc, result, round_cost)
+    body = summary_body(doc, result, round_cost, note)
     existing = st.find_summary_comment(gh.api(f"repos/{repo}/issues/{pr}/comments", paginate=True))
     if existing:
         gh.api(f"repos/{repo}/issues/comments/{existing['id']}", "PATCH", {"body": body})
@@ -307,17 +316,17 @@ def main() -> int:
     doc = json.loads(Path(args.findings).read_text(encoding="utf-8"))
     prior = st.empty_state()
     prior.update(json.loads(Path(args.prior).read_text(encoding="utf-8")))
-    usage = None
+    record: dict[str, Any] = {}
     if args.usage and Path(args.usage).is_file():
-        usage = json.loads(Path(args.usage).read_text(encoding="utf-8")).get("usage")
+        record = json.loads(Path(args.usage).read_text(encoding="utf-8"))
     diff = gh._run(["pr", "diff", str(args.pr), "-R", args.repo])
     result = plan(doc, prior, th.fetch(args.repo, args.pr), diff)
-    round_cost = cost(usage)
+    round_cost, reviewer = round_cost_of(record)
     if args.dry_run:
         print(json.dumps({"actions": {k: len(v) for k, v in result["actions"].items()},
                           "signals": result["actions"]["signals"], "cost": round_cost}, indent=2))
         return 0
-    execute(args.repo, args.pr, args.sha, doc, result, round_cost)
+    execute(args.repo, args.pr, args.sha, doc, result, round_cost, reviewer)
     print(json.dumps({"round": result["state"]["round"], "signals": result["actions"]["signals"]}))
     return 0
 
