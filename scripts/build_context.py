@@ -382,18 +382,29 @@ def trusted_reply(r: dict[str, Any], pr_author: str = "") -> bool:
 
 
 def render_prior(prior: dict[str, Any], threads: list[dict[str, Any]], pr_author: str = "") -> str:
-    if not prior["findings"]:
+    open_findings = [
+        f for f in (prior.get("findings") or [])
+        if isinstance(f, dict) and f.get("id") and f.get("status") not in ("fixed", "accepted_pushback")
+    ]
+    accepted = [a for a in (prior.get("accepted") or []) if isinstance(a, dict)]
+    has_hw = isinstance(prior.get("id_high_water"), dict) and bool(prior["id_high_water"])
+    if not open_findings and not has_hw and not accepted:
+        if prior.get("round", 0) >= 1:
+            return f"Round {prior['round']} has no open findings in this scope."
         return "_first round: no prior findings_"
+
     by_id = th.by_finding(threads)
-    lines = [f"Round {prior['round']} raised these. Account for **every** id below in this round "
-             "(status still_open / reopened / fixed / accepted_pushback, with prior_id set)."]
-    if isinstance(prior.get("id_high_water"), dict) and prior["id_high_water"]:
+    lines: list[str] = []
+    if open_findings:
+        lines.append(f"Round {prior['round']} raised these. Account for **every** id below in this round "
+                     "(status still_open / reopened / fixed / accepted_pushback, with prior_id set).")
+    else:
+        lines.append(f"Round {prior.get('round', 1)} has no open findings in this scope.")
+    if has_hw:
         hw = _max_id_nums(prior)
         lines.append(f"Next free ids (past id_high_water): `R-{hw['R'] + 1:03d}`, `S-{hw['S'] + 1:03d}`.")
-    for f in prior["findings"]:
-        if f.get("status") in ("fixed", "accepted_pushback"):
-            continue
-        t = by_id.get(f["id"])
+    for f in open_findings:
+        t = by_id.get(f["id"]) or (by_id.get(f["prior_id"]) if f.get("prior_id") else None)
         thread_state = "no thread"
         if t:
             thread_state = "RESOLVED by someone" if t["isResolved"] else "open"
@@ -410,10 +421,10 @@ def render_prior(prior: dict[str, Any], threads: list[dict[str, Any]], pr_author
             lines.append(f"> **{r['author']}**: {clean(r['body'])[:2000]}")
         if omitted:
             lines.append(f"> _[{omitted} untrusted {'reply' if omitted == 1 else 'replies'} omitted]_")
-    if prior["accepted"]:
+    if accepted:
         lines.append("\n### Pushback you already accepted (do not raise again)")
-        for a in prior["accepted"]:
-            lines.append(f"- {a['id']}: `{a['file']}` {a['rule']}")
+        for a in accepted:
+            lines.append(f"- {a.get('id')}: `{a.get('file')}` {a.get('rule')}")
     return "\n".join(lines)
 
 
@@ -842,9 +853,11 @@ def has_new_trusted_replies(
 ) -> bool:
     """True if a writer or the human PR author replied after the bot's last comment on an open finding."""
     open_ids = {
-        f["id"]
-        for f in prior.get("findings", [])
-        if isinstance(f, dict) and f.get("id") and f.get("status") not in ("fixed", "accepted_pushback")
+        fid
+        for f in (prior.get("findings") or [])
+        if isinstance(f, dict) and f.get("status") not in ("fixed", "accepted_pushback")
+        for fid in (f.get("id"), f.get("prior_id"))
+        if isinstance(fid, str) and fid
     }
     if not open_ids or not threads:
         return False
@@ -987,6 +1000,22 @@ def build_carry_forward_findings(prior: dict[str, Any]) -> list[dict[str, Any]]:
     return out
 
 
+def _diff_envelope(diff_text: str) -> list[tuple[str, tuple[str, ...]]] | None:
+    """Extract non-index file headers/modes/renames; return None on binary diffs."""
+    env: list[tuple[str, tuple[str, ...]]] = []
+    for path, chunk in _split_diff(diff_text):
+        hdr: list[str] = []
+        for line in chunk.splitlines():
+            if line.startswith("@@"):
+                break
+            if line.startswith(("Binary files ", "GIT binary patch")):
+                return None
+            if not line.startswith(("index ", "similarity index ")):
+                hdr.append(line)
+        env.append((path, tuple(hdr)))
+    return env
+
+
 def check_noop_rebase(
     git_dir: Path | None,
     meta: dict[str, Any],
@@ -1024,6 +1053,11 @@ def check_noop_rebase(
         return False
     cur_diff = _git_diff(git_dir, f"{base_target}...{head_sha}") if current_diff is None else current_diff
     if cur_diff is None:
+        return False
+
+    prior_env = _diff_envelope(prior_diff)
+    cur_env = _diff_envelope(cur_diff)
+    if prior_env is None or cur_env is None or prior_env != cur_env:
         return False
 
     prior_pid = compute_patch_id(prior_diff)
@@ -1296,14 +1330,15 @@ def plan_chunks(
             "truncated": trunc,
         }]
 
+    bin_budget = min(chunk_budget, limit_threshold)
     bins: list[list[tuple[str, str]]] = []
     bin_sizes: list[int] = []
     for path, raw_chunk in sorted_kept:
-        capped_len = min(len(raw_chunk), per_file_budget, chunk_budget)
+        capped_len = min(len(raw_chunk), per_file_budget, bin_budget) if bin_budget > 0 else len(raw_chunk)
         if not bins:
             bins.append([(path, raw_chunk)])
             bin_sizes.append(capped_len)
-        elif bin_sizes[-1] + capped_len <= chunk_budget:
+        elif bin_budget > 0 and bin_sizes[-1] + capped_len <= bin_budget:
             bins[-1].append((path, raw_chunk))
             bin_sizes[-1] += capped_len
         elif len(bins) < max_chunks:
@@ -1497,6 +1532,9 @@ def build_chunks(
             )
         ]
         scoped_prior["findings"] = scoped_findings
+        hw = _max_id_nums(prior)
+        if (isinstance(prior.get("id_high_water"), dict) and prior["id_high_water"]) or any(hw.values()):
+            scoped_prior["id_high_water"] = hw
 
         out.append(build(
             repo, pr, scoped_scan, collector, meta, diff, scoped_prior, threads,

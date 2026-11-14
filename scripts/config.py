@@ -897,16 +897,19 @@ def read_base_file(
             data = gh.api(f"repos/{repo}/contents/{encoded_path}?ref={encoded_ref}")
         except (gh.GhError, ValueError, TypeError):
             return None
-        if not (
-            isinstance(data, dict)
-            and data.get("type") == "file"
-            and data.get("encoding") == "base64"
-            and isinstance(data.get("content"), str)
-        ):
+        if not isinstance(data, dict) or data.get("type") != "file":
             return None
         size_hint = data.get("size")
-        if strict_size and max_bytes is not None and isinstance(size_hint, int) and size_hint > max_bytes:
+        if (
+            strict_size
+            and max_bytes is not None
+            and isinstance(size_hint, int)
+            and not isinstance(size_hint, bool)
+            and size_hint > max_bytes
+        ):
             raise ConfigError(f"{norm_path} exceeds {max_bytes} bytes")
+        if data.get("encoding") != "base64" or not isinstance(data.get("content"), str):
+            return None
         try:
             raw_bytes = base64.b64decode(data["content"])
         except (binascii.Error, ValueError):

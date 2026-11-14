@@ -304,6 +304,25 @@ class BaseRefIsolationTest(unittest.TestCase):
         self.assertEqual(loaded["round_cap"], 9)
         self.assertIn("ref=" + "a" * 40, m.call_args[0][0])
 
+    def test_api_fallback_oversized_none_encoding_fails_closed(self):
+        # GitHub Contents API returns encoding="none" and content="" for >1 MB files.
+        api_resp = {"type": "file", "encoding": "none", "content": "", "size": 2_000_000}
+        with mock.patch.object(gh, "api", return_value=api_resp):
+            with self.assertRaises(cfg.ConfigError):
+                cfg.load_from_base(None, base_sha="a" * 40, repo="o/r", strict=True)
+            err_buf = io.StringIO()
+            with mock.patch.object(cfg.sys, "stderr", err_buf):
+                loaded, warnings = cfg.load_from_base(None, base_sha="a" * 40, repo="o/r", strict=False)
+            self.assertEqual(loaded, cfg.default_config())
+            self.assertEqual(len(warnings), 1)
+            self.assertIn("exceeds", warnings[0])
+            self.assertIsNone(
+                cfg.read_base_file(
+                    None, "AGENTS.md", base_sha="a" * 40, repo="o/r",
+                    max_bytes=256 * 1024, strict_size=False, strict_decode=False,
+                )
+            )
+
 
 class GlobMatcherTest(unittest.TestCase):
     def test_single_star_does_not_cross_slash(self):

@@ -875,6 +875,94 @@ class NoopRebaseAndInterdiffTest(unittest.TestCase):
         self.assertTrue(tr_cost["noop_rebase"])
         self.assertTrue(tr_cost["skip_model"])
 
+    def test_noop_rebase_rejects_binary_pure_rename_empty_and_mode_changes(self):
+        cases = ("mode", "rename", "empty", "binary", "new_path_changed")
+        for kind in cases:
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as tmp:
+                repo = Path(tmp)
+                _init_repo(repo)
+                (repo / "base.txt").write_text("m1\n", encoding="utf-8")
+                (repo / "keep.txt").write_text("unchanged\n", encoding="utf-8")
+                _git(repo, "add", "base.txt", "keep.txt")
+                _git(repo, "commit", "-m", "M1")
+                m1 = _git(repo, "rev-parse", "HEAD")
+
+                _git(repo, "checkout", "-b", "pr-r1", m1)
+                if kind == "new_path_changed":
+                    (repo / "safe.py").write_text("def f():\n    return 1\n", encoding="utf-8")
+                    _git(repo, "add", "safe.py")
+                else:
+                    (repo / "feature.py").write_text("def f():\n    return 1\n", encoding="utf-8")
+                    _git(repo, "add", "feature.py")
+                _git(repo, "commit", "-m", "r1")
+                last_sha = _git(repo, "rev-parse", "HEAD")
+
+                _git(repo, "checkout", "main")
+                (repo / "base.txt").write_text("m1\nm2\n", encoding="utf-8")
+                _git(repo, "add", "base.txt")
+                _git(repo, "commit", "-m", "M2")
+                m2 = _git(repo, "rev-parse", "HEAD")
+
+                _git(repo, "checkout", "-b", "pr-r2", m2)
+                if kind == "new_path_changed":
+                    wf = repo / ".github" / "workflows" / "evil.yml"
+                    wf.parent.mkdir(parents=True)
+                    wf.write_text("def f():\n    return 1\n", encoding="utf-8")
+                    _git(repo, "add", ".github/workflows/evil.yml")
+                else:
+                    (repo / "feature.py").write_text("def f():\n    return 1\n", encoding="utf-8")
+                    _git(repo, "add", "feature.py")
+                    if kind == "mode":
+                        _git(repo, "update-index", "--chmod=+x", "feature.py")
+                    elif kind == "rename":
+                        (repo / ".github" / "workflows").mkdir(parents=True)
+                        _git(repo, "mv", "keep.txt", ".github/workflows/renamed.txt")
+                    elif kind == "empty":
+                        (repo / "empty.py").write_bytes(b"")
+                        _git(repo, "add", "empty.py")
+                    elif kind == "binary":
+                        (repo / "payload.bin").write_bytes(b"\x00\x01\x02\x03\xff")
+                        _git(repo, "add", "payload.bin")
+                _git(repo, "commit", "-m", f"r2-{kind}")
+                head_sha = _git(repo, "rev-parse", "HEAD")
+
+                m = {
+                    "files": [{"filename": "feature.py", "additions": 2, "deletions": 0}],
+                    "changedFiles": 1, "baseRefName": "main", "baseRefOid": m2, "headRefOid": head_sha,
+                }
+                prior = st.empty_state()
+                prior.update(round=1, last_reviewed_sha=last_sha, last_reviewed_base="main", findings=[])
+                self.assertFalse(bc.check_noop_rebase(repo, m, CLEAN, prior, []), kind)
+                with mock.patch.object(bc, "compute_patch_id", return_value="a" * 40):
+                    self.assertFalse(bc.check_noop_rebase(repo, m, CLEAN, prior, []), f"{kind}-pid-collision")
+
+        self.assertIsNone(bc._diff_envelope("diff --git a/p.bin b/p.bin\nGIT binary patch\nliteral 0\n"))
+
+    def test_has_new_trusted_replies_follows_prior_id_across_rounds(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, m2, last_sha, head_sha = self._setup_rebase_repo(tmp, modify_on_rebase=False)
+            m = {
+                "files": [{"filename": "feature.py", "additions": 2, "deletions": 0}],
+                "changedFiles": 1, "baseRefName": "main", "baseRefOid": m2, "headRefOid": head_sha,
+            }
+            prior = st.empty_state()
+            prior.update(
+                round=2,
+                last_reviewed_sha=last_sha,
+                last_reviewed_base="main",
+                findings=[finding("R-002", prior_id="R-001", status="still_open", file="feature.py")],
+            )
+            threads = [
+                thread("R-001", replies=[comment("dev", "/ai-review wontfix: false positive", association="COLLABORATOR")])
+            ]
+            self.assertTrue(bc.has_new_trusted_replies(prior, threads))
+            self.assertFalse(bc.check_noop_rebase(repo, m, CLEAN, prior, threads))
+
+            outsider = [thread("R-001", replies=[comment("rando", "hi", association="NONE")])]
+            self.assertFalse(bc.has_new_trusted_replies(prior, outsider))
+            closed_prior = dict(prior, findings=[finding("R-002", prior_id="R-001", status="fixed", file="feature.py")])
+            self.assertFalse(bc.has_new_trusted_replies(closed_prior, threads))
+
 
 class BudgetTriageTest(unittest.TestCase):
     """Issue #37: size and cost caps emit escalate_reason with skip_model=False."""
@@ -1143,6 +1231,76 @@ class ChunkingAndMergeTest(unittest.TestCase):
         self.assertIn("R-013", bc.render_prior(prior_hw, []))
         merged_hw = bc.merge_chunk_findings([doc1, doc2], prior=prior_hw)
         self.assertEqual({f["id"] for f in merged_hw["findings"]}, {"R-013", "R-014", "S-008"})
+
+    def test_plan_chunks_respects_threshold_smaller_than_chunk_budget(self):
+        diff = "".join(
+            f"diff --git a/pkg/f_{i}.py b/pkg/f_{i}.py\n" + ("+x = 1234\n" * 600)
+            for i in range(5)
+        )
+        chunks = bc.plan_chunks(
+            diff,
+            chunk_budget=160_000,
+            per_file_budget=16_000,
+            max_chunks=4,
+            threshold=13_000,
+        )
+        self.assertGreater(len(chunks), 1)
+        self.assertLessEqual(len(chunks), 4)
+        self.assertEqual(sorted(p for ch in chunks for p in ch["files"]), [f"pkg/f_{i}.py" for i in range(5)])
+
+    def test_render_prior_preserves_accepted_high_water_and_prior_id_threads(self):
+        # Empty findings with accepted pushback & id_high_water must not claim first round.
+        prior_empty = {
+            "round": 2,
+            "findings": [],
+            "accepted": [{"id": "R-001", "file": "a.py", "rule": "CWE-89"}],
+            "id_high_water": {"R": 4, "S": 2},
+        }
+        out_empty = bc.render_prior(prior_empty, [])
+        self.assertNotIn("first round", out_empty)
+        self.assertIn("Pushback you already accepted", out_empty)
+        self.assertIn("R-001", out_empty)
+        self.assertIn("R-005", out_empty)
+        self.assertIn("S-003", out_empty)
+
+        # All findings closed in scope must not prompt model to account for ids below.
+        prior_closed = {
+            "round": 2,
+            "findings": [finding("R-002", status="fixed", file="a.py")],
+            "accepted": [{"id": "R-001", "file": "a.py", "rule": "CWE-89"}],
+        }
+        out_closed = bc.render_prior(prior_closed, [])
+        self.assertNotIn("Account for **every** id below", out_closed)
+        self.assertIn("Pushback you already accepted", out_closed)
+
+        # Rotated id looks up thread via prior_id.
+        prior_rot = {
+            "round": 2,
+            "findings": [finding("R-003", prior_id="R-001", status="still_open", file="a.py")],
+            "accepted": [],
+        }
+        threads = [thread("R-001", replies=[comment("dev", "FOLLOWUP-REPLY", association="OWNER")])]
+        out_rot = bc.render_prior(prior_rot, threads)
+        self.assertIn("thread: open", out_rot)
+        self.assertIn("FOLLOWUP-REPLY", out_rot)
+
+        # build_chunks propagates accepted pushback & id_high_water even to chunks with 0 open findings.
+        diff = (
+            "diff --git a/a.py b/a.py\n" + ("+a = 1\n" * 2000)
+            + "diff --git a/z.py b/z.py\n" + ("+z = 1\n" * 2000)
+        )
+        chunks = bc.plan_chunks(diff, chunk_budget=15_000, per_file_budget=14_000, max_chunks=4)
+        prior_chunk = st.empty_state()
+        prior_chunk.update(
+            round=1,
+            findings=[finding("R-001", file="a.py")],
+            accepted=[{"id": "R-002", "file": "z.py", "rule": "PEP8"}],
+        )
+        mds = bc.build_chunks("o/r", 1, CLEAN, None, meta("a.py", "z.py"), diff, prior_chunk, [], chunks=chunks)
+        self.assertIn("Pushback you already accepted", mds[1])
+        self.assertIn("PEP8", mds[1])
+        self.assertIn("R-002", mds[1])
+        self.assertIn("R-003", mds[1])
 
 
 if __name__ == "__main__":
