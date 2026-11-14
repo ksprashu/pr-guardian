@@ -53,10 +53,14 @@ A PR merges only when all of these hold:
 
 It records drift in the "Governor drift report" issue.
 
-To bootstrap it, add two secrets to this repo:
+To bootstrap it, create a `governor` environment in this repo (Settings > Environments) before the workflow first runs. Set its deployment branches to the default branch (`main`) only, and add no required reviewers, or the daily run will wait for approval. Then add two environment secrets to it:
 
 - `GOVERNOR_TOKEN`: a fine-grained PAT on all repos, with read/write access to Administration, Secrets, Contents, Pull requests and Workflows
 - `GEMINI_API_KEY`
+
+Never store `GOVERNOR_TOKEN` as a plain repository secret. Any workflow on any branch of this repo can read repository secrets, and the token is admin on every owned repo. The `reconcile` job declares `environment: governor` and runs only on the schedule or on a dispatch from the default branch.
+
+The governor still writes `GEMINI_API_KEY` as a repository secret on every governed repo, this one included, because the review caller needs it. Anyone who can push a branch to a governed repo can read that copy, so use a key with a spending cap.
 
 Optionally, set the `PRG_REF` variable to the tag or SHA that callers should pin.
 
