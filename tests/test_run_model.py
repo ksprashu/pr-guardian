@@ -156,6 +156,8 @@ class ClaudeFallbackTest(unittest.TestCase):
                 mock.patch.object(rm.Path, "read_text", return_value="{}"):
             out = rm.run_claude("p", "s.json", "claude-opus-5-5", ".", "/ctx")
         cmd = run.call_args.args[0]
+        self.assertIn("--bare", cmd)
+        self.assertLess(cmd.index("--bare"), cmd.index("--add-dir"))
         self.assertIn("--restricted", cmd)
         self.assertIn("--strict-mcp-config", cmd)
         self.assertEqual(cmd[cmd.index("--tools") + 1], "Read,Grep,Glob")
@@ -179,3 +181,134 @@ class ClaudeFallbackTest(unittest.TestCase):
                     mock.patch.object(rm.Path, "read_text", return_value="{}"):
                 with self.assertRaisesRegex(RuntimeError, expected):
                     rm.run_claude("p", "s.json", "claude-opus-5-5", ".", "/ctx")
+
+
+class EngineEnvTest(unittest.TestCase):
+    """Model subprocesses get only safe passlist vars and their own engine API key."""
+
+    SAFE_ENV = {
+        "PATH": "/usr/bin",
+        "HOME": "/home/runner",
+        "USER": "runner",
+        "LOGNAME": "runner",
+        "SHELL": "/bin/bash",
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "LC_CTYPE": "C.UTF-8",
+        "TZ": "UTC",
+        "TMPDIR": "/tmp",
+        "TERM": "xterm-256color",
+        "HTTPS_PROXY": "http://proxy:8080",
+        "HTTP_PROXY": "http://proxy:8080",
+        "NO_PROXY": "localhost",
+        "SSL_CERT_FILE": "/etc/ssl/cert.pem",
+        "SSL_CERT_DIR": "/etc/ssl/certs",
+        "REQUESTS_CA_BUNDLE": "/etc/ssl/cert.pem",
+        "NODE_EXTRA_CA_CERTS": "/etc/ssl/extra.pem",
+        "XDG_CONFIG_HOME": "/home/runner/.config",
+        "XDG_CACHE_HOME": "/home/runner/.cache",
+        "XDG_DATA_HOME": "/home/runner/.local/share",
+        "XDG_STATE_HOME": "/home/runner/.local/state",
+        "XDG_RUNTIME_DIR": "/run/user/1000",
+    }
+    SECRET_ENV = {
+        "GEMINI_API_KEY": "gem-secret",
+        "ANTHROPIC_API_KEY": "ant-secret",
+        "ANTHROPIC_AUTH_TOKEN": "ant-auth-secret",
+        "ANTHROPIC_BASE_URL": "https://evil.example",
+        "CLAUDE_CODE_OAUTH_TOKEN": "cc-oauth-secret",
+        "CLAUDE_CONFIG_DIR": "/tmp/evil-claude",
+        "GOOGLE_API_KEY": "goog-secret",
+        "GITHUB_TOKEN": "ghs_secret",
+        "GITHUB_ENV": "/tmp/_runner_file_commands/set_env",
+        "GITHUB_PATH": "/tmp/_runner_file_commands/add_path",
+        "GITHUB_OUTPUT": "/tmp/_runner_file_commands/set_output",
+        "GH_TOKEN": "ghp_secret",
+        "ACTIONS_RUNTIME_TOKEN": "art-secret",
+        "ACTIONS_ID_TOKEN_REQUEST_TOKEN": "oidc-secret",
+        "RUNNER_TEMP": "/tmp/runner",
+        "AWS_SECRET_ACCESS_KEY": "aws-secret",
+        "NODE_OPTIONS": "--require /tmp/evil.js",
+        "LD_PRELOAD": "/tmp/evil.so",
+        "DYLD_INSERT_LIBRARIES": "/tmp/evil.dylib",
+        "PYTHONPATH": "/tmp/evil_py",
+        "PYTHONSTARTUP": "/tmp/evil_startup.py",
+        "BASH_ENV": "/tmp/evil_bash.sh",
+        "ENV": "/tmp/evil_sh.sh",
+        "GIT_SSH_COMMAND": "sh -c evil",
+        "XDG_EVIL_TOKEN": "ghp_xdg_evil",
+    }
+
+    def test_engine_env_agy_isolates_keys_and_secrets(self):
+        from unittest import mock
+        full = {**self.SAFE_ENV, **self.SECRET_ENV, "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"}
+        with mock.patch.dict(rm.os.environ, full, clear=True):
+            env = rm._engine_env("agy")
+            env["MUTATED"] = "yes"
+            fresh = rm._engine_env("agy")
+        self.assertEqual(fresh, {**self.SAFE_ENV, "GEMINI_API_KEY": "gem-secret"})
+        self.assertNotIn("XDG_EVIL_TOKEN", fresh)
+        self.assertNotIn("MUTATED", rm.os.environ)
+
+        with mock.patch.dict(rm.os.environ, self.SAFE_ENV, clear=True):
+            self.assertEqual(rm._engine_env("agy"), self.SAFE_ENV)
+
+    def test_engine_env_claude_isolates_keys_and_forces_nonessential_off(self):
+        from unittest import mock
+        full = {**self.SAFE_ENV, **self.SECRET_ENV, "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "0"}
+        with mock.patch.dict(rm.os.environ, full, clear=True):
+            env = rm._engine_env("claude")
+        self.assertEqual(env, {
+            **self.SAFE_ENV,
+            "ANTHROPIC_API_KEY": "ant-secret",
+            "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+        })
+        self.assertNotIn("XDG_EVIL_TOKEN", env)
+
+        with mock.patch.dict(rm.os.environ, self.SAFE_ENV, clear=True):
+            self.assertEqual(rm._engine_env("claude"), {
+                **self.SAFE_ENV,
+                "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+            })
+
+    def test_engine_env_rejects_unknown_engine(self):
+        for bad in ("unknown", "", "codex"):
+            with self.assertRaisesRegex(ValueError, f"unknown engine: {bad}"):
+                rm._engine_env(bad)
+
+    def test_run_agy_passes_filtered_env_to_subprocess(self):
+        import json
+        from unittest import mock
+        full = {**self.SAFE_ENV, **self.SECRET_ENV}
+        proc = mock.Mock(returncode=0, stdout=json.dumps({"status": "SUCCESS", "structured_output": {"findings": []}}),
+                         stderr="")
+        with mock.patch.dict(rm.os.environ, full, clear=True), \
+                mock.patch.object(rm.subprocess, "run", return_value=proc) as run:
+            rm.run_agy("p", "s.json", "gemini-4-argon-high", ".", "/ctx")
+        sent = run.call_args.kwargs["env"]
+        self.assertIsNotNone(sent)
+        self.assertEqual(sent, {**self.SAFE_ENV, "GEMINI_API_KEY": "gem-secret"})
+        for prefix in ("ANTHROPIC_", "GOOGLE_", "CLAUDE_", "GITHUB_", "GH_", "ACTIONS_", "RUNNER_"):
+            self.assertFalse(any(k.startswith(prefix) for k in sent), prefix)
+
+    def test_run_claude_passes_filtered_env_and_bare_to_subprocess(self):
+        import json
+        from unittest import mock
+        full = {**self.SAFE_ENV, **self.SECRET_ENV}
+        proc = mock.Mock(returncode=0, stdout=json.dumps({"is_error": False, "result": "{}"}), stderr="")
+        with mock.patch.dict(rm.os.environ, full, clear=True), \
+                mock.patch.object(rm.subprocess, "run", return_value=proc) as run, \
+                mock.patch.object(rm.Path, "read_text", return_value="{}"):
+            rm.run_claude("p", "s.json", "claude-opus-5-5", ".", "/ctx")
+        cmd = run.call_args.args[0]
+        self.assertIn("--bare", cmd)
+        self.assertLess(cmd.index("--bare"), cmd.index("--add-dir"))
+        sent = run.call_args.kwargs["env"]
+        self.assertIsNotNone(sent)
+        self.assertEqual(sent, {
+            **self.SAFE_ENV,
+            "ANTHROPIC_API_KEY": "ant-secret",
+            "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+        })
+        for prefix in ("GEMINI_", "GOOGLE_", "GITHUB_", "GH_", "ACTIONS_", "RUNNER_"):
+            self.assertFalse(any(k.startswith(prefix) for k in sent), prefix)

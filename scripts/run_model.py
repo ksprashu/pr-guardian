@@ -34,6 +34,7 @@ RATE_LIMIT_WAIT_S = 120
 # The fallback reviewer. agy serves Claude only to Google-account logins, not API keys,
 # so the fallback runs through Claude Code instead.
 FALLBACK_MODEL = "claude-opus-5-5"
+# --bare skips CLAUDE.md auto-discovery, hooks, plugins, auto-memory and keychain reads.
 # --restricted ignores user, project and local settings files, so hooks, apiKeyHelper or
 # permissions a PR adds under .claude/ never load, and it removes the code-running tools.
 # It also drops user skills, so the prompt points Claude at the skill files instead.
@@ -43,6 +44,27 @@ CLAUDE_SKILLS_NOTE = ("\n\nThe skills are not loaded as tools in this session. R
                       "{d}/security-review/SKILL.md first, with the references they point to, and "
                       "follow them exactly as if they had been invoked.\n")
 RUN_ERRORS = (RuntimeError, json.JSONDecodeError, subprocess.TimeoutExpired, OSError)
+_BASE_ENV_KEYS = frozenset({
+    "PATH", "HOME", "USER", "LOGNAME", "SHELL",
+    "LANG", "LC_ALL", "LC_CTYPE", "TZ", "TMPDIR", "TERM",
+    "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY",
+    "SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE", "NODE_EXTRA_CA_CERTS",
+    "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_RUNTIME_DIR",
+})
+_ENGINE_KEY = {"agy": "GEMINI_API_KEY", "claude": "ANTHROPIC_API_KEY"}
+
+
+def _engine_env(engine: str) -> dict[str, str]:
+    """Build a minimal subprocess env for the chosen engine with only its own API key."""
+    if engine not in _ENGINE_KEY:
+        raise ValueError(f"unknown engine: {engine}")
+    env = {k: v for k, v in os.environ.items() if k in _BASE_ENV_KEYS}
+    key = _ENGINE_KEY[engine]
+    if key in os.environ:
+        env[key] = os.environ[key]
+    if engine == "claude":
+        env["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] = "1"
+    return env
 
 
 def load_findings_lib(path: str):
@@ -89,7 +111,7 @@ def run_agy(prompt: str, schema: str, model: str, workdir: str, extra_dir: str,
     if conversation:
         cmd += ["--conversation", conversation]
     proc = subprocess.run(cmd, capture_output=True, text=True, shell=False, cwd=workdir,
-                          timeout=TIMEOUT_S)
+                          env=_engine_env("agy"), timeout=TIMEOUT_S)
     try:
         result = json.loads(proc.stdout)
     except json.JSONDecodeError:
@@ -106,10 +128,10 @@ def run_claude(prompt: str, schema: str, model: str, workdir: str, extra_dir: st
     """Run Claude Code read-only and return the result in agy's shape."""
     cmd = ["claude", "-p", prompt + CLAUDE_SKILLS_NOTE.format(d=CLAUDE_SKILLS), "--model", model,
            "--output-format", "json", "--json-schema", Path(schema).read_text(encoding="utf-8"),
-           "--restricted", "--strict-mcp-config", "--tools", CLAUDE_TOOLS,
+           "--bare", "--restricted", "--strict-mcp-config", "--tools", CLAUDE_TOOLS,
            "--add-dir", extra_dir, str(CLAUDE_SKILLS)]
     proc = subprocess.run(cmd, capture_output=True, text=True, shell=False, cwd=workdir,
-                          timeout=TIMEOUT_S)
+                          env=_engine_env("claude"), timeout=TIMEOUT_S)
     try:
         raw = json.loads(proc.stdout)
     except json.JSONDecodeError:
