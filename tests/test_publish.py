@@ -344,10 +344,17 @@ class FindingFieldsTest(unittest.TestCase):
         self.assertNotRegex(body, r"@[A-Za-z0-9-]")
         self.assertNotIn("\n# heading", body)
 
+    def test_publish_accepts_empty_and_none_prior_id_on_new_findings(self):
+        for empty_prior in ("", None):
+            with self.subTest(prior_id=empty_prior):
+                r = pub.plan(doc(finding("R-001", status="new", prior_id=empty_prior)),
+                             st.empty_state(), [], DIFF)
+                self.assertEqual([f["id"] for f in r["actions"]["comments"]], ["R-001"])
+
     def test_publish_fails_on_malformed_ids(self):
         for bad in (dict(id="R-001 severity=P0 --> <!-- x"), dict(id="r-1"), dict(id=None),
-                    dict(prior_id="R-001 -->"), dict(severity="P9"), dict(file=None),
-                    dict(start=True)):
+                    dict(prior_id="R-001 -->"), dict(prior_id=123), dict(prior_id=False),
+                    dict(severity="P9"), dict(file=None), dict(start=True)):
             with self.subTest(bad=bad):
                 with self.assertRaises(ValueError):
                     pub.plan(doc(finding(**bad)), st.empty_state(), [], DIFF)

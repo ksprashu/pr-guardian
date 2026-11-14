@@ -56,8 +56,9 @@ def check_finding(f: dict[str, Any]) -> None:
     """Fail the publish when a field that lands inside a marker is not well formed."""
     if not isinstance(f.get("id"), str) or not st.ID_RE.match(f["id"]):
         raise ValueError(f"finding id {inline(f.get('id'))!r} does not match {st.ID_RE.pattern}")
-    if f.get("prior_id") is not None and not (isinstance(f["prior_id"], str) and st.ID_RE.match(f["prior_id"])):
-        raise ValueError(f"finding {f['id']}: prior_id {inline(f['prior_id'])!r} is not a finding id")
+    prior_id = f.get("prior_id")
+    if prior_id is not None and (not isinstance(prior_id, str) or (prior_id != "" and not st.ID_RE.match(prior_id))):
+        raise ValueError(f"finding {f['id']}: prior_id {inline(prior_id)!r} is not a finding id")
     if f.get("severity") not in st.SEVERITIES:
         raise ValueError(f"finding {f['id']}: unknown severity {inline(f.get('severity'))!r}")
     for key in ("file", "rule"):

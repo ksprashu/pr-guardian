@@ -4,7 +4,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
 
-def finding(id="R-001", severity="P1", status="new", prior_id=None, file="app.py", start=3, end=3,
+def finding(id="R-001", severity="P1", status="new", prior_id="", file="app.py", start=3, end=3,
             rule="CWE-89", axis="security", **extra):
     f = {"id": id, "severity": severity, "axis": axis, "rule": rule, "title": f"title {id}",
          "file": file, "start_line": start, "end_line": end, "rationale": f"why {id}",
