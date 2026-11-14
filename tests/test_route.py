@@ -38,13 +38,21 @@ def parse_github_output(raw: str) -> dict[str, str]:
     return outputs
 
 
-def pr_event(action="opened", draft=False, fork=False, label=None):
+def pr_event(action="opened", draft=False, fork=False, label=None, sender=None):
     base = {"full_name": "o/r"}
     ev = {"action": action, "pull_request": {
         "number": 7, "draft": draft, "head": {"sha": "abc", "repo": {"full_name": "x/r" if fork else "o/r"}},
         "base": {"repo": base}}}
     if label:
         ev["label"] = {"name": label}
+    if sender is not None:
+        ev["sender"] = sender
+    return ev
+
+
+def retarget_event(prev="stage", **kw):
+    ev = pr_event("edited", **kw)
+    ev["changes"] = {"base": {"ref": {"from": prev}, "sha": {"from": "f" * 40}}}
     return ev
 
 
@@ -68,9 +76,58 @@ class RouteTest(unittest.TestCase):
         self.assertIn("fork", r["reason"])
 
     def test_labels(self):
-        self.assertEqual(route.decide("pull_request", pr_event("labeled", label="human-override"), "o")["action"],
-                         "verdict")
+        r = route.decide("pull_request", pr_event("labeled", label="human-override"), "o")
+        self.assertEqual((r["action"], r["bind_override"]), ("verdict", "false"))
         self.assertEqual(route.decide("pull_request", pr_event("labeled", label="bug"), "o")["action"], "skip")
+
+
+class OverrideRouteTest(unittest.TestCase):
+    """GHSA-q4j9-99qr-cfhw / #27: label application binds, removal recomputes."""
+
+    OWNER = {"login": "o", "type": "User"}
+
+    def d(self, action, label="human-override", sender=None, owner="o", **kw):
+        return route.decide("pull_request", pr_event(action, label=label, sender=sender, **kw), owner)
+
+    def test_owner_application_binds_with_head_sha(self):
+        r = self.d("labeled", sender=self.OWNER)
+        self.assertEqual((r["action"], r["head_sha"], r["bind_override"], r["reason"]),
+                         ("verdict", "abc", "true", "human-override label applied"))
+
+    def test_non_owner_bot_or_missing_sender_never_binds(self):
+        for sender in (None, {"login": "mallory", "type": "User"}, {"login": "o", "type": "Bot"},
+                       {"login": "O", "type": "User"}, {"type": "User"}, {"login": ["o"]}, "o", []):
+            with self.subTest(sender=sender):
+                r = self.d("labeled", sender=sender)
+                self.assertEqual((r["action"], r["head_sha"], r["bind_override"]), ("verdict", "abc", "false"))
+        r = self.d("labeled", sender={"login": "", "type": "User"}, owner="")
+        self.assertEqual(r["bind_override"], "false")
+
+    def test_removal_recomputes_and_never_binds(self):
+        r = self.d("unlabeled", sender=self.OWNER)
+        self.assertEqual((r["action"], r["head_sha"], r["bind_override"], r["reason"]),
+                         ("verdict", "abc", "false", "human-override label removed"))
+
+    def test_other_labels_skip_on_both_actions(self):
+        for action in ("labeled", "unlabeled"):
+            for label in ("needs-human", "bug", None, "Human-Override"):
+                with self.subTest(action=action, label=label):
+                    r = self.d(action, label=label, sender=self.OWNER)
+                    self.assertEqual((r["action"], r["bind_override"]), ("skip", "false"))
+
+    def test_draft_and_fork_label_events_still_reach_verdict(self):
+        for kw in ({"draft": True}, {"fork": True}):
+            with self.subTest(**kw):
+                self.assertEqual(self.d("labeled", sender=self.OWNER, **kw)["bind_override"], "true")
+                self.assertEqual(self.d("unlabeled", sender=self.OWNER, **kw)["action"], "verdict")
+
+    def test_bind_override_false_everywhere_else(self):
+        for ev in (pr_event(), pr_event("synchronize"), pr_event("ready_for_review"), pr_event("reopened"),
+                   pr_event(fork=True), pr_event(draft=True)):
+            self.assertEqual(route.decide("pull_request", ev, "o")["bind_override"], "false")
+        self.assertEqual(route.decide("issue_comment", comment_event("/ai-review escalate"), "o")["bind_override"],
+                         "false")
+        self.assertEqual(route.decide("workflow_dispatch", {"inputs": {"pr": "3"}}, "o")["bind_override"], "false")
 
     def test_commands(self):
         d = lambda *a, **k: route.decide("issue_comment", comment_event(*a, **k), "o")
@@ -147,7 +204,7 @@ class RouteSecurityTest(unittest.TestCase):
                         self.assertEqual(rc, 0)
                         self.assertNotIn("\r", raw_out)
                         lines = raw_out.splitlines()
-                        self.assertEqual(len(lines), 5)
+                        self.assertEqual(len(lines), 6)
                         self.assertEqual([ln.split("=", 1)[0] for ln in lines], list(route.OUTPUT_KEYS))
                         self.assertEqual(list(parsed.keys()), list(route.OUTPUT_KEYS))
                         self.assertIn(parsed["reason"], route.REASONS)
@@ -170,6 +227,14 @@ class RouteSecurityTest(unittest.TestCase):
                         else:
                             self.assertEqual(parsed["action"], "review")
                             self.assertEqual(parsed["escalate"], "false")
+
+    def test_main_writes_bind_override_line(self):
+        ev = pr_event("labeled", label="human-override", sender={"login": "o", "type": "User"})
+        ev["pull_request"]["head"]["sha"] = VALID_SHA
+        rc, raw_out, parsed, _, _ = self._run_main("pull_request", ev)
+        self.assertEqual(rc, 0)
+        self.assertEqual(raw_out.splitlines()[-1], "bind_override=true")
+        self.assertEqual((parsed["action"], parsed["head_sha"]), ("verdict", VALID_SHA))
 
     def test_auth_runs_before_parsing(self):
         for kind in ("issue_comment", "pull_request_review_comment"):
@@ -202,7 +267,7 @@ class RouteSecurityTest(unittest.TestCase):
             ev["pull_request"]["head"]["sha"] = VALID_SHA
             rc, raw_out, parsed, _, _ = self._run_main("pull_request", ev)
             self.assertEqual(rc, 0)
-            self.assertEqual(len(raw_out.splitlines()), 5)
+            self.assertEqual(len(raw_out.splitlines()), 6)
             self.assertEqual(parsed["action"], "skip")
             self.assertEqual(parsed["escalate"], "false")
             self.assertEqual(parsed["reason"], "label is not a pr-guardian control")
@@ -250,7 +315,7 @@ class RouteSecurityTest(unittest.TestCase):
         for payload in ("3\naction=verdict", "\u0663", "--repo=x/y"):
             rc, raw_out, parsed, _, _ = self._run_main("workflow_dispatch", {"inputs": {"pr": payload}})
             self.assertEqual(rc, 0)
-            self.assertEqual(len(raw_out.splitlines()), 5)
+            self.assertEqual(len(raw_out.splitlines()), 6)
             self.assertEqual(parsed["action"], "skip")
             self.assertEqual(parsed["pr"], "")
             self.assertNotIn("verdict", raw_out)
@@ -267,11 +332,14 @@ class RouteSecurityTest(unittest.TestCase):
             "head_sha": VALID_SHA,
             "escalate": "false",
             "reason": "manual dispatch",
+            "bind_override": "false",
         }
         # Valid 40-char and 64-char SHAs pass untouched.
         self.assertEqual(route.validate_output(base), base)
         base_256 = {**base, "head_sha": VALID_SHA256}
         self.assertEqual(route.validate_output(base_256), base_256)
+        bind = {**base, "action": "verdict", "reason": "human-override label applied", "bind_override": "true"}
+        self.assertEqual(route.validate_output(bind), bind)
 
         bad_cases = [
             None,
@@ -307,6 +375,12 @@ class RouteSecurityTest(unittest.TestCase):
             {**base, "reason": "manual dispatch\x00"},
             {**base, "reason": "manual dispatch\x1b"},
             {**base, "reason": "manual dispatch \u2014 ok"},
+            {k: v for k, v in base.items() if k != "bind_override"},
+            {**base, "bind_override": True},
+            {**base, "bind_override": "yes"},
+            {**base, "bind_override": "TRUE"},
+            {**base, "bind_override": ""},
+            {**base, "bind_override": "true\nSECRET_MARKER"},
         ]
         for bad in bad_cases:
             with self.subTest(bad=bad):
@@ -325,7 +399,7 @@ class RouteSecurityTest(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(parsed, route.SAFE_SKIP)
         self.assertEqual(json.loads(stdout_val), route.SAFE_SKIP)
-        self.assertEqual(len(raw_out.splitlines()), 5)
+        self.assertEqual(len(raw_out.splitlines()), 6)
         self.assertIn("invalid route output", json.loads(stderr_val)["error"])
 
         rc, _, parsed_short, _, stderr_short = self._run_main("pull_request", pr_event())
@@ -349,8 +423,11 @@ class RouteSecurityTest(unittest.TestCase):
             route.decide("pull_request", pr_event("reopened"), "o"),
             route.decide("pull_request", pr_event("ready_for_review"), "o"),
             route.decide("pull_request", pr_event("labeled", label="human-override"), "o"),
+            route.decide("pull_request", pr_event("unlabeled", label="human-override"), "o"),
             route.decide("pull_request", pr_event("labeled", label="bug"), "o"),
             route.decide("pull_request", pr_event("closed"), "o"),
+            route.decide("pull_request", retarget_event(), "o"),
+            route.decide("pull_request", pr_event("edited"), "o"),
             route.decide("pull_request", pr_event(draft=True), "o"),
             route.decide("pull_request", pr_event(fork=True), "o"),
             route.decide("pull_request", {"action": "opened", "pull_request": {"number": "7\nfoo", "head": {"sha": "abc"}, "base": {"repo": {"full_name": "o/r"}}}}, "o"),
@@ -370,6 +447,50 @@ class RouteSecurityTest(unittest.TestCase):
         ]
         for res in samples:
             self.assertIn(res["reason"], route.REASONS)
+
+
+class BaseRetargetRouteTest(unittest.TestCase):
+    """GHSA-6h55-p37r-jc34: a base retarget is re-reviewed; other edits are not."""
+
+    def test_retarget_reviews(self):
+        for prev in ("stage", "0", "release/1.0", "main"):
+            with self.subTest(prev=prev):
+                r = route.decide("pull_request", retarget_event(prev), "o")
+                self.assertEqual((r["action"], r["reason"], r["head_sha"], r["pr"], r["bind_override"]),
+                                 ("review", "pull_request.edited", "abc", "7", "false"))
+                ev = retarget_event(prev)
+                ev["pull_request"]["head"]["sha"] = VALID_SHA
+                full = route.decide("pull_request", ev, "o")
+                self.assertEqual(route.validate_output(full), full)
+
+    def test_title_body_and_malformed_edits_skip(self):
+        changes = (None, {}, [], "base", {"title": {"from": "old"}}, {"body": {"from": "old"}},
+                   {"base": None}, {"base": {}}, {"base": []}, {"base": {"ref": None}}, {"base": {"ref": {}}},
+                   {"base": {"ref": "stage"}}, {"base": {"ref": {"from": ""}}}, {"base": {"ref": {"from": None}}},
+                   {"base": {"ref": {"from": 0}}}, {"base": {"ref": {"from": ["stage"]}}},
+                   {"base": {"sha": {"from": "f" * 40}}})
+        for ch in changes:
+            with self.subTest(changes=ch):
+                ev = pr_event("edited")
+                if ch is not None:
+                    ev["changes"] = ch
+                r = route.decide("pull_request", ev, "o")
+                self.assertEqual((r["action"], r["reason"]),
+                                 ("skip", "pull_request action does not trigger a review"))
+
+    def test_retarget_of_draft_or_fork(self):
+        r = route.decide("pull_request", retarget_event(draft=True), "o")
+        self.assertEqual((r["action"], r["reason"]), ("skip", "draft PR; review starts when marked ready"))
+        r = route.decide("pull_request", retarget_event(fork=True), "o")
+        self.assertEqual(r["action"], "verdict")
+        self.assertIn("fork", r["reason"])
+
+    def test_base_change_payload_on_other_actions_changes_nothing(self):
+        ev = retarget_event()
+        ev["action"] = "closed"
+        self.assertEqual(route.decide("pull_request", ev, "o")["action"], "skip")
+        ev["action"] = "synchronize"
+        self.assertEqual(route.decide("pull_request", ev, "o")["reason"], "pull_request.synchronize")
 
 
 if __name__ == "__main__":

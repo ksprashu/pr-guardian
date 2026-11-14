@@ -539,6 +539,19 @@ def pr_event(action, label=None):
     return _ctx("pull_request", event)
 
 
+def retarget_event(prev="stage", changes=None):
+    """pull_request.edited; a base retarget unless `changes` overrides the payload."""
+    ctx = pr_event("edited")
+    ctx["github"]["event"]["changes"] = (changes if changes is not None
+                                         else {"base": {"ref": {"from": prev}, "sha": {"from": "f" * 40}}})
+    return ctx
+
+
+NON_RETARGET_EDITS = ({"title": {"from": "old"}}, {"body": {"from": "old"}}, {"base": None}, {},
+                      {"base": {}}, {"base": {"ref": None}}, {"base": {"ref": {}}},
+                      {"base": {"ref": {"from": ""}}}, {"base": {"ref": {"from": None}}})
+
+
 def comment_event(body, assoc="OWNER", user_type="User", kind="issue_comment", on_pr=True,
                   login=OWNER_LOGIN):
     comment = {"body": body, "author_association": assoc, "user": {"login": login, "type": user_type}}
@@ -648,7 +661,10 @@ class CallerGate(unittest.TestCase):
             self.assertFires(pr_event(action), False)
         for label in ("bug", "needs-human", "enhancement", "Human-Override-x", ""):
             self.assertFires(pr_event("labeled", label=label), False)
-        self.assertFires(pr_event("unlabeled", label="human-override"), False)
+        # Only the human-override label's removal recomputes the verdict (#27); removing
+        # needs-human would re-apply it from state and repost the escalation comment.
+        for label in ("bug", "needs-human", "Human-Override-x", ""):
+            self.assertFires(pr_event("unlabeled", label=label), False)
         self.assertFires(_ctx("push", {"ref": "refs/heads/main"}), False)
 
     def test_writer_commands_start_a_run(self):
@@ -663,15 +679,37 @@ class CallerGate(unittest.TestCase):
         for action in ("opened", "synchronize", "reopened", "ready_for_review"):
             self.assertGroup(pr_event(action), "review", True)
         self.assertGroup(pr_event("labeled", label="human-override"), "verdict", False)
+        self.assertGroup(pr_event("unlabeled", label="human-override"), "verdict", False)
         self.assertGroup(dispatch_event("7"), "review", True)
+
+    def test_caller_subscribes_to_unlabeled_and_edited(self):
+        for name, text in self.texts.items():
+            with self.subTest(source=name):
+                types = yaml_get(text, "on", "pull_request", "types")
+                self.assertIn("unlabeled", [t.strip() for t in types.strip("[]").split(",")])
+                self.assertIn("edited", [t.strip() for t in types.strip("[]").split(",")])
+
+    def test_base_retarget_starts_a_cancelling_review(self):
+        """GHSA-6h55-p37r-jc34; '0' guards GitHub's '0' == null numeric coercion."""
+        for prev in ("stage", "0", "main", "release/1.0", "false", "null"):
+            with self.subTest(prev=prev):
+                self.assertGroup(retarget_event(prev), "review", True)
+
+    def test_title_body_and_malformed_edits_never_start_a_run(self):
+        for changes in NON_RETARGET_EDITS:
+            with self.subTest(changes=changes):
+                self.assertFires(retarget_event(changes=changes), False)
 
     def test_caller_never_drops_an_event_route_acts_on(self):
         """Every event route.decide() would act on still reaches it through the caller."""
         import route  # noqa: E402
         events = [pr_event(a) for a in ("opened", "synchronize", "reopened", "ready_for_review",
                                         "closed", "edited", "labeled", "unlabeled")]
-        events += [pr_event("labeled", label=n) for n in ("human-override", "bug", "needs-human")]
+        events += [pr_event(a, label=n) for a in ("labeled", "unlabeled")
+                   for n in ("human-override", "bug", "needs-human")]
         events.append(dispatch_event("7"))
+        events += [retarget_event(p) for p in ("stage", "0", "main", "false")]
+        events += [retarget_event(changes=c) for c in NON_RETARGET_EDITS]
         for kind in ("issue_comment", "pull_request_review_comment"):
             for assoc in WRITERS + OUTSIDERS:
                 for user_type in ("User", "Bot"):
@@ -726,6 +764,79 @@ class VerdictGate(unittest.TestCase):
         for route_result in ("failure", "cancelled", "skipped"):
             self.assertFalse(self.run_if(upstream_ok=False, route_result=route_result))
         self.assertFalse(self.run_if(action="skip"))
+
+
+def _job_block(text, job):
+    """Raw text of one top-level job in review.yml."""
+    m = re.search(rf"^  {re.escape(job)}:\n(.*?)(?=^  [A-Za-z_][\w-]*:\n|\Z)", text, re.M | re.S)
+    if not m:
+        raise KeyError(job)
+    return m.group(1)
+
+
+def _step_env(block, key):
+    m = re.search(rf"^\s+{re.escape(key)}:\s+(.*)$", block, re.M)
+    if not m:
+        raise KeyError(key)
+    return m.group(1).strip()
+
+
+class VerdictOverrideWiring(unittest.TestCase):
+    """review.yml plumbing for GHSA-q4j9-99qr-cfhw: SHA fallback, bind flag, no synchronize-only clear."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.text = REVIEW.read_text()
+        cls.verdict = _job_block(cls.text, "verdict")
+
+    def test_route_exports_head_sha_and_bind_override(self):
+        for key in ("head_sha", "bind_override"):
+            self.assertEqual(yaml_get(self.text, "jobs", "route", "outputs", key),
+                             f"${{{{ steps.route.outputs.{key} }}}}")
+
+    def test_sha_falls_back_to_event_head_not_live_head(self):
+        raw = _step_env(self.verdict, "SHA")
+        ctx = lambda scan, route_sha: {"needs": {"scan": {"outputs": {"head_sha": scan}},
+                                                 "route": {"outputs": {"head_sha": route_sha}}}}
+        self.assertEqual(eval_value(raw, ctx(SHA, "a" * 40)), SHA)
+        self.assertEqual(eval_value(raw, ctx("", "a" * 40)), "a" * 40)  # scan skipped/failed early
+        self.assertEqual(eval_value(raw, {"needs": {"route": {"outputs": {"head_sha": "a" * 40}}}}), "a" * 40)
+        self.assertEqual(eval_value(raw, ctx("", "")), "")  # issue_comment: verdict.py uses the live head
+
+    def test_bind_override_passed_and_clear_override_gone(self):
+        self.assertEqual(_step_env(self.verdict, "BIND_OVERRIDE"), "${{ needs.route.outputs.bind_override }}")
+        call = [ln for ln in logical_lines(self.verdict) if "verdict.py" in ln]
+        self.assertEqual(len(call), 1, call)
+        args = _tokens(call[0])
+        self.assertEqual(args[args.index("--bind-override") + 1], "$BIND_OVERRIDE")
+        self.assertEqual(args[args.index("--sha") + 1], "$SHA")
+        self.assertNotIn("clear-override", self.verdict)
+        self.assertNotRegex(self.verdict, r"^\s+CLEAR:", "override removal must not depend on the event reason")
+
+
+class ReviewedBaseWiring(unittest.TestCase):
+    """review.yml: publish records the base the scan diffed against (GHSA-6h55-p37r-jc34)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.text = REVIEW.read_text()
+        cls.publish = _job_block(cls.text, "publish")
+
+    def test_scan_exports_base_ref_from_its_own_pr_lookup(self):
+        self.assertEqual(yaml_get(self.text, "jobs", "scan", "outputs", "base_ref"),
+                         "${{ steps.pr.outputs.base_ref }}")
+        self.assertIn('"base_ref=" + .baseRefName', _job_block(self.text, "scan"))
+
+    def test_publish_passes_scan_base_not_a_live_lookup(self):
+        self.assertEqual(_step_env(self.publish, "BASE"), "${{ needs.scan.outputs.base_ref }}")
+        self.assertIn("scan", yaml_get(self.text, "jobs", "publish", "needs"))
+        call = [ln for ln in logical_lines(self.publish) if "publish_review.py" in ln]
+        self.assertEqual(len(call), 1, call)
+        args = _tokens(call[0])
+        # --base=VALUE so a ref starting with "-" is never parsed as an option.
+        self.assertIn("--base=$BASE", args)
+        self.assertNotIn("--base", args)
+        self.assertEqual(args[args.index("--sha") + 1], "$SHA")
 
 
 if __name__ == "__main__":

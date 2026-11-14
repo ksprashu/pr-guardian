@@ -2,7 +2,7 @@
 name: pr-guardian
 on:
   pull_request:
-    types: [opened, synchronize, reopened, ready_for_review, labeled]
+    types: [opened, synchronize, reopened, ready_for_review, edited, labeled, unlabeled]
   # Only /ai-review commands from writers act (scripts/route.py), and fork PRs are never
   # reviewed from a comment (the scan job refuses cross-repository heads).
   issue_comment: # zizmor: ignore[dangerous-triggers]
@@ -18,15 +18,22 @@ permissions: {}
 jobs:
   guardian:
     # Start a run only for events scripts/route.py can act on (GHSA-6wg7-gfpx-8639): review
-    # actions, the human-override label, and non-bot /ai-review comments on PRs from writers
-    # (OWNER, MEMBER, COLLABORATOR, as route.py's WRITE_ASSOCIATIONS). Outsiders, bots, plain
-    # issues and other labels never join a concurrency group, so they cannot cancel a run.
+    # actions, an edit that retargets the base (changes.base.ref.from set; the verdict is bound
+    # to the reviewed base, GHSA-6h55-p37r-jc34; title/body edits never start a run), the
+    # human-override label being applied or removed (removal recomputes the verdict, so an
+    # override's success never outlives the label), and non-bot /ai-review comments on PRs
+    # from writers (OWNER, MEMBER, COLLABORATOR, as route.py's WRITE_ASSOCIATIONS).
+    # Outsiders, bots, plain issues, other labels and title/body edits never join a
+    # concurrency group, so they cannot cancel a run.
     if: >-
       github.event_name == 'workflow_dispatch'
       || (github.event_name == 'pull_request'
       && (github.event.action == 'opened' || github.event.action == 'synchronize'
       || github.event.action == 'reopened' || github.event.action == 'ready_for_review'
-      || (github.event.action == 'labeled' && github.event.label.name == 'human-override')))
+      || (github.event.action == 'edited' && github.event.changes.base != null
+      && github.event.changes.base.ref.from != '')
+      || ((github.event.action == 'labeled' || github.event.action == 'unlabeled')
+      && github.event.label.name == 'human-override')))
       || ((github.event_name == 'pull_request_review_comment'
       || (github.event_name == 'issue_comment' && github.event.issue.pull_request != null))
       && github.event.comment.user.type != 'Bot'
@@ -34,14 +41,15 @@ jobs:
       && (github.event.comment.author_association == 'OWNER'
       || github.event.comment.author_association == 'MEMBER'
       || github.event.comment.author_association == 'COLLABORATOR'))
-    # Reviews cancel superseded reviews; verdict-only runs (override label, escalation) queue
+    # Reviews cancel superseded reviews; verdict-only runs (override label on/off, escalation) queue
     # instead, so one writer action never cancels another's verdict in flight.
     concurrency:
       group: >-
         pr-guardian-${{ github.event.pull_request.number || github.event.issue.number || inputs.pr }}-${{
-        (github.event.action == 'labeled' || startsWith(github.event.comment.body, '/ai-review escalate'))
+        (github.event.action == 'labeled' || github.event.action == 'unlabeled'
+        || startsWith(github.event.comment.body, '/ai-review escalate'))
         && 'verdict' || 'review' }}
-      cancel-in-progress: ${{ !(github.event.action == 'labeled' || startsWith(github.event.comment.body, '/ai-review escalate')) }}
+      cancel-in-progress: ${{ !(github.event.action == 'labeled' || github.event.action == 'unlabeled' || startsWith(github.event.comment.body, '/ai-review escalate')) }}
     uses: ksprashu/pr-guardian/.github/workflows/review.yml@{{REF}}
     with:
       guardian_ref: {{REF}}

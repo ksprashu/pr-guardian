@@ -7,8 +7,10 @@ Usage:
 
 The model never runs in this job and this job is the only one holding
 `pull-requests: write`. Everything the model wrote is treated as untrusted
-text: HTML comments are stripped (so it cannot forge markers), @-mentions are
-defused, and fences are chosen so evidence cannot break out of its block.
+text (textsafe.py): HTML comments are stripped to a fixpoint (so it cannot
+forge markers), @-mentions are defused, single-line fields cannot break lines,
+link targets must be plain https URLs, ids must match the marker grammar, and
+fences are chosen so evidence cannot break out of its block.
 
 Thread policy:
   new P0-P3 inside the diff     -> new inline thread (one review, event COMMENT)
@@ -33,6 +35,7 @@ from typing import Any
 import gh
 import state as st
 import threads as th
+from textsafe import clean, inline, safe_url  # noqa: F401  (clean is re-exported as pub.clean)
 
 BLOCKING = ("P0", "P1", "P2", "P3")
 STATUS_MARKER = "<!-- pr-guardian:status id={id} status={status} -->"
@@ -46,11 +49,38 @@ PRICES = [(dt.date(2026, 12, 1), 4.0, 20.0), (dt.date(1970, 1, 1), 2.0, 10.0)]
 
 
 # --- sanitising model text ---------------------------------------------------
+# clean/inline/safe_url live in textsafe.py; ids are validated, never rewritten,
+# because they are also the keys threads and state are matched on.
 
-def clean(text: str) -> str:
-    text = re.sub(r"<!--.*?(-->|$)", "", text or "", flags=re.S)
-    text = text.replace("<!--", "")
-    return re.sub(r"(?<![\w`])@(?=[A-Za-z0-9-])", "@​", text)
+def check_finding(f: dict[str, Any]) -> None:
+    """Fail the publish when a field that lands inside a marker is not well formed."""
+    if not isinstance(f.get("id"), str) or not st.ID_RE.match(f["id"]):
+        raise ValueError(f"finding id {inline(f.get('id'))!r} does not match {st.ID_RE.pattern}")
+    if f.get("prior_id") is not None and not (isinstance(f["prior_id"], str) and st.ID_RE.match(f["prior_id"])):
+        raise ValueError(f"finding {f['id']}: prior_id {inline(f['prior_id'])!r} is not a finding id")
+    if f.get("severity") not in st.SEVERITIES:
+        raise ValueError(f"finding {f['id']}: unknown severity {inline(f.get('severity'))!r}")
+    for key in ("file", "rule"):
+        if not isinstance(f.get(key), str):
+            raise ValueError(f"finding {f['id']}: {key} must be a string")
+    for key in ("start_line", "end_line"):
+        if not isinstance(f.get(key), int) or isinstance(f.get(key), bool):
+            raise ValueError(f"finding {f['id']}: {key} must be an integer")
+
+
+def _marker_id(value: Any) -> str:
+    """Belt and braces for marker tokens: nothing but id characters survive."""
+    return re.sub(r"[^\w.-]", "", str(value or ""))
+
+
+def _ref(r: Any) -> str | None:
+    if not isinstance(r, dict):
+        return None
+    url = safe_url(r.get("url"))
+    if not url:
+        return None
+    title = inline(r.get("title")).replace("\\", "\\\\").replace("[", "\\[").replace("]", "\\]")
+    return f"[{title or url}]({url})"
 
 
 def fence(text: str, lang: str = "") -> str:
@@ -61,19 +91,18 @@ def fence(text: str, lang: str = "") -> str:
 
 
 def finding_body(f: dict[str, Any], in_diff: bool) -> str:
-    parts = [st.FINDING_MARKER.format(id=f["id"], severity=f["severity"]),
-             f"**{f['severity']} · {f['axis']} · {clean(f['rule'])}** · {clean(f['title'])}",
+    parts = [st.FINDING_MARKER.format(id=_marker_id(f["id"]), severity=_marker_id(f["severity"])),
+             f"**{inline(f['severity'])} · {inline(f['axis'])} · {inline(f['rule'])}** · {inline(f['title'])}",
              "", clean(f["rationale"])]
     if f.get("evidence"):
         parts += ["", "<details><summary>Evidence</summary>", "", fence(clean(f["evidence"])),
                   "", "</details>"]
     if in_diff and f.get("suggestion"):
         parts += ["", "```suggestion\n" + clean(f["suggestion"]).replace("```", "ʼʼʼ") + "\n```"]
-    if f.get("references"):
-        refs = " · ".join(f"[{clean(r['title'])}]({r['url']})" for r in f["references"]
-                          if r["url"].startswith("https://"))
-        parts += ["", f"References: {refs}"]
-    parts += ["", f"<sub>{f['id']} · confidence {f['confidence']} · fix it, or reply "
+    refs = [x for x in (_ref(r) for r in f.get("references") or []) if x]
+    if refs:
+        parts += ["", "References: " + " · ".join(refs)]
+    parts += ["", f"<sub>{inline(f['id'])} · confidence {inline(f.get('confidence'))} · fix it, or reply "
                   "`/ai-review wontfix: <reason>` to push back</sub>"]
     return "\n".join(parts)
 
@@ -129,6 +158,8 @@ def plan(doc: dict[str, Any], prior: dict[str, Any], thread_list: list[dict[str,
     accepted_keys = {(a["file"], a["rule"]) for a in prior["accepted"]}
     seen_prior: set[str] = set()
     findings = [dict(f) for f in doc["findings"]]
+    for f in findings:
+        check_finding(f)
 
     for f in findings:
         if f.get("prior_id"):
@@ -150,15 +181,15 @@ def plan(doc: dict[str, Any], prior: dict[str, Any], thread_list: list[dict[str,
             continue
 
         if status == "new" and (f["file"], f["rule"]) in accepted_keys:
-            actions["signals"].append(f"oscillation: {f['id']} re-raises accepted pushback "
-                                      f"({f['file']}, {f['rule']})")
+            actions["signals"].append(f"oscillation: {inline(f['id'])} re-raises accepted pushback "
+                                      f"({inline(f['file'])}, {inline(f['rule'])})")
 
         if thread:
             if status == "reopened":
                 key = f["prior_id"]
                 new_state["reopen_counts"][key] = new_state["reopen_counts"].get(key, 0) + 1
                 if new_state["reopen_counts"][key] >= REOPEN_ESCALATION:
-                    actions["signals"].append(f"{key} reopened {new_state['reopen_counts'][key]} times")
+                    actions["signals"].append(f"{inline(key)} reopened {new_state['reopen_counts'][key]} times")
             if thread["isResolved"]:
                 actions["unresolve"].append({"thread": thread["id"], "body": _status(f, "reopened")
                                              + f"🔁 Reopened: the code still has this problem. {clean(f['rationale'])}"})
@@ -171,12 +202,12 @@ def plan(doc: dict[str, Any], prior: dict[str, Any], thread_list: list[dict[str,
         target.append(f)
 
     for old in prior["findings"]:
-        if (old["severity"] in BLOCKING and old.get("status") not in st_closed()
+        if (old.get("severity") in BLOCKING and old.get("status") not in st_closed()
                 and old["id"] not in seen_prior
                 and old["id"] not in {f["id"] for f in findings}):
             carried = dict(old, status="still_open", prior_id=old["id"])
             findings.append(carried)
-            actions["signals"].append(f"unaccounted: reviewer dropped {old['id']} without a status; kept open")
+            actions["signals"].append(f"unaccounted: reviewer dropped {inline(old['id'])} without a status; kept open")
 
     if new_state["round"] >= ROUND_CAP:
         actions["signals"].append(f"round cap: {new_state['round']} rounds")
@@ -191,7 +222,7 @@ def plan(doc: dict[str, Any], prior: dict[str, Any], thread_list: list[dict[str,
 
 
 def _status(f: dict[str, Any], status: str) -> str:
-    return STATUS_MARKER.format(id=f["prior_id"] or f["id"], status=status) + "\n"
+    return STATUS_MARKER.format(id=_marker_id(f["prior_id"] or f["id"]), status=_marker_id(status)) + "\n"
 
 
 def st_closed() -> tuple[str, ...]:
@@ -214,6 +245,11 @@ def round_cost_of(record: dict[str, Any]) -> tuple[float, str]:
     return cost(record.get("usage")), ""
 
 
+def _loc(f: dict[str, Any]) -> str:
+    """`file:line` as a code span the file name cannot close or break out of."""
+    return f"`{inline(f.get('file')).replace('`', '')}:{inline(f.get('start_line'))}`"
+
+
 def summary_body(doc: dict[str, Any], result: dict[str, Any], round_cost: float, note: str = "") -> str:
     s, a = result["state"], result["actions"]
     open_blocking = [f for f in s["findings"] if f["severity"] in BLOCKING and f["status"] not in st_closed()]
@@ -224,21 +260,22 @@ def summary_body(doc: dict[str, Any], result: dict[str, Any], round_cost: float,
              f"| {counts['P0']} | {counts['P1']} | {counts['P2']} | {counts['P3']} | {len(a['nits'])} |", ""]
     if a["outside"]:
         lines.append("**Findings outside the diff** (fix them; they block like threads do):")
-        lines += [f"- **{f['id']} [{f['severity']}]** `{f['file']}:{f['start_line']}` {clean(f['title'])}"
+        lines += [f"- **{inline(f['id'])} [{inline(f['severity'])}]** {_loc(f)} {inline(f['title'])}"
                   for f in a["outside"]]
         lines.append("")
     if a["nits"]:
         lines.append(f"<details><summary>{len(a['nits'])} nits (non-blocking)</summary>\n")
-        lines += [f"- `{f['file']}:{f['start_line']}` {clean(f['title'])}" for f in a["nits"]]
+        lines += [f"- {_loc(f)} {inline(f['title'])}" for f in a["nits"]]
         lines.append("\n</details>\n")
     if doc.get("not_inspected"):
         lines.append("<details><summary>Not inspected</summary>\n")
-        lines += [f"- {clean(n['what'])}: {clean(n['reason'])}" for n in doc["not_inspected"]]
+        lines += [f"- {inline(n.get('what'))}: {inline(n.get('reason'))}" for n in doc["not_inspected"]
+                  if isinstance(n, dict)]
         lines.append("\n</details>\n")
     if a["signals"]:
-        lines.append("**Signals:** " + "; ".join(clean(x) for x in a["signals"]))
+        lines.append("**Signals:** " + "; ".join(inline(x) for x in a["signals"]))
     if note:
-        lines.append(f"_{clean(note)}._")
+        lines.append(f"_{inline(note)}._")
     total = round(sum(s["cost_usd"]), 2)
     lines.append(f"\n<sub>Round cost ≈ ${round_cost:.2f} · PR total ≈ ${total:.2f} · "
                  "commands: `/ai-review wontfix: <reason>` (in a thread), `/ai-review escalate: <why>`</sub>")
@@ -264,7 +301,7 @@ def toggle(mutation: str, thread: str) -> None:
 
 
 def execute(repo: str, pr: int, sha: str, doc: dict[str, Any], result: dict[str, Any],
-            round_cost: float, note: str = "") -> None:
+            round_cost: float, note: str = "", base: str = "") -> None:
     a = result["actions"]
     for item in a["unresolve"]:
         toggle(UNRESOLVE, item["thread"])
@@ -294,6 +331,8 @@ def execute(repo: str, pr: int, sha: str, doc: dict[str, Any], result: dict[str,
 
     result["state"]["cost_usd"] = list(result["state"]["cost_usd"]) + [round_cost]
     result["state"]["last_reviewed_sha"] = sha
+    # The base the scan diffed against, so a retarget makes verdict.py wait (GHSA-6h55-p37r-jc34).
+    result["state"]["last_reviewed_base"] = base
     body = summary_body(doc, result, round_cost, note)
     existing = st.find_summary_comment(gh.api(f"repos/{repo}/issues/{pr}/comments", paginate=True))
     if existing:
@@ -307,6 +346,7 @@ def main() -> int:
     ap.add_argument("--repo", required=True)
     ap.add_argument("--pr", required=True, type=int)
     ap.add_argument("--sha", required=True)
+    ap.add_argument("--base", default="", help="base ref the scan reviewed against (scan job output)")
     ap.add_argument("--findings", required=True)
     ap.add_argument("--prior", default=None, help="optional prior state JSON; defaults to live summary comment")
     ap.add_argument("--usage", help="agy --output-format json result, for cost")
@@ -315,8 +355,9 @@ def main() -> int:
 
     doc = json.loads(Path(args.findings).read_text(encoding="utf-8"))
     if args.prior:
-        prior = st.empty_state()
-        prior.update(json.loads(Path(args.prior).read_text(encoding="utf-8")))
+        prior = st.validate_state(json.loads(Path(args.prior).read_text(encoding="utf-8")))
+        if prior is None:
+            raise SystemExit(f"publish: --prior {args.prior} is not a valid pr-guardian state")
     else:
         comments = gh.api(f"repos/{args.repo}/issues/{args.pr}/comments", paginate=True) or []
         summary = st.find_summary_comment(comments)
@@ -331,7 +372,7 @@ def main() -> int:
         print(json.dumps({"actions": {k: len(v) for k, v in result["actions"].items()},
                           "signals": result["actions"]["signals"], "cost": round_cost}, indent=2))
         return 0
-    execute(args.repo, args.pr, args.sha, doc, result, round_cost, reviewer)
+    execute(args.repo, args.pr, args.sha, doc, result, round_cost, reviewer, base=args.base)
     print(json.dumps({"round": result["state"]["round"], "signals": result["actions"]["signals"]}))
     return 0
 
