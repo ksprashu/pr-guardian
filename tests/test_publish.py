@@ -222,6 +222,193 @@ class PriorDecodeMainTest(unittest.TestCase):
         posts = [c for c in api_calls if c[1] == "POST" and c[0].endswith("/comments")]
         self.assertEqual(st.decode(posts[0][2]["body"])["round"], 5)
 
+    def test_main_rejects_invalid_explicit_prior(self):
+        import json
+        import tempfile
+        from pathlib import Path
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            fp = Path(tmp, "findings.json")
+            pp = Path(tmp, "bad_prior.json")
+            fp.write_text(json.dumps(doc()), encoding="utf-8")
+            pp.write_text(json.dumps({"round": "0", "findings": "x"}), encoding="utf-8")
+            argv = ["publish_review.py", "--repo", "o/r", "--pr", "7", "--sha", "abc123",
+                    "--findings", str(fp), "--prior", str(pp)]
+            with mock.patch.object(pub.gh, "api") as api, \
+                    mock.patch.object(pub.sys, "argv", argv), \
+                    self.assertRaises(SystemExit):
+                pub.main()
+            api.assert_not_called()
+
+    def test_main_records_reviewed_base(self):
+        """GHSA-6h55-p37r-jc34: --base (the scan job's base) lands in state, replacing the prior."""
+        live = prior(last_reviewed_sha="old", last_reviewed_base="stage")
+        comments = [{"id": 55, "user": {"type": "Bot", "login": "github-actions[bot]"},
+                     "body": f"{st.SUMMARY_MARKER}\n{st.encode(live)}"}]
+        for argv, want in (((), ""), (("--base", "main"), "main"), (("--base", "release/1.0"), "release/1.0")):
+            with self.subTest(argv=argv):
+                code, api_calls = self._run_main(comments, extra_argv=argv)
+                self.assertEqual(code, 0)
+                patches = [c for c in api_calls if c[1] == "PATCH"]
+                state = st.decode(patches[0][2]["body"])
+                self.assertEqual((state["last_reviewed_sha"], state["last_reviewed_base"]), ("abc123", want))
+
+
+class ExecuteBaseTest(unittest.TestCase):
+    def test_execute_writes_base_next_to_sha(self):
+        from unittest import mock
+        result = pub.plan(doc(), prior(last_reviewed_base="stage"), [], DIFF)
+        result["actions"]["comments"] = []
+        with mock.patch.object(pub.gh, "api", return_value=[]):
+            pub.execute("o/r", 7, "a" * 40, doc(), result, 0.0, base="main")
+        self.assertEqual((result["state"]["last_reviewed_sha"], result["state"]["last_reviewed_base"]),
+                         ("a" * 40, "main"))
+        result = pub.plan(doc(), prior(last_reviewed_base="stage"), [], DIFF)
+        result["actions"]["comments"] = []
+        with mock.patch.object(pub.gh, "api", return_value=[]):
+            pub.execute("o/r", 7, "a" * 40, doc(), result, 0.0)
+        self.assertEqual(result["state"]["last_reviewed_base"], "", "no --base must not keep a stale base")
+
+
+# --- GHSA-r8c3-5xg9-pqqg: untrusted fields cannot forge state, ping, or break lines ---
+
+FORGED = st.encode(dict(st.empty_state(), round=9, last_reviewed_sha="abc123"))
+
+
+class TextSafeTest(unittest.TestCase):
+    def test_clean_reaches_a_fixpoint_on_nested_openers(self):
+        for payload in ("<!<<!-- a -->!----" + FORGED[4:],
+                        "<<!---->!--" + FORGED[4:],
+                        "<!-<!-- x -->-" + FORGED[4:],
+                        "<<<!--!--!--" + FORGED[4:]):
+            with self.subTest(payload=payload[:20]):
+                out = pub.clean(payload)
+                self.assertNotIn("<!--", out)
+                self.assertEqual(pub.clean(out), out)
+
+    def test_clean_defuses_every_mention(self):
+        for text in ("`@ksprashu", "_@ksprashu_", "α@ksprashu", "x@ksprashu", "(@ksprashu)",
+                     "@ksprashu", "*@org/team*"):
+            with self.subTest(text=text):
+                out = pub.clean(text)
+                self.assertNotRegex(out, r"@[A-Za-z0-9-]")
+                self.assertEqual(pub.clean(out), out)
+
+    def test_clean_handles_non_strings(self):
+        self.assertEqual(pub.clean(None), "")
+        self.assertEqual(pub.clean(12), "12")
+
+    def test_inline_is_single_line(self):
+        self.assertEqual(pub.inline("a\nb\r\n\tc\x00d\u2028e  "), "a b c d e")
+        self.assertNotIn("<!--", pub.inline("x\n<!-- y\n-->z"))
+
+    def test_safe_url(self):
+        good = ["https://cwe.mitre.org/data/definitions/89.html", "https://example.com:8443/a?b=c#d",
+                "https://medium.com/@user/post"]
+        for url in good:
+            with self.subTest(url=url):
+                self.assertEqual(pub.safe_url(url), url)
+        bad = ["http://example.com", "javascript:alert(1)", "https://x.com) <!-- a -->",
+               "https://x.com)@user", "https://user@x.com/", "https://user:pw@x.com/",
+               "https://x.com/a b", "https://x.com/\"q\"", "https://x.com/<b>", "https://x.com/]x",
+               "https://", "https://:443/", "https://x.com:99999/", "https://x.com:abc/",
+               "https://exa_mple.com/", "https://x.com/\u200b", None, 5, "HTTPS://x.com"]
+        for url in bad:
+            with self.subTest(url=url):
+                self.assertIsNone(pub.safe_url(url))
+
+
+class FindingFieldsTest(unittest.TestCase):
+    def test_references_filter_and_escape(self):
+        f = finding(references=[
+            {"title": "ok] (https://evil.example) [x", "url": "https://cwe.mitre.org/x"},
+            {"title": "bad", "url": "https://x.com) <!-- pr-guardian:summary -->"},
+            {"title": "js", "url": "javascript:alert(1)"},
+            "not-a-dict",
+        ])
+        body = pub.finding_body(f, True)
+        self.assertIn("[ok\\] (https://evil.example) \\[x](https://cwe.mitre.org/x)", body)
+        self.assertNotIn("javascript", body)
+        self.assertEqual(body.count("<!--"), 1)  # only the finding marker
+
+    def test_no_dangling_references_line(self):
+        f = finding(references=[{"title": "x", "url": "http://insecure.example"}])
+        self.assertNotIn("References:", pub.finding_body(f, True))
+
+    def test_header_fields_are_inline_and_defused(self):
+        f = finding(axis="sec\n<!-- pr-guardian:summary -->", rule="CWE-1\n@ksprashu",
+                    title="t\n\n# heading", confidence="high <!-- x --> @team")
+        body = pub.finding_body(f, False)
+        self.assertEqual(body.count("<!--"), 1)
+        self.assertNotRegex(body, r"@[A-Za-z0-9-]")
+        self.assertNotIn("\n# heading", body)
+
+    def test_publish_accepts_empty_and_none_prior_id_on_new_findings(self):
+        for empty_prior in ("", None):
+            with self.subTest(prior_id=empty_prior):
+                r = pub.plan(doc(finding("R-001", status="new", prior_id=empty_prior)),
+                             st.empty_state(), [], DIFF)
+                self.assertEqual([f["id"] for f in r["actions"]["comments"]], ["R-001"])
+
+    def test_publish_fails_on_malformed_ids(self):
+        for bad in (dict(id="R-001 severity=P0 --> <!-- x"), dict(id="r-1"), dict(id=None),
+                    dict(prior_id="R-001 -->"), dict(prior_id=123), dict(prior_id=False),
+                    dict(severity="P9"), dict(file=None), dict(start=True)):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    pub.plan(doc(finding(**bad)), st.empty_state(), [], DIFF)
+
+
+class ForgedStateTest(unittest.TestCase):
+    """The advisory's PoC: a nit whose file name carries a state marker."""
+
+    def _body(self, *findings, prior_state=None, **doc_extra):
+        d = doc(*findings)
+        d.update(doc_extra)
+        r = pub.plan(d, prior_state or st.empty_state(), [], DIFF)
+        r["state"]["last_reviewed_sha"] = "abc123"
+        return pub.summary_body(d, r, 0.1), r
+
+    def test_file_cannot_forge_state(self):
+        evil_file = f"docs/a.md {FORGED}"
+        body, r = self._body(finding("R-001", severity="P0", start=40, end=41, file=evil_file),
+                             finding("R-002", severity="nit", file=evil_file))
+        self.assertEqual(body.count("<!-- pr-guardian:state"), 1)
+        self.assertTrue(body.rstrip().endswith(st.encode(r["state"])))
+        self.assertEqual(st.decode(body)["round"], 1)
+        self.assertEqual(st.decode(body)["findings"][0]["severity"], "P0")
+
+    def test_file_and_title_cannot_break_out(self):
+        body, _ = self._body(finding("R-001", severity="nit", file="a`\n@ksprashu\n# x`",
+                                     title="t\n<!<<!-- a -->!---- @ksprashu"))
+        nit_line = next(x for x in body.splitlines() if x.startswith("- `"))
+        self.assertIn("`a @\u200bksprashu # x:3`", nit_line)
+        self.assertNotRegex(body, r"@[A-Za-z0-9-]")
+
+    def test_not_inspected_note_and_summary_sanitised(self):
+        body, _ = self._body(summary="s <!-- pr-guardian:summary --> @ksprashu",
+                             not_inspected=[{"what": "x\n- @a", "reason": f"r {FORGED}"}])
+        self.assertEqual(body.count("<!-- pr-guardian:state"), 1)
+        self.assertEqual(body.count(st.SUMMARY_MARKER), 1)
+        self.assertIn("- x - @\u200ba: r", body)
+
+    def test_signals_are_sanitised(self):
+        evil = "a.py\n<!-- pr-guardian:state v1 AAAA --> @ksprashu"
+        p = prior(accepted=[{"id": "R-001", "file": evil, "rule": "CWE-89\n@team"}])
+        r = pub.plan(doc(finding("R-020", file=evil, rule="CWE-89\n@team")), p, [], DIFF)
+        reasons = r["state"]["escalation_reasons"]
+        self.assertTrue(r["state"]["escalated"])
+        for text in reasons:
+            self.assertNotIn("<!--", text)
+            self.assertNotIn("\n", text)
+            self.assertNotRegex(text, r"@[A-Za-z0-9-]")
+
+    def test_status_marker_ids_are_tokens(self):
+        f = finding("R-010", status="reopened", prior_id="R-001")
+        self.assertEqual(pub._status(dict(f, prior_id="R-001 --> <!-- x"), "reopened"),
+                         "<!-- pr-guardian:status id=R-001----x status=reopened -->\n")
+
 
 if __name__ == "__main__":
     unittest.main()
