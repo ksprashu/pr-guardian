@@ -16,8 +16,10 @@ Thread policy:
   new P0-P3 inside the diff     -> new inline thread (one review, event COMMENT)
   new P0-P3 outside the diff    -> listed in the review body
   still_open / reopened, thread resolved   -> unresolve + reply why
-  still_open, author replied since bot     -> reply with the counter-argument
+  still_open, a writer replied since bot   -> reply with the counter-argument
   fixed / accepted_pushback      -> reply + resolve
+  accepted_pushback without a writer's `/ai-review wontfix` after the bot's
+    last comment in the finding's thread  -> kept open (still_open), signalled
   prior open id missing from this round    -> kept open, flagged as unaccounted
   nit                            -> summary comment only, never a thread
 """
@@ -40,7 +42,10 @@ from textsafe import clean, inline, safe_url  # noqa: F401  (clean is re-exporte
 BLOCKING = ("P0", "P1", "P2", "P3")
 STATUS_MARKER = "<!-- pr-guardian:status id={id} status={status} -->"
 NITS_MARKER = "<!-- pr-guardian:nits -->"
-BOT_LOGINS = ("github-actions", "github-actions[bot]")
+WONTFIX_RE = re.compile(r"\A/ai-review\s+wontfix(?:\s|:|\Z)")
+UNAUTH_PUSHBACK = "unauthenticated pushback"
+COERCED_NOTE = ("Still open: pushback is accepted only after someone with write access replies "
+                "`/ai-review wontfix: <reason>` in this thread after pr-guardian's last comment.")
 REOPEN_ESCALATION = 3
 ROUND_CAP = 6
 
@@ -140,8 +145,34 @@ def in_diff(f: dict[str, Any], lines: dict[str, set[int]]) -> bool:
 # --- planning (pure, tested) -------------------------------------------------
 
 def last_comment_is_bot(thread: dict[str, Any]) -> bool:
-    nodes = thread.get("comments", {}).get("nodes", [])
-    return bool(nodes) and (nodes[-1].get("author") or {}).get("login") in BOT_LOGINS
+    nodes = th.comments(thread)
+    return bool(nodes) and th.is_bot(nodes[-1])
+
+
+def _since_bot(thread: dict[str, Any]) -> list[dict[str, Any]] | None:
+    """Comments after pr-guardian's last comment in the thread; None when it never spoke."""
+    nodes = th.comments(thread)
+    last_bot_idx = max((i for i, c in enumerate(nodes) if th.is_bot(c)), default=-1)
+    return None if last_bot_idx < 0 else nodes[last_bot_idx + 1:]
+
+
+def writer_replied(thread: dict[str, Any]) -> bool:
+    """A writer commented after pr-guardian's last comment (outsiders get no reply)."""
+    after = _since_bot(thread)
+    return bool(after) and any(th.is_writer(c) for c in after)
+
+
+def has_writer_wontfix(thread: dict[str, Any]) -> bool:
+    """A writer replied `/ai-review wontfix` after pr-guardian's last comment.
+
+    The only evidence that lets `accepted_pushback` close a finding (GHSA-j3g5-fvc6-rrjw).
+    Fails closed when the bot never spoke or GitHub truncated the comment list, since
+    the bot's latest reply (which would make an older wontfix stale) may be unseen.
+    """
+    after = _since_bot(thread)
+    if after is None or th.truncated(thread):
+        return False
+    return any(th.is_writer(c) and WONTFIX_RE.match((c.get("body") or "").strip()) for c in after)
 
 
 def plan(doc: dict[str, Any], prior: dict[str, Any], thread_list: list[dict[str, Any]],
@@ -171,6 +202,16 @@ def plan(doc: dict[str, Any], prior: dict[str, Any], thread_list: list[dict[str,
             continue
         thread = threads.get(f["prior_id"] or f["id"])
         status = f["status"]
+        coerced = False
+
+        # The model's say-so is not pushback: only a writer's wontfix in the finding's own
+        # thread, after the bot's last word, can close a blocking finding. Otherwise it stays
+        # open (and blocking in state) and the summary says why (GHSA-j3g5-fvc6-rrjw).
+        if status == "accepted_pushback" and not (f.get("prior_id") and thread and has_writer_wontfix(thread)):
+            status = f["status"] = "still_open"
+            coerced = True
+            actions["signals"].append(f"{UNAUTH_PUSHBACK}: {inline(f['id'])} was marked accepted_pushback "
+                                      "without a writer's /ai-review wontfix in its thread; kept open")
 
         if status in st_closed():
             if thread and not thread["isResolved"]:
@@ -192,11 +233,12 @@ def plan(doc: dict[str, Any], prior: dict[str, Any], thread_list: list[dict[str,
                 if new_state["reopen_counts"][key] >= REOPEN_ESCALATION:
                     actions["signals"].append(f"{inline(key)} reopened {new_state['reopen_counts'][key]} times")
             if thread["isResolved"]:
+                why = COERCED_NOTE if coerced else f"the code still has this problem. {clean(f['rationale'])}"
                 actions["unresolve"].append({"thread": thread["id"], "body": _status(f, "reopened")
-                                             + f"🔁 Reopened: the code still has this problem. {clean(f['rationale'])}"})
-            elif not last_comment_is_bot(thread):
-                actions["reply"].append({"thread": thread["id"], "body": _status(f, "still_open")
-                                         + f"Still open after your reply: {clean(f['rationale'])}"})
+                                             + f"🔁 Reopened: {why}"})
+            elif writer_replied(thread):
+                why = COERCED_NOTE if coerced else f"Still open after your reply: {clean(f['rationale'])}"
+                actions["reply"].append({"thread": thread["id"], "body": _status(f, "still_open") + why})
             continue
 
         target = actions["comments"] if in_diff(f, lines) else actions["outside"]
@@ -215,8 +257,9 @@ def plan(doc: dict[str, Any], prior: dict[str, Any], thread_list: list[dict[str,
 
     new_state["findings"] = findings
     # Escalation is per round: the verdict turns it into the needs-human label, which is
-    # the durable signal the owner clears (override) or removes.
-    this_round = [x for x in actions["signals"] if not x.startswith("unaccounted")]
+    # the durable signal the owner clears (override) or removes. Unaccounted and unauthenticated
+    # pushback keep the finding open, which already blocks, so they inform rather than escalate.
+    this_round = [x for x in actions["signals"] if not x.startswith(("unaccounted", UNAUTH_PUSHBACK))]
     new_state["escalated"] = bool(this_round)
     new_state["escalation_reasons"] += this_round
     return {"actions": actions, "state": new_state}
