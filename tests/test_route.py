@@ -110,7 +110,9 @@ class OverrideRouteTest(unittest.TestCase):
 
     def test_other_labels_skip_on_both_actions(self):
         for action in ("labeled", "unlabeled"):
-            for label in ("needs-human", "bug", None, "Human-Override"):
+            for label in ("needs-human", "bug", None, "Human-Override", "Needs-Human"):
+                if (action, label) == ("unlabeled", "needs-human"):
+                    continue  # NeedsHumanUnlabeledTest
                 with self.subTest(action=action, label=label):
                     r = self.d(action, label=label, sender=self.OWNER)
                     self.assertEqual((r["action"], r["bind_override"]), ("skip", "false"))
@@ -242,7 +244,7 @@ class RouteSecurityTest(unittest.TestCase):
                         self.assertEqual(rc, 0)
                         self.assertNotIn("\r", raw_out)
                         lines = raw_out.splitlines()
-                        self.assertEqual(len(lines), 6)
+                        self.assertEqual(len(lines), len(route.OUTPUT_KEYS))
                         self.assertEqual([ln.split("=", 1)[0] for ln in lines], list(route.OUTPUT_KEYS))
                         self.assertEqual(list(parsed.keys()), list(route.OUTPUT_KEYS))
                         self.assertIn(parsed["reason"], route.REASONS)
@@ -262,8 +264,13 @@ class RouteSecurityTest(unittest.TestCase):
                         elif cmd_kind == "escalate":
                             self.assertEqual(parsed["action"], "verdict")
                             self.assertEqual(parsed["escalate"], "true")
+                        elif kind == "issue_comment":
+                            # A top-level wontfix gets a hint, not a model round (#39).
+                            self.assertEqual((parsed["action"], parsed["reason"], parsed["mode"]),
+                                             ("verdict", "wontfix belongs in a finding thread", ""))
+                            self.assertEqual(parsed["escalate"], "false")
                         else:
-                            self.assertEqual(parsed["action"], "review")
+                            self.assertEqual((parsed["action"], parsed["mode"]), ("review", "wontfix_only"))
                             self.assertEqual(parsed["escalate"], "false")
 
     def test_main_writes_bind_override_line(self):
@@ -271,7 +278,7 @@ class RouteSecurityTest(unittest.TestCase):
         ev["pull_request"]["head"]["sha"] = VALID_SHA
         rc, raw_out, parsed, _, _ = self._run_main("pull_request", ev)
         self.assertEqual(rc, 0)
-        self.assertEqual(raw_out.splitlines()[-1], "bind_override=true")
+        self.assertEqual(raw_out.splitlines()[-2:], ["bind_override=true", "mode="])
         self.assertEqual((parsed["action"], parsed["head_sha"]), ("verdict", VALID_SHA))
 
     def test_auth_runs_before_parsing(self):
@@ -305,7 +312,7 @@ class RouteSecurityTest(unittest.TestCase):
             ev["pull_request"]["head"]["sha"] = VALID_SHA
             rc, raw_out, parsed, _, _ = self._run_main("pull_request", ev)
             self.assertEqual(rc, 0)
-            self.assertEqual(len(raw_out.splitlines()), 6)
+            self.assertEqual(len(raw_out.splitlines()), len(route.OUTPUT_KEYS))
             self.assertEqual(parsed["action"], "skip")
             self.assertEqual(parsed["escalate"], "false")
             self.assertEqual(parsed["reason"], "label is not a pr-guardian control")
@@ -353,7 +360,7 @@ class RouteSecurityTest(unittest.TestCase):
         for payload in ("3\naction=verdict", "\u0663", "--repo=x/y"):
             rc, raw_out, parsed, _, _ = self._run_main("workflow_dispatch", {"inputs": {"pr": payload}})
             self.assertEqual(rc, 0)
-            self.assertEqual(len(raw_out.splitlines()), 6)
+            self.assertEqual(len(raw_out.splitlines()), len(route.OUTPUT_KEYS))
             self.assertEqual(parsed["action"], "skip")
             self.assertEqual(parsed["pr"], "")
             self.assertNotIn("verdict", raw_out)
@@ -361,7 +368,8 @@ class RouteSecurityTest(unittest.TestCase):
         self.assertEqual(route.decide("workflow_dispatch", {"inputs": None}, "o")["action"], "skip")
         for good, expected in (("3", "3"), ("9999999999", "9999999999"), (42, "42")):
             res = route.decide("workflow_dispatch", {"inputs": {"pr": good}}, "o")
-            self.assertEqual((res["action"], res["pr"], res["reason"]), ("review", expected, "manual dispatch"))
+            self.assertEqual((res["action"], res["pr"], res["reason"], res["mode"]),
+                             ("review", expected, "manual dispatch", "full"))
 
     def test_validate_output_rejects_bad_fields_to_safe_skip(self):
         base = {
@@ -371,13 +379,17 @@ class RouteSecurityTest(unittest.TestCase):
             "escalate": "false",
             "reason": "manual dispatch",
             "bind_override": "false",
+            "mode": "full",
         }
         # Valid 40-char and 64-char SHAs pass untouched.
         self.assertEqual(route.validate_output(base), base)
         base_256 = {**base, "head_sha": VALID_SHA256}
         self.assertEqual(route.validate_output(base_256), base_256)
-        bind = {**base, "action": "verdict", "reason": "human-override label applied", "bind_override": "true"}
+        bind = {**base, "action": "verdict", "reason": "human-override label applied", "bind_override": "true",
+                "mode": ""}
         self.assertEqual(route.validate_output(bind), bind)
+        wontfix = {**base, "reason": "pushback from a writer", "mode": "wontfix_only"}
+        self.assertEqual(route.validate_output(wontfix), wontfix)
 
         bad_cases = [
             None,
@@ -419,6 +431,16 @@ class RouteSecurityTest(unittest.TestCase):
             {**base, "bind_override": "TRUE"},
             {**base, "bind_override": ""},
             {**base, "bind_override": "true\nSECRET_MARKER"},
+            {k: v for k, v in base.items() if k != "mode"},
+            {**base, "mode": ""},  # a review always names its mode
+            {**base, "mode": "FULL"},
+            {**base, "mode": "fast"},
+            {**base, "mode": "full\nSECRET_MARKER"},
+            {**base, "mode": None},
+            {**bind, "mode": "full"},  # mode only on review
+            {**bind, "mode": "wontfix_only"},
+            {**base, "action": "skip", "pr": "", "head_sha": "", "reason": "event not handled"},
+            {**base, "mode": "full", "extra": "x"},
         ]
         for bad in bad_cases:
             with self.subTest(bad=bad):
@@ -437,7 +459,7 @@ class RouteSecurityTest(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(parsed, route.SAFE_SKIP)
         self.assertEqual(json.loads(stdout_val), route.SAFE_SKIP)
-        self.assertEqual(len(raw_out.splitlines()), 6)
+        self.assertEqual(len(raw_out.splitlines()), len(route.OUTPUT_KEYS))
         self.assertIn("invalid route output", json.loads(stderr_val)["error"])
 
         rc, _, parsed_short, _, stderr_short = self._run_main("pull_request", pr_event())
@@ -478,6 +500,16 @@ class RouteSecurityTest(unittest.TestCase):
             route.decide("issue_comment", comment_event("/ai-review", assoc="COLLABORATOR", login="c"), "o"),
             route.decide("issue_comment", comment_event("/ai-review"), "o"),
             route.decide("issue_comment", comment_event("/ai-review nope"), "o"),
+            route.decide("pull_request", pr_event("unlabeled", label="needs-human"), "o"),
+            route.decide("issue_comment", comment_event("/ai-review help"), "o"),
+            route.decide("issue_comment", comment_event("/ai-review explain R-001"), "o"),
+            route.decide("issue_comment", comment_event("/ai-review explain"), "o"),
+            route.decide("issue_comment", comment_event("/ai-review override " + "a" * 12 + ": ok then"), "o"),
+            route.decide("issue_comment", comment_event("/ai-review override"), "o"),
+            route.decide("issue_comment", comment_event("/ai-review override " + "a" * 12 + ": ok then",
+                                                        assoc="COLLABORATOR", login="c"), "o"),
+            route.decide("pull_request_review_comment",
+                         comment_event("/ai-review override " + "a" * 12 + ": ok then", kind="review"), "o"),
             route.decide("workflow_dispatch", {"inputs": {"pr": "3"}}, "o"),
             route.decide("workflow_dispatch", {"inputs": {"pr": "0"}}, "o"),
             route.decide("push", {}, "o"),
@@ -529,6 +561,118 @@ class BaseRetargetRouteTest(unittest.TestCase):
         self.assertEqual(route.decide("pull_request", ev, "o")["action"], "skip")
         ev["action"] = "synchronize"
         self.assertEqual(route.decide("pull_request", ev, "o")["reason"], "pull_request.synchronize")
+
+
+OVR_CMD = "/ai-review override " + "a" * 12 + ": reviewed the fork by hand"
+
+
+class CommandRouteTest(unittest.TestCase):
+    """#39 / #43: help, explain, override, wontfix placement and the review mode."""
+
+    def d(self, body, kind="issue_comment", **kw):
+        ev = comment_event(body, kind=kind, **kw)
+        return route.decide(kind, ev, "o")
+
+    def check(self, res, action, reason, mode="", escalate="false"):
+        self.assertEqual((res["action"], res["reason"], res["mode"], res["escalate"], res["bind_override"]),
+                         (action, reason, mode, escalate, "false"))
+        self.assertIn(res["reason"], route.REASONS)
+
+    def test_writer_info_commands_route_to_verdict(self):
+        for kind in ("issue_comment", "pull_request_review_comment"):
+            for assoc, login in (("OWNER", "o"), ("MEMBER", "m"), ("COLLABORATOR", "c")):
+                with self.subTest(kind=kind, assoc=assoc):
+                    self.check(self.d("/ai-review help", kind, assoc=assoc, login=login), "verdict", "help requested")
+                    self.check(self.d("/ai-review help me", kind, assoc=assoc, login=login),
+                               "verdict", "help requested")
+                    self.check(self.d("/ai-review explain R-001", kind, assoc=assoc, login=login),
+                               "verdict", "explain requested")
+                    # Malformed ids still reach verdict, which replies with the usage.
+                    for bad in ("/ai-review explain", "/ai-review explain r-001", "/ai-review explain R-1"):
+                        self.check(self.d(bad, kind, assoc=assoc, login=login), "verdict", "explain requested")
+
+    def test_owner_override_on_conversation(self):
+        self.check(self.d(OVR_CMD), "verdict", "override requested by owner")
+        for bad in ("/ai-review override", "/ai-review override: because", "/ai-review override abc: because",
+                    "/ai-review override " + "a" * 12, "/ai-review override " + "a" * 12 + ": x",
+                    "/ai-review override " + "A" * 12 + ": because"):
+            with self.subTest(body=bad):
+                self.check(self.d(bad), "verdict", "override needs a head SHA and a reason")
+
+    def test_override_owner_check(self):
+        for assoc, login in (("COLLABORATOR", "c"), ("MEMBER", "m"), ("COLLABORATOR", "o"), ("MEMBER", "o"),
+                             ("OWNER", "O"), ("OWNER", "not-o")):
+            for kind in ("issue_comment", "pull_request_review_comment"):
+                with self.subTest(assoc=assoc, login=login, kind=kind):
+                    self.check(self.d(OVR_CMD, kind, assoc=assoc, login=login), "skip", "only the owner can override")
+        self.check(route.decide("issue_comment", comment_event(OVR_CMD, login=""), ""),
+                   "skip", "only the owner can override")
+
+    def test_owner_override_in_thread_gets_a_hint(self):
+        self.check(self.d(OVR_CMD, "pull_request_review_comment"),
+                   "verdict", "override must be a top-level PR comment")
+
+    def test_wontfix_placement(self):
+        for body in ("/ai-review wontfix: fp", "/ai-review wontfix"):
+            self.check(self.d(body), "verdict", "wontfix belongs in a finding thread")
+            res = self.d(body, "pull_request_review_comment", assoc="COLLABORATOR", login="c")
+            self.check(res, "review", "pushback from a writer", mode="wontfix_only")
+
+    def test_review_modes(self):
+        self.check(self.d("/ai-review"), "review", "re-review requested by owner", mode="full")
+        self.check(self.d("/ai-review", "pull_request_review_comment"), "review", "re-review requested by owner",
+                   mode="full")
+        for assoc in ("MEMBER", "COLLABORATOR"):  # the owner's login alone is not enough
+            self.check(self.d("/ai-review", assoc=assoc), "skip", "only the owner can force a re-review")
+        self.assertEqual(route.decide("pull_request", pr_event(), "o")["mode"], "full")
+        self.assertEqual(route.decide("pull_request", retarget_event(), "o")["mode"], "full")
+        self.assertEqual(route.decide("workflow_dispatch", {"inputs": {"pr": "3"}}, "o")["mode"], "full")
+        self.check(self.d("/ai-review escalate: loops"), "verdict", "escalated by a writer", escalate="true")
+
+    def test_outsiders_and_bots_stay_skipped(self):
+        for body in ("/ai-review help", "/ai-review explain R-001", OVR_CMD, "/ai-review wontfix: x"):
+            for kind in ("issue_comment", "pull_request_review_comment"):
+                with self.subTest(body=body, kind=kind):
+                    self.check(self.d(body, kind, assoc="NONE", login="o"), "skip", "commenter has no write access")
+                    self.check(self.d(body, kind, assoc="CONTRIBUTOR", login="mallory"),
+                               "skip", "commenter has no write access")
+                    self.check(self.d(body, kind, bot=True), "skip", "not a /ai-review command")
+
+    def test_unknown_subcommands_still_skip(self):
+        for body in ("/ai-review frobnicate", "/ai-review helpme", "/ai-review overrides " + "a" * 12 + ": x y z",
+                     "/ai-reviewhelp", "/ai-review explainR-001"):
+            with self.subTest(body=body):
+                self.check(self.d(body), "skip", "unknown /ai-review command")
+
+    def test_command_text_never_reaches_outputs(self):
+        body = "/ai-review override " + "a" * 12 + ": SECRET\naction=review\nmode=full\npr=99"
+        res = route.validate_output(route.decide("issue_comment", comment_event(body), "o"))
+        self.assertEqual(res["reason"], "override requested by owner")
+        self.assertNotIn("SECRET", json.dumps(res))
+        self.assertEqual((res["pr"], res["mode"]), ("7", ""))
+
+
+class NeedsHumanUnlabeledTest(unittest.TestCase):
+    """#27: removing needs-human recomputes the verdict; applying it never starts a run."""
+
+    def test_unlabeled_needs_human_routes_to_verdict(self):
+        for sender in ({"login": "o", "type": "User"}, {"login": "c", "type": "User"}, None):
+            for kw in ({}, {"draft": True}, {"fork": True}):
+                with self.subTest(sender=sender, **kw):
+                    ev = pr_event("unlabeled", label="needs-human", sender=sender, **kw)
+                    ev["pull_request"]["head"]["sha"] = VALID_SHA
+                    res = route.decide("pull_request", ev, "o")
+                    self.assertEqual((res["action"], res["reason"], res["head_sha"], res["bind_override"], res["mode"]),
+                                     ("verdict", "needs-human label removed", VALID_SHA, "false", ""))
+                    self.assertEqual(route.validate_output(res), res)
+
+    def test_labeled_needs_human_skips(self):
+        res = route.decide("pull_request", pr_event("labeled", label="needs-human"), "o")
+        self.assertEqual((res["action"], res["reason"]), ("skip", "label is not a pr-guardian control"))
+
+    def test_human_override_removal_unchanged(self):
+        res = route.decide("pull_request", pr_event("unlabeled", label="human-override"), "o")
+        self.assertEqual((res["action"], res["reason"]), ("verdict", "human-override label removed"))
 
 
 if __name__ == "__main__":
