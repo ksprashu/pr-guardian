@@ -249,7 +249,9 @@ jobs:
 
   verdict:
     needs: [route, scan, review, publish]
-    if: always() && needs.route.result == 'success' && needs.route.outputs.action != 'skip'
+    # !cancelled(), not always(): a cancelled run (superseded by a newer one) must not stamp
+    # "error" on the PR, whereas failed or timed-out jobs still report it (GHSA-6wg7-gfpx-8639).
+    if: ${{ !cancelled() && needs.route.result == 'success' && needs.route.outputs.action != 'skip' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:

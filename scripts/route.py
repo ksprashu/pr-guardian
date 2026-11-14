@@ -18,30 +18,148 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 from typing import Any
 
 WRITE_ASSOCIATIONS = ("OWNER", "MEMBER", "COLLABORATOR")
 PR_REVIEW_TYPES = ("opened", "synchronize", "reopened", "ready_for_review")
+OUTPUT_KEYS = ("action", "pr", "head_sha", "escalate", "reason")
+VALID_ACTIONS = frozenset({"review", "verdict", "skip"})
+VALID_ESCALATE = frozenset({"true", "false"})
+
+PR_REVIEW_REASONS = {
+    "opened": "pull_request.opened",
+    "synchronize": "pull_request.synchronize",
+    "reopened": "pull_request.reopened",
+    "ready_for_review": "pull_request.ready_for_review",
+}
+
+SAFE_SKIP: dict[str, str] = {
+    "action": "skip",
+    "pr": "",
+    "head_sha": "",
+    "escalate": "false",
+    "reason": "invalid route output",
+}
+
+REASONS = frozenset({
+    *PR_REVIEW_REASONS.values(),
+    "human-override label applied",
+    "label is not a pr-guardian control",
+    "pull_request action does not trigger a review",
+    "draft PR; review starts when marked ready",
+    "external fork PR: secrets are unavailable, owner review required",
+    "not a /ai-review command",
+    "comment is on an issue, not a PR",
+    "commenter has no write access",
+    "escalated by a writer",
+    "pushback from a writer",
+    "only the owner can force a re-review",
+    "re-review requested by owner",
+    "unknown /ai-review command",
+    "manual dispatch",
+    "invalid workflow_dispatch pr",
+    "invalid PR metadata",
+    "event not handled",
+    SAFE_SKIP["reason"],
+})
+
+_PR_RE = re.compile(r"\A[1-9][0-9]{0,9}\Z", re.ASCII)
+# decide() accepts any lower-hex SHA up to 64 chars so existing unit fixtures
+# with short SHAs keep passing, while validate_output() enforces 40 or 64 chars.
+_DECIDE_SHA_RE = re.compile(r"\A[0-9a-f]{0,64}\Z", re.ASCII)
+_OUTPUT_SHA_RE = re.compile(r"\A(?:[0-9a-f]{40}|[0-9a-f]{64})?\Z", re.ASCII)
+
+
+def _is_valid_pr(value: Any, *, allow_empty: bool = False) -> bool:
+    if not isinstance(value, str):
+        return False
+    if value == "":
+        return allow_empty
+    return value.isascii() and value.isdigit() and bool(_PR_RE.fullmatch(value))
+
+
+def _coerce_pr(raw: Any) -> str:
+    if isinstance(raw, bool) or not isinstance(raw, (int, str)):
+        return ""
+    text = str(raw)
+    return text if _is_valid_pr(text) else ""
+
+
+def _extract_pr_fields(pr_obj: Any) -> tuple[str, str] | None:
+    if not isinstance(pr_obj, dict):
+        return None
+    pr_num = _coerce_pr(pr_obj.get("number"))
+    head = pr_obj.get("head")
+    head_sha = head.get("sha", "") if isinstance(head, dict) else ""
+    if not pr_num or not isinstance(head_sha, str) or not _DECIDE_SHA_RE.fullmatch(head_sha):
+        return None
+    return pr_num, head_sha
+
+
+def _check_output(out: Any) -> str | None:
+    if not isinstance(out, dict):
+        return "output must be a dict"
+    if tuple(out.keys()) != OUTPUT_KEYS:
+        return "unexpected output keys or order"
+    for key in OUTPUT_KEYS:
+        val = out[key]
+        if not isinstance(val, str):
+            return f"non-string field: {key}"
+        if "\r" in val or "\n" in val:
+            return f"newline in field: {key}"
+    if out["action"] not in VALID_ACTIONS:
+        return "invalid action"
+    if out["escalate"] not in VALID_ESCALATE:
+        return "invalid escalate"
+    if not _is_valid_pr(out["pr"], allow_empty=(out["action"] == "skip")):
+        return "invalid pr"
+    if not _OUTPUT_SHA_RE.fullmatch(out["head_sha"]):
+        return "invalid head_sha"
+    reason = out["reason"]
+    if not reason or not all(0x20 <= ord(ch) <= 0x7E for ch in reason) or reason not in REASONS:
+        return "invalid reason"
+    return None
+
+
+def validate_output(out: Any) -> dict[str, str]:
+    """Enforce the GITHUB_OUTPUT schema; fail closed to SAFE_SKIP on violation."""
+    err = _check_output(out)
+    if err is not None:
+        print(json.dumps({"error": "invalid route output", "detail": err}), file=sys.stderr)
+        return dict(SAFE_SKIP)
+    return {k: out[k] for k in OUTPUT_KEYS}
 
 
 def decide(event_name: str, event: dict[str, Any], owner: str) -> dict[str, Any]:
     out = {"action": "skip", "pr": "", "head_sha": "", "escalate": "false", "reason": ""}
 
     if event_name in ("pull_request", "pull_request_target"):
-        pr = event["pull_request"]
-        out["pr"], out["head_sha"] = str(pr["number"]), pr["head"]["sha"]
-        fork = pr["head"]["repo"] is None or pr["head"]["repo"]["full_name"] != pr["base"]["repo"]["full_name"]
+        pr = event.get("pull_request")
+        fields = _extract_pr_fields(pr)
+        if fields is None:
+            out["reason"] = "invalid PR metadata"
+            return out
+        head_repo = pr["head"].get("repo") if isinstance(pr.get("head"), dict) else None
+        base = pr.get("base")
+        base_repo = base.get("repo") if isinstance(base, dict) else None
+        if not isinstance(base_repo, dict) or not isinstance(base_repo.get("full_name"), str):
+            out["reason"] = "invalid PR metadata"
+            return out
+        out["pr"], out["head_sha"] = fields
+        fork = head_repo is None or not isinstance(head_repo, dict) or head_repo.get("full_name") != base_repo["full_name"]
         action = event.get("action")
         if action == "labeled":
-            name = event.get("label", {}).get("name")
+            label = event.get("label")
+            name = label.get("name") if isinstance(label, dict) else None
             if name == "human-override":
                 out.update(action="verdict", reason="human-override label applied")
             else:
-                out["reason"] = f"label {name} is not a pr-guardian control"
+                out["reason"] = "label is not a pr-guardian control"
             return out
         if action not in PR_REVIEW_TYPES:
-            out["reason"] = f"pull_request.{action} does not trigger a review"
+            out["reason"] = "pull_request action does not trigger a review"
             return out
         if pr.get("draft"):
             out["reason"] = "draft PR; review starts when marked ready"
@@ -49,52 +167,68 @@ def decide(event_name: str, event: dict[str, Any], owner: str) -> dict[str, Any]
         if fork:
             out.update(action="verdict", reason="external fork PR: secrets are unavailable, owner review required")
             return out
-        out.update(action="review", reason=f"pull_request.{action}")
+        out.update(action="review", reason=PR_REVIEW_REASONS[action])
         return out
 
     if event_name in ("issue_comment", "pull_request_review_comment"):
-        comment = event["comment"]
-        body = (comment.get("body") or "").strip()
-        if comment.get("user", {}).get("type") == "Bot" or not body.startswith("/ai-review"):
+        comment = event.get("comment")
+        if not isinstance(comment, dict):
+            out["reason"] = "not a /ai-review command"
+            return out
+        raw_body = comment.get("body")
+        body = raw_body.strip() if isinstance(raw_body, str) else ""
+        user = comment.get("user")
+        user_dict = user if isinstance(user, dict) else {}
+        if user_dict.get("type") == "Bot" or not body.startswith("/ai-review"):
             out["reason"] = "not a /ai-review command"
             return out
         if event_name == "issue_comment":
-            if "pull_request" not in event.get("issue", {}):
+            issue = event.get("issue")
+            if not isinstance(issue, dict) or "pull_request" not in issue:
                 out["reason"] = "comment is on an issue, not a PR"
                 return out
-            out["pr"] = str(event["issue"]["number"])
+            pr_num = _coerce_pr(issue.get("number"))
+            if not pr_num:
+                out["reason"] = "invalid PR metadata"
+                return out
+            out["pr"] = pr_num
         else:
-            out["pr"] = str(event["pull_request"]["number"])
-            out["head_sha"] = event["pull_request"]["head"]["sha"]
+            fields = _extract_pr_fields(event.get("pull_request"))
+            if fields is None:
+                out["reason"] = "invalid PR metadata"
+                return out
+            out["pr"], out["head_sha"] = fields
+        # Authorise before parsing any subcommand or reading user-controlled text.
         assoc = comment.get("author_association", "")
-        login = comment.get("user", {}).get("login", "")
+        if not isinstance(assoc, str) or assoc not in WRITE_ASSOCIATIONS:
+            out["reason"] = "commenter has no write access"
+            return out
+        login = user_dict.get("login", "")
         rest = body[len("/ai-review"):].strip()
         if rest.startswith("escalate"):
-            if assoc not in WRITE_ASSOCIATIONS:
-                out["reason"] = f"{login} cannot escalate"
-                return out
-            out.update(action="verdict", escalate="true", reason=f"escalated by {login}")
+            out.update(action="verdict", escalate="true", reason="escalated by a writer")
         elif rest.startswith("wontfix"):
-            if assoc not in WRITE_ASSOCIATIONS:
-                out["reason"] = f"{login} cannot push back on findings"
-                return out
-            out.update(action="review", reason=f"pushback from {login}")
+            out.update(action="review", reason="pushback from a writer")
         elif rest == "":
-            if login != owner:
+            if not isinstance(login, str) or not owner or login != owner:
                 out["reason"] = "only the owner can force a re-review"
                 return out
             out.update(action="review", reason="re-review requested by owner")
         else:
-            out["reason"] = f"unknown command: /ai-review {rest[:40]}"
+            out["reason"] = "unknown /ai-review command"
         return out
 
     if event_name == "workflow_dispatch":
-        pr = str(event.get("inputs", {}).get("pr", ""))
-        if pr:
-            out.update(action="review", pr=pr, reason="manual dispatch")
+        inputs = event.get("inputs")
+        raw_pr = inputs.get("pr", "") if isinstance(inputs, dict) else ""
+        pr = _coerce_pr(raw_pr)
+        if not pr:
+            out["reason"] = "invalid workflow_dispatch pr"
+            return out
+        out.update(action="review", pr=pr, reason="manual dispatch")
         return out
 
-    out["reason"] = f"event {event_name} not handled"
+    out["reason"] = "event not handled"
     return out
 
 
@@ -108,7 +242,10 @@ def main() -> int:
     except (OSError, json.JSONDecodeError) as exc:
         print(f"route: cannot read event: {exc}", file=sys.stderr)
         return 2
-    result = decide(event_name, event, owner)
+    if not isinstance(event, dict):
+        print(json.dumps({"error": "event payload must be a JSON object"}), file=sys.stderr)
+        return 2
+    result = validate_output(decide(event_name, event, owner))
     lines = "".join(f"{k}={v}\n" for k, v in result.items())
     target = os.environ.get("GITHUB_OUTPUT")
     if target:

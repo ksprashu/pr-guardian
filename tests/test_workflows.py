@@ -8,11 +8,17 @@ and that code can overwrite scanner outputs in $RUNNER_TEMP before upload.
 The checker is deliberately strict: every mention of review_collector in a workflow
 (comments included) must be a direct, recognised invocation whose arguments use only
 known options, so unusual forms fail loudly instead of slipping past.
+
+GHSA-6wg7-gfpx-8639: the caller template must start a run (and so join a concurrency
+group that can cancel another run) only for events route.py acts on, and review.yml's
+verdict job must not post an error for a run that was cancelled.
 """
 import re
 import shlex
 import unittest
 from pathlib import Path
+
+import tests.helpers  # noqa: F401  (puts scripts/ on sys.path for route and governor)
 
 ROOT = Path(__file__).resolve().parent.parent
 WORKFLOW_FILES = sorted((ROOT / ".github" / "workflows").glob("*.yml")) + \
@@ -246,6 +252,480 @@ class WorkflowCollectorNoExec(unittest.TestCase):
                 self.assertEqual(check(path.read_text()), [],
                                  "review_collector.py must run with --no-exec on PR checkouts "
                                  "(GHSA-7p2f-fx79-f4vw)")
+
+
+# --- GHSA-6wg7-gfpx-8639: who can start (and so cancel) a pr-guardian run --------------
+#
+# The caller's job `if` decides which events join a concurrency group. If an outsider's
+# comment passes it, that run cancels the review in flight before route.py skips it. The
+# tests below evaluate the real expressions with a small stdlib model of the GitHub
+# Actions expression language instead of matching their text.
+
+_EXPR_TOKEN = re.compile(r"""\s*(?:
+    (?P<str>'(?:[^']|'')*')
+  | (?P<num>\d+(?:\.\d+)?)
+  | (?P<op>==|!=|&&|\|\||[!().,\[\]])
+  | (?P<id>[A-Za-z_][\w-]*)
+)""", re.X)
+_STATUS_FUNCS = re.compile(r"\b(?:success|failure|cancelled|always)\s*\(")
+
+
+def _expr_tokens(src):
+    toks, pos, src = [], 0, src.rstrip()
+    while pos < len(src):
+        m = _EXPR_TOKEN.match(src, pos)
+        if not m or m.end() == pos:
+            raise ValueError(f"cannot tokenise expression at {src[pos:pos + 20]!r}")
+        kind = m.lastgroup
+        toks.append((kind, m.group(kind)))
+        pos = m.end()
+    return toks
+
+
+def _to_num(v):
+    if v is None:
+        return 0.0
+    if isinstance(v, bool):
+        return 1.0 if v else 0.0
+    if isinstance(v, (int, float)):
+        return float(v)
+    if isinstance(v, str):
+        try:
+            return float(v.strip()) if v.strip() else 0.0
+        except ValueError:
+            return float("nan")
+    return float("nan")
+
+
+def _to_str(v):
+    if v is None:
+        return ""
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, float) and v.is_integer():
+        return str(int(v))
+    return str(v)
+
+
+def _truthy(v):
+    if isinstance(v, float) and v != v:
+        return False
+    return v not in (None, False, 0, "")
+
+
+def _eq(a, b):
+    if isinstance(a, str) and isinstance(b, str):
+        return a.casefold() == b.casefold()  # GitHub compares strings case-insensitively
+    if type(a) is type(b) and not isinstance(a, (dict, list)):
+        return a == b
+    if isinstance(a, (dict, list)) or isinstance(b, (dict, list)):
+        return a is b
+    return _to_num(a) == _to_num(b)
+
+
+class _Expr:
+    """Recursive-descent evaluator for the subset of expressions the workflows use."""
+
+    def __init__(self, src):
+        self.toks, self.i = _expr_tokens(src), 0
+        self.tree = self._or()
+        if self.i != len(self.toks):
+            raise ValueError(f"trailing tokens: {self.toks[self.i:]}")
+
+    def _peek(self):
+        return self.toks[self.i] if self.i < len(self.toks) else (None, None)
+
+    def _take(self, value=None):
+        kind, tok = self._peek()
+        if kind is None or (value is not None and tok != value):
+            raise ValueError(f"expected {value!r}, got {tok!r}")
+        self.i += 1
+        return kind, tok
+
+    def _or(self):
+        node = self._and()
+        while self._peek()[1] == "||":
+            self._take()
+            node = ("or", node, self._and())
+        return node
+
+    def _and(self):
+        node = self._cmp()
+        while self._peek()[1] == "&&":
+            self._take()
+            node = ("and", node, self._cmp())
+        return node
+
+    def _cmp(self):
+        node = self._unary()
+        while self._peek()[1] in ("==", "!="):
+            op = self._take()[1]
+            node = (op, node, self._unary())
+        return node
+
+    def _unary(self):
+        if self._peek()[1] == "!":
+            self._take()
+            return ("not", self._unary())
+        return self._postfix()
+
+    def _postfix(self):
+        node = self._primary()
+        while self._peek()[1] in (".", "["):
+            if self._take()[1] == ".":
+                kind, name = self._take()
+                if kind != "id":
+                    raise ValueError(f"bad property {name!r}")
+                node = ("get", node, ("lit", name))
+            else:
+                node = ("get", node, self._or())
+                self._take("]")
+        return node
+
+    def _primary(self):
+        kind, tok = self._take()
+        if kind == "str":
+            return ("lit", tok[1:-1].replace("''", "'"))
+        if kind == "num":
+            return ("lit", float(tok))
+        if tok == "(":
+            node = self._or()
+            self._take(")")
+            return node
+        if kind != "id":
+            raise ValueError(f"unexpected token {tok!r}")
+        if tok in ("true", "false", "null"):
+            return ("lit", {"true": True, "false": False, "null": None}[tok])
+        if self._peek()[1] == "(":
+            self._take()
+            args = []
+            while self._peek()[1] != ")":
+                args.append(self._or())
+                if self._peek()[1] == ",":
+                    self._take()
+            self._take(")")
+            return ("call", tok, args)
+        return ("ctx", tok)
+
+    def eval(self, ctx, node=None):
+        node = self.tree if node is None else node
+        op = node[0]
+        if op == "lit":
+            return node[1]
+        if op == "ctx":
+            return ctx.get(node[1])
+        if op == "get":
+            obj, key = self.eval(ctx, node[1]), self.eval(ctx, node[2])
+            if isinstance(obj, dict):
+                for k, v in obj.items():
+                    if isinstance(key, str) and k.casefold() == key.casefold():
+                        return v
+            return None
+        if op == "not":
+            return not _truthy(self.eval(ctx, node[1]))
+        if op == "and":
+            left = self.eval(ctx, node[1])
+            return self.eval(ctx, node[2]) if _truthy(left) else left
+        if op == "or":
+            left = self.eval(ctx, node[1])
+            return left if _truthy(left) else self.eval(ctx, node[2])
+        if op in ("==", "!="):
+            same = _eq(self.eval(ctx, node[1]), self.eval(ctx, node[2]))
+            return same if op == "==" else not same
+        if op == "call":
+            name, args = node[1].casefold(), [self.eval(ctx, a) for a in node[2]]
+            status = ctx.get("__status__", {"success": True, "failure": False, "cancelled": False})
+            if name in ("success", "failure", "cancelled"):
+                return status[name]
+            if name == "always":
+                return True
+            if name == "startswith":
+                return _to_str(args[0]).casefold().startswith(_to_str(args[1]).casefold())
+            if name == "contains":
+                if isinstance(args[0], list):
+                    return any(_eq(x, args[1]) for x in args[0])
+                return _to_str(args[1]).casefold() in _to_str(args[0]).casefold()
+            raise ValueError(f"unsupported function {node[1]}")
+        raise ValueError(f"bad node {node!r}")
+
+
+def _unwrap(raw):
+    """Inner expression of a value that is exactly one ${{ ... }}, else None."""
+    raw = raw.strip()
+    if raw.startswith("${{") and raw.endswith("}}") and raw.count("${{") == 1:
+        return raw[3:-2]
+    return None
+
+
+def eval_if(raw, ctx):
+    """A job `if`: optional ${{ }} wrapper, implicit success() when no status function."""
+    inner = _unwrap(raw)
+    expr = inner if inner is not None else raw
+    if "${{" in expr:
+        raise ValueError(f"`if` mixes ${{{{ }}}} with bare text: {raw!r}")
+    if not _STATUS_FUNCS.search(expr):
+        expr = f"success() && ({expr})"
+    return _truthy(_Expr(expr).eval(ctx))
+
+
+def eval_value(raw, ctx):
+    """A non-`if` value: one whole ${{ }} keeps its type; otherwise interpolate as text."""
+    inner = _unwrap(raw)
+    if inner is not None:
+        return _Expr(inner).eval(ctx)
+    return re.sub(r"\$\{\{(.*?)\}\}", lambda m: _to_str(_Expr(m.group(1)).eval(ctx)), raw, flags=re.S)
+
+
+def yaml_get(text, *path):
+    """Scalar at a mapping path, for the block-style YAML these workflows use. Supports
+    plain scalars and > / >- / | / |- block scalars; comments outside scalars are skipped."""
+    lines = text.replace("\r\n", "\n").split("\n")
+
+    def indent(line):
+        return len(line) - len(line.lstrip(" "))
+
+    def skip(line):
+        s = line.strip()
+        return not s or s.startswith("#")
+
+    lo, hi = 0, len(lines)
+    for depth, key in enumerate(path):
+        child, hit = None, None
+        for i in range(lo, hi):
+            if skip(lines[i]):
+                continue
+            child = indent(lines[i]) if child is None else child
+            body = lines[i][indent(lines[i]):]
+            if indent(lines[i]) == child and re.match(rf"{re.escape(key)}:(\s|$)", body):
+                hit = i
+                break
+        if hit is None:
+            raise KeyError(".".join(path))
+        ind, end = indent(lines[hit]), hit + 1
+        while end < hi and (skip(lines[end]) or indent(lines[end]) > ind):
+            end += 1
+        rest = lines[hit][ind + len(key) + 1:].strip()
+        if depth < len(path) - 1:
+            lo, hi = hit + 1, end
+            continue
+        if rest in (">", ">-", "|", "|-"):
+            content = [ln.strip() for ln in lines[hit + 1:end] if ln.strip() and indent(ln) > ind]
+            return (" " if rest.startswith(">") else "\n").join(content)
+        return rest
+    raise KeyError(".".join(path))
+
+
+TEMPLATE = ROOT / "templates" / "pr-guardian.yml"
+REVIEW = ROOT / ".github" / "workflows" / "review.yml"
+WRITERS = ("OWNER", "MEMBER", "COLLABORATOR")
+OUTSIDERS = ("NONE", "CONTRIBUTOR", "FIRST_TIME_CONTRIBUTOR", "FIRST_TIMER", "MANNEQUIN")
+OWNER_LOGIN = "owner"
+SHA = "b" * 40
+
+
+def _ctx(event_name, event, inputs=None):
+    return {"github": {"event_name": event_name, "event": event}, "inputs": inputs or {}}
+
+
+def _pr_obj(number=7):
+    repo = {"full_name": "owner/repo"}
+    return {"number": number, "draft": False, "head": {"sha": SHA, "repo": repo}, "base": {"repo": repo}}
+
+
+def pr_event(action, label=None):
+    event = {"action": action, "number": 7, "pull_request": _pr_obj()}
+    if label is not None:
+        event["label"] = {"name": label}
+    return _ctx("pull_request", event)
+
+
+def comment_event(body, assoc="OWNER", user_type="User", kind="issue_comment", on_pr=True,
+                  login=OWNER_LOGIN):
+    comment = {"body": body, "author_association": assoc, "user": {"login": login, "type": user_type}}
+    if kind == "issue_comment":
+        issue = {"number": 7}
+        if on_pr is True:
+            issue["pull_request"] = {"url": "https://api.github.com/repos/owner/repo/pulls/7"}
+        elif on_pr is None:
+            issue["pull_request"] = None
+        return _ctx(kind, {"action": "created", "issue": issue, "comment": comment})
+    return _ctx(kind, {"action": "created", "pull_request": _pr_obj(), "comment": comment})
+
+
+def dispatch_event(pr="7"):
+    return _ctx("workflow_dispatch", {"inputs": {"pr": pr}}, inputs={"pr": pr})
+
+
+COMMANDS = ("/ai-review", "/ai-review escalate", "/ai-review wontfix: false positive", "/ai-review bogus")
+
+
+class ExpressionModel(unittest.TestCase):
+    """The evaluator itself, on GitHub's documented semantics."""
+
+    def ev(self, src, ctx=None):
+        return _Expr(src).eval(ctx or {})
+
+    def test_operators_return_operands(self):
+        self.assertEqual(self.ev("null || 'x'"), "x")
+        self.assertEqual(self.ev("'a' && 'b'"), "b")
+        self.assertIsNone(self.ev("null && 'b'"))
+        self.assertEqual(self.ev("7 || 'x'"), 7.0)
+
+    def test_case_insensitive_strings_and_null_comparisons(self):
+        self.assertTrue(self.ev("'Bot' == 'bot'"))
+        self.assertTrue(self.ev("startsWith('/AI-Review x', '/ai-review')"))
+        self.assertFalse(self.ev("startsWith(null, '/ai-review')"))
+        self.assertTrue(self.ev("a.b.c == null", {"a": {}}))
+        self.assertFalse(self.ev("a.b != null", {"a": {"b": None}}))
+        self.assertTrue(self.ev("a.b != null", {"a": {"b": {}}}))
+
+    def test_implicit_success_unless_status_function(self):
+        failed = {"__status__": {"success": False, "failure": True, "cancelled": False}}
+        self.assertFalse(eval_if("true", failed))
+        self.assertTrue(eval_if("${{ !cancelled() }}", failed))
+        self.assertTrue(eval_if("always() && true", failed))
+
+    def test_yaml_get_reads_folded_and_plain_scalars(self):
+        text = "a:\n  # c\n  b: >-\n    x\n    y\n  c: ${{ z }}\nd: 1\n"
+        self.assertEqual(yaml_get(text, "a", "b"), "x y")
+        self.assertEqual(yaml_get(text, "a", "c"), "${{ z }}")
+        with self.assertRaises(KeyError):
+            yaml_get(text, "a", "d")
+
+
+class CallerGate(unittest.TestCase):
+    """templates/pr-guardian.yml: jobs.guardian.if and concurrency (GHSA-6wg7-gfpx-8639)."""
+
+    @classmethod
+    def setUpClass(cls):
+        import governor  # noqa: E402  (tests.helpers puts scripts/ on sys.path)
+        cls.texts = {"template": TEMPLATE.read_text(),
+                     "rendered": governor.render_caller("0123456789abcdef0123456789abcdef01234567")}
+
+    def each(self):
+        for name, text in self.texts.items():
+            with self.subTest(source=name):
+                yield (yaml_get(text, "jobs", "guardian", "if"),
+                       yaml_get(text, "jobs", "guardian", "concurrency", "group"),
+                       yaml_get(text, "jobs", "guardian", "concurrency", "cancel-in-progress"))
+
+    def fires(self, ctx):
+        return [eval_if(cond, ctx) for cond, _, _ in self.each()]
+
+    def assertFires(self, ctx, expected, msg=""):
+        for cond, _, _ in self.each():
+            self.assertIs(eval_if(cond, ctx), expected, msg or ctx)
+
+    def assertGroup(self, ctx, suffix, cancel):
+        for cond, group, cip in self.each():
+            self.assertTrue(eval_if(cond, ctx), ctx)
+            self.assertEqual(eval_value(group, ctx), f"pr-guardian-7-{suffix}", ctx)
+            self.assertIs(eval_value(cip, ctx), cancel, ctx)
+
+    def test_outsider_commands_never_start_a_run(self):
+        for kind in ("issue_comment", "pull_request_review_comment"):
+            for assoc in OUTSIDERS + ("", "owner-ish"):
+                for body in COMMANDS:
+                    self.assertFires(comment_event(body, assoc=assoc, kind=kind, login="mallory"), False)
+
+    def test_bot_commands_never_start_a_run(self):
+        for kind in ("issue_comment", "pull_request_review_comment"):
+            for assoc in WRITERS:
+                for body in COMMANDS:
+                    self.assertFires(comment_event(body, assoc=assoc, user_type="Bot", kind=kind), False)
+
+    def test_plain_issue_and_ordinary_comments_never_start_a_run(self):
+        for on_pr in (False, None):
+            for body in COMMANDS:
+                self.assertFires(comment_event(body, on_pr=on_pr), False)
+        for kind in ("issue_comment", "pull_request_review_comment"):
+            for body in ("LGTM", "please /ai-review", "", "ai-review escalate"):
+                self.assertFires(comment_event(body, kind=kind), False)
+
+    def test_other_pull_request_actions_and_labels_never_start_a_run(self):
+        for action in ("closed", "edited", "assigned", "unlabeled", "converted_to_draft",
+                       "review_requested", "auto_merge_enabled"):
+            self.assertFires(pr_event(action), False)
+        for label in ("bug", "needs-human", "enhancement", "Human-Override-x", ""):
+            self.assertFires(pr_event("labeled", label=label), False)
+        self.assertFires(pr_event("unlabeled", label="human-override"), False)
+        self.assertFires(_ctx("push", {"ref": "refs/heads/main"}), False)
+
+    def test_writer_commands_start_a_run(self):
+        for kind in ("issue_comment", "pull_request_review_comment"):
+            for assoc in WRITERS:
+                self.assertGroup(comment_event("/ai-review escalate", assoc=assoc, kind=kind), "verdict", False)
+                self.assertGroup(comment_event("/ai-review", assoc=assoc, kind=kind), "review", True)
+                self.assertGroup(comment_event("/ai-review wontfix: fp", assoc=assoc, kind=kind),
+                                 "review", True)
+
+    def test_review_actions_override_label_and_dispatch(self):
+        for action in ("opened", "synchronize", "reopened", "ready_for_review"):
+            self.assertGroup(pr_event(action), "review", True)
+        self.assertGroup(pr_event("labeled", label="human-override"), "verdict", False)
+        self.assertGroup(dispatch_event("7"), "review", True)
+
+    def test_caller_never_drops_an_event_route_acts_on(self):
+        """Every event route.decide() would act on still reaches it through the caller."""
+        import route  # noqa: E402
+        events = [pr_event(a) for a in ("opened", "synchronize", "reopened", "ready_for_review",
+                                        "closed", "edited", "labeled", "unlabeled")]
+        events += [pr_event("labeled", label=n) for n in ("human-override", "bug", "needs-human")]
+        events.append(dispatch_event("7"))
+        for kind in ("issue_comment", "pull_request_review_comment"):
+            for assoc in WRITERS + OUTSIDERS:
+                for user_type in ("User", "Bot"):
+                    for body in COMMANDS + ("LGTM",):
+                        for login in (OWNER_LOGIN, "someone"):
+                            events.append(comment_event(body, assoc, user_type, kind, login=login))
+        events += [comment_event(b, on_pr=False) for b in COMMANDS]
+        acted = 0
+        for ctx in events:
+            gh = ctx["github"]
+            decision = route.decide(gh["event_name"], gh["event"], OWNER_LOGIN)
+            fired = self.fires(ctx)
+            if decision["action"] != "skip":
+                acted += 1
+                self.assertEqual(fired, [True] * len(fired), (decision, ctx))
+            if gh["event_name"].endswith("comment") and gh["event"]["comment"]["author_association"] in OUTSIDERS:
+                self.assertEqual(decision["action"], "skip")
+                self.assertEqual(fired, [False] * len(fired), ctx)
+        self.assertGreater(acted, 20)
+
+
+class VerdictGate(unittest.TestCase):
+    """review.yml: a cancelled run must not post an error verdict; failures still must."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.raw = yaml_get(REVIEW.read_text(), "jobs", "verdict", "if")
+
+    def run_if(self, cancelled=False, upstream_ok=True, route_result="success", action="review"):
+        status = {"cancelled": cancelled, "success": upstream_ok and not cancelled,
+                  "failure": not upstream_ok and not cancelled}
+        ctx = {"needs": {"route": {"result": route_result, "outputs": {"action": action}}},
+               "__status__": status}
+        return eval_if(self.raw, ctx)
+
+    def test_shape(self):
+        self.assertIsNotNone(_unwrap(self.raw), "wrap the whole verdict `if` in one ${{ }}")
+        self.assertNotIn("always()", self.raw)
+        self.assertIn("cancelled()", self.raw)
+
+    def test_cancelled_run_skips_verdict(self):
+        for action in ("review", "verdict"):
+            for upstream_ok in (True, False):
+                self.assertFalse(self.run_if(cancelled=True, upstream_ok=upstream_ok, action=action))
+
+    def test_failed_or_timed_out_upstream_still_posts_verdict(self):
+        for action in ("review", "verdict"):
+            self.assertTrue(self.run_if(upstream_ok=True, action=action))
+            self.assertTrue(self.run_if(upstream_ok=False, action=action))
+
+    def test_route_failure_or_skip_never_posts(self):
+        for route_result in ("failure", "cancelled", "skipped"):
+            self.assertFalse(self.run_if(upstream_ok=False, route_result=route_result))
+        self.assertFalse(self.run_if(action="skip"))
 
 
 if __name__ == "__main__":
