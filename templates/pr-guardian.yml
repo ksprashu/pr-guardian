@@ -40,7 +40,8 @@ jobs:
       || ((github.event_name == 'pull_request_review_comment'
       || (github.event_name == 'issue_comment' && github.event.issue.pull_request != null))
       && github.event.comment.user.type != 'Bot'
-      && startsWith(github.event.comment.body, '/ai-review')
+      && (github.event.comment.body == '/ai-review'
+      || startsWith(github.event.comment.body, '/ai-review '))
       && (github.event.comment.author_association == 'OWNER'
       || github.event.comment.author_association == 'MEMBER'
       || github.event.comment.author_association == 'COLLABORATOR'))
@@ -48,6 +49,8 @@ jobs:
     # wontfix inside a finding thread) cancel superseded reviews. Verdict-only runs (labels, escalate,
     # help, explain, override, a top-level wontfix, unknown commands) queue instead, so an
     # informational command never cancels a review that route.py would not restart.
+    # GitHub Actions == and startsWith are case-insensitive and do not trim; commands.py shares
+    # this exact grammar (no leading/trailing space on bare /ai-review, one ASCII space before args).
     concurrency:
       group: >-
         pr-guardian-${{ github.event.pull_request.number || github.event.issue.number || inputs.pr }}-${{

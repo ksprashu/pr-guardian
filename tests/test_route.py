@@ -640,9 +640,31 @@ class CommandRouteTest(unittest.TestCase):
 
     def test_unknown_subcommands_still_skip(self):
         for body in ("/ai-review frobnicate", "/ai-review helpme", "/ai-review overrides " + "a" * 12 + ": x y z",
-                     "/ai-reviewhelp", "/ai-review explainR-001"):
+                     "/ai-reviewhelp", "/ai-review explainR-001", "/ai-review ", "/ai-review  ",
+                     "/ai-review\r\n", "/ai-review  wontfix: fp", "/ai-review\twontfix: fp",
+                     "/ai-review\nwontfix: fp", "/ai-review  help"):
             with self.subTest(body=body):
                 self.check(self.d(body), "skip", "unknown /ai-review command")
+                self.check(self.d(body, "pull_request_review_comment"), "skip", "unknown /ai-review command")
+
+    def test_case_and_leading_whitespace_match_caller_gate(self):
+        """R-001: route agrees with GitHub Actions case-insensitive == and startsWith without trim."""
+        for body in ("/AI-REVIEW", "/Ai-Review"):
+            self.check(self.d(body), "review", "re-review requested by owner", mode="full")
+            self.check(self.d(body, "pull_request_review_comment"), "review",
+                       "re-review requested by owner", mode="full")
+        for body in ("/AI-REVIEW wontfix: fp", "/ai-review WONTFIX: fp", "/AI-REVIEW WONTFIX: fp"):
+            self.check(self.d(body), "verdict", "wontfix belongs in a finding thread")
+            self.check(self.d(body, "pull_request_review_comment", assoc="COLLABORATOR", login="c"),
+                       "review", "pushback from a writer", mode="wontfix_only")
+        self.check(self.d("/AI-REVIEW HELP"), "verdict", "help requested")
+        self.check(self.d("/AI-REVIEW EXPLAIN R-001"), "verdict", "explain requested")
+        self.check(self.d("/AI-REVIEW ESCALATE: stuck"), "verdict", "escalated by a writer", escalate="true")
+        self.check(self.d("/AI-REVIEW OVERRIDE " + "a" * 12 + ": reviewed by hand"),
+                   "verdict", "override requested by owner")
+        for body in ("  /ai-review", "\n/ai-review", "  /ai-review help", " /ai-review wontfix: fp"):
+            for kind in ("issue_comment", "pull_request_review_comment"):
+                self.check(self.d(body, kind), "skip", "not a /ai-review command")
 
     def test_command_text_never_reaches_outputs(self):
         body = "/ai-review override " + "a" * 12 + ": SECRET\naction=review\nmode=full\npr=99"

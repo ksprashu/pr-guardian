@@ -29,9 +29,9 @@ PREFIX = "/ai-review"
 WRITE_ASSOCIATIONS = ("OWNER", "MEMBER", "COLLABORATOR")
 ID_RE = re.compile(r"\A[A-Z][A-Z0-9]*-[0-9]{3,}\Z")
 # override <head sha prefix, 12-64 lower hex>: <reason, at least 3 characters>
-OVERRIDE_RE = re.compile(r"\Aoverride\s+([0-9a-f]{12,64})\s*:\s*(\S.{2,})\Z", re.S)
-EXPLAIN_RE = re.compile(r"\Aexplain\s+([A-Z][A-Z0-9]*-[0-9]{3,})\s*\Z")
-_WORD_RE = re.compile(r"\A(help|explain|override)\b")
+OVERRIDE_RE = re.compile(r"\A(?i:override)\s+([0-9a-f]{12,64})\s*:\s*(\S.{2,})\Z", re.S)
+EXPLAIN_RE = re.compile(r"\A(?i:explain)\s+([A-Z][A-Z0-9]*-[0-9]{3,})\s*\Z")
+_WORD_RE = re.compile(r"\A(help|explain|override)\b", re.ASCII | re.IGNORECASE)
 REPLY_MARKER = "<!-- pr-guardian:reply to={kind}-{id} -->"
 REPLY_RE = re.compile(r"<!-- pr-guardian:reply to=(issue|review)-([1-9][0-9]{0,19}) -->\s*\Z", re.ASCII)
 KINDS = {"issue_comment": "issue", "pull_request_review_comment": "review"}
@@ -45,41 +45,56 @@ class Command:
     ok: bool = True    # False when the subcommand is recognised but malformed
 
 
+def has_prefix(body: Any) -> bool:
+    """True when body starts at index 0 with `/ai-review` (ASCII case-insensitive)."""
+    return (isinstance(body, str)
+            and body[:len(PREFIX)].isascii()
+            and body[:len(PREFIX)].lower() == PREFIX)
+
+
 def _reason(rest: str) -> str:
     return rest.lstrip().removeprefix(":").strip()
 
 
 def parse(body: Any) -> Command | None:
-    """The command in a comment body, or None when it is not a /ai-review command."""
-    if not isinstance(body, str):
+    """The command in a comment body, or None when it is not a /ai-review command.
+
+    Aligned with templates/pr-guardian.yml's GitHub Actions expressions: case-insensitive
+    prefix and command names, no leading whitespace, exact bare `/ai-review`, and a
+    single ASCII space before any subcommand.
+    """
+    if not has_prefix(body):
         return None
-    text = body.strip()
-    if not text.startswith(PREFIX):
-        return None
-    after = text[len(PREFIX):]
-    if after and not after[0].isspace():
-        return Command("unknown")  # "/ai-reviewer ...", "/ai-reviewhelp"
-    rest = after.strip()
-    if rest == "":
+    after = body[len(PREFIX):]
+    if after == "":
         return Command("review")
+    if not after.startswith(" "):
+        return Command("unknown")  # "/ai-reviewer ...", "/ai-reviewhelp", "/ai-review\n"
+    rest = after[1:]
+    if not rest or rest[0].isspace():
+        return Command("unknown")  # "/ai-review ", "/ai-review  wontfix: ..."
     # escalate / wontfix keep route.py's historical prefix semantics.
-    if rest.startswith("escalate"):
-        return Command("escalate", text=_reason(rest[len("escalate"):]))
-    if rest.startswith("wontfix"):
-        return Command("wontfix", text=_reason(rest[len("wontfix"):]))
+    if rest[:8].isascii() and rest[:8].lower() == "escalate":
+        return Command("escalate", text=_reason(rest[8:]))
+    if rest[:7].isascii() and rest[:7].lower() == "wontfix":
+        return Command("wontfix", text=_reason(rest[7:]))
     word = _WORD_RE.match(rest)
     if not word:
         return Command("unknown")
-    if word.group(1) == "help":
+    kw = word.group(1).lower()
+    if kw == "help":
         return Command("help")
-    if word.group(1) == "explain":
+    if kw == "explain":
         m = EXPLAIN_RE.match(rest)
         return Command("explain", arg=m.group(1)) if m else Command("explain", ok=False)
     m = OVERRIDE_RE.match(rest)
-    # The reason must survive sanitising: "<!-- -->" alone is not a reason.
-    if not m or len(textsafe.inline(m.group(2))) < 3:
+    if not m:
         return Command("override", ok=False)
-    return Command("override", arg=m.group(1), text=m.group(2))
+    text = m.group(2).rstrip()
+    # The reason must survive sanitising: "<!-- -->" alone is not a reason.
+    if len(text) < 3 or len(textsafe.inline(text)) < 3:
+        return Command("override", ok=False)
+    return Command("override", arg=m.group(1), text=text)
 
 
 def is_writer(comment: Any) -> bool:

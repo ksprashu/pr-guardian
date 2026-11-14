@@ -245,10 +245,9 @@ def decide(event_name: str, event: dict[str, Any], owner: str) -> dict[str, Any]
             out["reason"] = "not a /ai-review command"
             return out
         raw_body = comment.get("body")
-        body = raw_body.strip() if isinstance(raw_body, str) else ""
         user = comment.get("user")
         user_dict = user if isinstance(user, dict) else {}
-        if user_dict.get("type") == "Bot" or not body.startswith("/ai-review"):
+        if user_dict.get("type") == "Bot" or not commands.has_prefix(raw_body):
             out["reason"] = "not a /ai-review command"
             return out
         if event_name == "issue_comment":
@@ -274,7 +273,7 @@ def decide(event_name: str, event: dict[str, Any], owner: str) -> dict[str, Any]
             return out
         login = user_dict.get("login", "")
         by_owner = isinstance(login, str) and bool(owner) and login == owner
-        cmd = commands.parse(body)
+        cmd = commands.parse(raw_body)
         name = cmd.name if cmd is not None else "unknown"
         if name == "escalate":
             out.update(action="verdict", escalate="true", reason="escalated by a writer")

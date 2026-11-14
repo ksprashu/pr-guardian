@@ -572,6 +572,18 @@ def dispatch_event(pr="7"):
 
 COMMANDS = ("/ai-review", "/ai-review escalate", "/ai-review wontfix: false positive", "/ai-review bogus",
             "/ai-review help", "/ai-review explain R-001", "/ai-review override " + "a" * 40 + ": reviewed")
+COMMAND_VARIANTS = COMMANDS + (
+    "/ai-review frobnicate", "/ai-review wontfix", "/ai-review explain", "/ai-review override",
+    "/ai-review ", "/ai-review  ", "/ai-review\n", "/ai-review\r\n", "/AI-REVIEW\r\n",
+    " /ai-review", "\n/ai-review", "  /ai-review help",
+    "/ai-reviewer", "/ai-reviewhelp",
+    "/AI-REVIEW", "/Ai-Review", "/AI-REVIEW help", "/ai-review HELP",
+    "/AI-REVIEW wontfix: fp", "/ai-review WONTFIX: fp", "/AI-REVIEW WONTFIX: fp",
+    "/ai-review wontfix\nreason", "/ai-review  wontfix: fp", "/ai-review\twontfix: fp",
+    "/ai-review\nwontfix: fp", "/ai-review  help", "/ai-review\nhelp",
+    "/AI-REVIEW escalate: why", "/AI-REVIEW EXPLAIN R-001",
+    "/AI-REVIEW OVERRIDE " + "a" * 40 + ": reviewed",
+)
 
 
 class ExpressionModel(unittest.TestCase):
@@ -689,25 +701,22 @@ class CallerGate(unittest.TestCase):
                              "review", True)
 
     def test_info_commands_never_cancel_reviews(self):
-        """Only events route.decide() turns into a review may join the cancelling group (#39)."""
+        """Caller concurrency and route.decide() agree on every case and whitespace variant (#39, R-001)."""
         import route  # noqa: E402
-        bodies = COMMANDS + ("/ai-review frobnicate", "/ai-review wontfix", "/ai-review explain",
-                             "/ai-review override", "/ai-review  ", "/ai-reviewer", "/AI-REVIEW help")
         for kind in ("issue_comment", "pull_request_review_comment"):
             # Logins are unique ignoring case on GitHub, so the expression's case-insensitive == on
             # login cannot match a different account than route.py's exact comparison does.
             for assoc, login in [(a, n) for a in WRITERS for n in (OWNER_LOGIN, "someone")]:
-                for body in bodies:
+                for body in COMMAND_VARIANTS:
                     ctx = comment_event(body, assoc=assoc, kind=kind, login=login)
                     decision = route.decide(kind, ctx["github"]["event"], OWNER_LOGIN)
                     for cond, group, cip in self.each():
                         if not eval_if(cond, ctx):
-                            self.assertEqual(decision["action"], "skip", ctx)
+                            self.assertEqual(decision["action"], "skip", (body, kind, decision))
                             continue
                         cancels = eval_value(cip, ctx)
                         self.assertIs(cancels, eval_value(group, ctx).endswith("-review"), ctx)
-                        if cancels:
-                            self.assertEqual(decision["action"], "review", (body, kind, decision))
+                        self.assertIs(cancels, decision["action"] == "review", (body, kind, decision))
 
     def test_review_actions_override_label_and_dispatch(self):
         for action in ("opened", "synchronize", "reopened", "ready_for_review"):
@@ -747,10 +756,10 @@ class CallerGate(unittest.TestCase):
         for kind in ("issue_comment", "pull_request_review_comment"):
             for assoc in WRITERS + OUTSIDERS:
                 for user_type in ("User", "Bot"):
-                    for body in COMMANDS + ("LGTM",):
+                    for body in COMMAND_VARIANTS + ("LGTM",):
                         for login in (OWNER_LOGIN, "someone"):
                             events.append(comment_event(body, assoc, user_type, kind, login=login))
-        events += [comment_event(b, on_pr=False) for b in COMMANDS]
+        events += [comment_event(b, on_pr=False) for b in COMMAND_VARIANTS]
         acted = 0
         for ctx in events:
             gh = ctx["github"]

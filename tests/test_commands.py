@@ -15,38 +15,58 @@ BOT = {"type": "Bot", "login": "github-actions[bot]"}
 
 class ParseTest(unittest.TestCase):
     def test_not_commands(self):
-        for body in (None, 7, "", "lgtm", "please /ai-review", " ai-review", "/ai-reviewer", "/ai-reviewhelp",
-                     "/ai-reviewescalate"):
+        for body in (None, 7, "", "lgtm", "please /ai-review", " ai-review", "  /ai-review \n",
+                     "  /ai-review help", "\n/ai-review", "/ai-reviewer", "/ai-reviewhelp",
+                     "/ai-reviewescalate", "/ai-review ", "/ai-review  ", "/ai-review\n",
+                     "/ai-review\r\n", "/ai-review  wontfix: fp", "/ai-review\twontfix: fp",
+                     "/ai-review\nwontfix: fp", "/ai-review  help"):
             with self.subTest(body=body):
                 cmd = c.parse(body)
                 self.assertIn(cmd, (None, c.Command("unknown")))
         self.assertIsNone(c.parse("lgtm"))
+        self.assertIsNone(c.parse("  /ai-review \n"))
+        self.assertFalse(c.has_prefix("  /ai-review"))
+        self.assertTrue(c.has_prefix("/AI-REVIEW help"))
         self.assertEqual(c.parse("/ai-reviewer"), c.Command("unknown"))
+        self.assertEqual(c.parse("/ai-review  "), c.Command("unknown"))
+        self.assertEqual(c.parse("/ai-review\r\n"), c.Command("unknown"))
+        self.assertEqual(c.parse("/ai-review  wontfix: fp"), c.Command("unknown"))
 
     def test_table(self):
         cases = {
             "/ai-review": c.Command("review"),
-            "  /ai-review \n": c.Command("review"),
+            "/AI-REVIEW": c.Command("review"),
+            "/Ai-Review": c.Command("review"),
             "/ai-review wontfix: false positive": c.Command("wontfix", text="false positive"),
+            "/AI-REVIEW WONTFIX: False Positive": c.Command("wontfix", text="False Positive"),
             "/ai-review wontfix": c.Command("wontfix"),
+            "/ai-review WONTFIX": c.Command("wontfix"),
             "/ai-review wontfix   because": c.Command("wontfix", text="because"),
             "/ai-review escalate: loops": c.Command("escalate", text="loops"),
+            "/AI-REVIEW ESCALATE: loops": c.Command("escalate", text="loops"),
             "/ai-review escalate": c.Command("escalate"),
             "/ai-review help": c.Command("help"),
+            "/AI-REVIEW HELP": c.Command("help"),
             "/ai-review help please": c.Command("help"),
             "/ai-review explain R-001": c.Command("explain", arg="R-001"),
+            "/AI-REVIEW EXPLAIN R-001": c.Command("explain", arg="R-001"),
             "/ai-review explain SEC-1234": c.Command("explain", arg="SEC-1234"),
             "/ai-review explain r-001": c.Command("explain", ok=False),
             "/ai-review explain R-01": c.Command("explain", ok=False),
             "/ai-review explain": c.Command("explain", ok=False),
+            "/ai-review EXPLAIN": c.Command("explain", ok=False),
             "/ai-review explain R-001 R-002": c.Command("explain", ok=False),
             f"/ai-review override {SHA12}: reviewed by hand": c.Command("override", SHA12, "reviewed by hand"),
+            f"/AI-REVIEW OVERRIDE {SHA12}: Reviewed By Hand": c.Command("override", SHA12, "Reviewed By Hand"),
             f"/ai-review override {SHA40}:ok!": c.Command("override", SHA40, "ok!"),
+            f"/ai-review override {SHA40}: ok!  \n": c.Command("override", SHA40, "ok!"),
             f"/ai-review override {SHA64} : fine as is": c.Command("override", SHA64, "fine as is"),
             "/ai-review override": c.Command("override", ok=False),
+            "/ai-review OVERRIDE": c.Command("override", ok=False),
             "/ai-review override: because": c.Command("override", ok=False),
             f"/ai-review override {SHA12}": c.Command("override", ok=False),
             f"/ai-review override {SHA12}: ab": c.Command("override", ok=False),
+            f"/ai-review override {SHA12}: ab\n": c.Command("override", ok=False),
             "/ai-review override " + "a" * 11 + ": because": c.Command("override", ok=False),
             "/ai-review override " + "a" * 65 + ": because": c.Command("override", ok=False),
             "/ai-review override " + "A" * 12 + ": because": c.Command("override", ok=False),
