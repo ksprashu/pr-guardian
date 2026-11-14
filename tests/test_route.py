@@ -97,6 +97,44 @@ class RouteTest(unittest.TestCase):
         del ev["issue"]["pull_request"]
         self.assertEqual(route.decide("issue_comment", ev, "o")["action"], "skip")
 
+        for non_pr in (None, False, "https://api.github.com/repos/o/r/pulls/7", 7):
+            with self.subTest(pull_request=non_pr):
+                ev_null = comment_event("/ai-review")
+                ev_null["issue"]["pull_request"] = non_pr
+                res = route.decide("issue_comment", ev_null, "o")
+                self.assertEqual(res["action"], "skip")
+                self.assertEqual(res["pr"], "")
+                self.assertEqual(res["reason"], "comment is on an issue, not a PR")
+
+    def test_empty_or_missing_head_sha_rejected_on_pr_events(self):
+        bad_heads = (None, "abc", {}, {"sha": ""}, {"sha": None})
+        for event_name in ("pull_request", "pull_request_target"):
+            for head in bad_heads:
+                with self.subTest(event_name=event_name, head=head):
+                    ev = pr_event()
+                    if head is None:
+                        del ev["pull_request"]["head"]
+                    else:
+                        ev["pull_request"]["head"] = head
+                    res = route.decide(event_name, ev, "o")
+                    self.assertEqual(res["action"], "skip")
+                    self.assertEqual(res["pr"], "")
+                    self.assertEqual(res["head_sha"], "")
+                    self.assertEqual(res["reason"], "invalid PR metadata")
+
+        for head in bad_heads:
+            with self.subTest(event_name="pull_request_review_comment", head=head):
+                ev = comment_event("/ai-review wontfix: intended", kind="review")
+                if head is None:
+                    del ev["pull_request"]["head"]
+                else:
+                    ev["pull_request"]["head"] = head
+                res = route.decide("pull_request_review_comment", ev, "o")
+                self.assertEqual(res["action"], "skip")
+                self.assertEqual(res["pr"], "")
+                self.assertEqual(res["head_sha"], "")
+                self.assertEqual(res["reason"], "invalid PR metadata")
+
     def test_dispatch_and_unknown(self):
         self.assertEqual(route.decide("workflow_dispatch", {"inputs": {"pr": "3"}}, "o")["pr"], "3")
         self.assertEqual(route.decide("push", {}, "o")["action"], "skip")

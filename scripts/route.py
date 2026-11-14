@@ -66,9 +66,9 @@ REASONS = frozenset({
 })
 
 _PR_RE = re.compile(r"\A[1-9][0-9]{0,9}\Z", re.ASCII)
-# decide() accepts any lower-hex SHA up to 64 chars so existing unit fixtures
-# with short SHAs keep passing, while validate_output() enforces 40 or 64 chars.
-_DECIDE_SHA_RE = re.compile(r"\A[0-9a-f]{0,64}\Z", re.ASCII)
+# decide() accepts any non-empty lower-hex SHA up to 64 chars so existing unit
+# fixtures with short SHAs keep passing, while validate_output() enforces 40 or 64 chars.
+_DECIDE_SHA_RE = re.compile(r"\A[0-9a-f]{1,64}\Z", re.ASCII)
 _OUTPUT_SHA_RE = re.compile(r"\A(?:[0-9a-f]{40}|[0-9a-f]{64})?\Z", re.ASCII)
 
 
@@ -184,7 +184,7 @@ def decide(event_name: str, event: dict[str, Any], owner: str) -> dict[str, Any]
             return out
         if event_name == "issue_comment":
             issue = event.get("issue")
-            if not isinstance(issue, dict) or "pull_request" not in issue:
+            if not isinstance(issue, dict) or not isinstance(issue.get("pull_request"), dict):
                 out["reason"] = "comment is on an issue, not a PR"
                 return out
             pr_num = _coerce_pr(issue.get("number"))
