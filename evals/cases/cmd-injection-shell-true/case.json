@@ -1,0 +1,7 @@
+{
+  "title": "Add thumbnail conversion helper",
+  "description": "Intentional seeded defect for reviewer evaluation; not shipped code. Invokes subprocess with shell=True and caller input.",
+  "files": {
+    "app/runner.py": "from pathlib import Path\nimport subprocess\n\n\ndef health_check() -> int:\n    proc = subprocess.run([\"magick\", \"-version\"], check=True)\n    return proc.returncode\n"
+  }
+}

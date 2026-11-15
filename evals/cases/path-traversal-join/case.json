@@ -1,0 +1,7 @@
+{
+  "title": "Serve exported report files",
+  "description": "Intentional seeded defect for reviewer evaluation; not shipped code. Joins a user path without directory containment check.",
+  "files": {
+    "app/files.py": "import os\nfrom pathlib import Path\n\nEXPORT_ROOT = Path(\"/var/app/exports\")\n\n\ndef list_exports() -> list[str]:\n    return sorted(p.name for p in EXPORT_ROOT.iterdir() if p.is_file())\n"
+  }
+}

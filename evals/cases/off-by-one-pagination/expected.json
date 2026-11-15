@@ -1,0 +1,19 @@
+{
+  "clean": false,
+  "expect": [
+    {
+      "label": "off-by-one",
+      "file": "src/pagination.js",
+      "start_line": 3,
+      "end_line": 3,
+      "rules": [
+        "off-by-one",
+        "pagination"
+      ],
+      "axes": [
+        "correctness"
+      ],
+      "min_severity": "P2"
+    }
+  ]
+}

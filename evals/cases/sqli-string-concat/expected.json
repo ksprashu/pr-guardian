@@ -1,0 +1,19 @@
+{
+  "clean": false,
+  "expect": [
+    {
+      "label": "sqli",
+      "file": "app/search.py",
+      "start_line": 10,
+      "end_line": 11,
+      "rules": [
+        "CWE-89",
+        "sql"
+      ],
+      "axes": [
+        "security"
+      ],
+      "min_severity": "P1"
+    }
+  ]
+}

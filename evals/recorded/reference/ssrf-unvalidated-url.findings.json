@@ -1,0 +1,30 @@
+{
+  "schema_version": "1",
+  "producer": "review",
+  "mode": "pr",
+  "summary": "Found 1 blocking defect(s) in ssrf-unvalidated-url.",
+  "inspected": [
+    "app/webhook.py"
+  ],
+  "not_inspected": [],
+  "findings": [
+    {
+      "id": "E-001",
+      "severity": "P1",
+      "axis": "security",
+      "rule": "CWE-918: Server-Side Request Forgery (SSRF)",
+      "title": "Unvalidated caller URL fetched by server",
+      "file": "app/webhook.py",
+      "start_line": 8,
+      "end_line": 10,
+      "rationale": "Passing an unvalidated URL to urlopen allows internal metadata/loopback access and file:// reads.",
+      "evidence": "with urllib.request.urlopen(callback_url, timeout=5) as resp:",
+      "suggestion": "Enforce https scheme, DNS resolution check against private/loopback CIDRs, and disable redirects.",
+      "references": [],
+      "confidence": "high",
+      "status": "new",
+      "prior_id": "",
+      "security_verdict": "confirmed"
+    }
+  ]
+}

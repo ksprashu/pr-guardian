@@ -1,0 +1,19 @@
+{
+  "clean": false,
+  "expect": [
+    {
+      "label": "path-traversal",
+      "file": "app/files.py",
+      "start_line": 12,
+      "end_line": 14,
+      "rules": [
+        "CWE-22",
+        "traversal"
+      ],
+      "axes": [
+        "security"
+      ],
+      "min_severity": "P1"
+    }
+  ]
+}

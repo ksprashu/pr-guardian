@@ -1,0 +1,30 @@
+{
+  "schema_version": "1",
+  "producer": "review",
+  "mode": "pr",
+  "summary": "Found 1 blocking defect(s) in sqli-string-concat.",
+  "inspected": [
+    "app/search.py"
+  ],
+  "not_inspected": [],
+  "findings": [
+    {
+      "id": "E-001",
+      "severity": "P1",
+      "axis": "security",
+      "rule": "CWE-89: SQL injection",
+      "title": "SQL built by concatenating untrusted query parameter",
+      "file": "app/search.py",
+      "start_line": 10,
+      "end_line": 11,
+      "rationale": "Concatenating caller-supplied `query` directly into SQL lets arbitrary predicates execute.",
+      "evidence": "sql = \"SELECT id, email FROM users WHERE email LIKE '%\" + query + \"%'\"",
+      "suggestion": "Use parameterised SQL with LIKE ? and bound argument.",
+      "references": [],
+      "confidence": "high",
+      "status": "new",
+      "prior_id": "",
+      "security_verdict": "confirmed"
+    }
+  ]
+}

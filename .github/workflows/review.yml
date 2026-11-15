@@ -1,6 +1,7 @@
 # Reusable pr-guardian review. Callers: templates/pr-guardian.yml (installed by the governor).
 #
 # route   -> decide review / verdict / skip                      (no token)
+# announce-> early pending pr-guardian/verdict with the run link  (statuses write; no PR code)
 # scan    -> scanners + linters on the PR head                   (read)
 #            SARIF stays an artifact: code-scanning uploads open unresolvable
 #            duplicate PR threads that block required conversation resolution.
@@ -31,7 +32,7 @@ permissions: {}
 env:
   # agent-skill-forge commit the review / security-review skills are loaded from.
   FORGE_REPO: ksprashu/agent-skill-forge
-  FORGE_REF: f8c0b1a401913136e5ce5747ad49ae7455e29617 # review-security-hardening (PR #9) after rebase; repin to the merged main SHA
+  FORGE_REF: 5934386b0165d6481fd34a37461d56853351a3cf # ksprashu/agent-skill-forge main
 
 jobs:
   route:
@@ -53,6 +54,49 @@ jobs:
           persist-credentials: false
       - id: route
         run: python3 .prg/scripts/route.py
+      - name: Job summary
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        env:
+          ACTION: ${{ steps.route.outputs.action }}
+          REASON: ${{ steps.route.outputs.reason }}
+          PR: ${{ steps.route.outputs.pr }}
+        run: python3 .prg/scripts/step_summary.py route --action "$ACTION" --reason "$REASON" --pr "$PR"
+
+  announce:
+    # Early pending status, so the required check links to this run instead of showing
+    # GitHub's generic "Expected" while scan and review work (#38). This job holds
+    # statuses: write and nothing else: no checkout, no PR code, no model. verdict needs it,
+    # so the final status always lands after this one.
+    needs: route
+    if: needs.route.outputs.action == 'review'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      pull-requests: read # head SHA lookup for comment and dispatch events
+      statuses: write # the pending status
+    steps:
+      - name: Post pending pr-guardian/verdict
+        # Fork and Dependabot runs get a read-only token: the POST fails and the run goes on.
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ needs.route.outputs.pr }}
+          EVENT_SHA: ${{ needs.route.outputs.head_sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          sha="$EVENT_SHA"
+          if [ -z "$sha" ]; then
+            sha="$(gh pr view "$PR" -R "$GITHUB_REPOSITORY" --json headRefOid --jq .headRefOid)"
+          fi
+          if ! [[ "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::notice::no head SHA for PR #$PR; pending status not posted"
+            exit 0
+          fi
+          gh api "repos/$GITHUB_REPOSITORY/statuses/$sha" -X POST \
+            -f state=pending -f context=pr-guardian/verdict \
+            -f description="Review running" -f target_url="$RUN_URL" > /dev/null \
+            || echo "::notice::pending status not posted (read-only token, as on fork and Dependabot runs)"
 
   scan:
     needs: route
@@ -127,6 +171,12 @@ jobs:
             ${{ runner.temp }}/evidence.json
           if-no-files-found: warn
           retention-days: 7
+      - name: Job summary
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        run: |
+          python3 .prg/scripts/step_summary.py scan --scan "$RUNNER_TEMP/scan.json" \
+            --collector "$RUNNER_TEMP/evidence.json"
 
   review:
     needs: [route, scan]
@@ -155,10 +205,15 @@ jobs:
           path: .forge
           persist-credentials: false
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        id: scan_artifact
+        # When neither scanner step wrote output there is no artifact (#25). The job goes on:
+        # build_context reports "scan not run" and triage then never skips the model.
+        continue-on-error: true
         with:
           name: prg-scan
           path: ${{ runner.temp }}/scan
       - name: Build review context
+        id: context
         env:
           GH_TOKEN: ${{ github.token }}
           PR: ${{ needs.route.outputs.pr }}
@@ -169,10 +224,14 @@ jobs:
             --collector "$RUNNER_TEMP/scan/evidence.json" \
             --triage-out "$RUNNER_TEMP/triage.json"
           cat "$RUNNER_TEMP/triage.json"
+          # Only the JSON boolean true skips the model; anything else reviews (#31).
+          skip="$(jq -r '.skip_model == true' "$RUNNER_TEMP/triage.json" 2>/dev/null || true)"
+          [ "$skip" = "true" ] || skip=false
+          echo "skip_model=$skip" >> "$GITHUB_OUTPUT"
       - name: Install Antigravity CLI and skills
+        if: steps.context.outputs.skip_model != 'true'
         run: |
-          curl -fsSL https://antigravity.google/cli/install.sh | bash
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          .prg/scripts/install_agy.sh
           mkdir -p ~/.gemini/antigravity-cli ~/.gemini/config/skills
           cp .prg/config/agy-settings.json ~/.gemini/antigravity-cli/settings.json
           mkdir -p ~/.claude/skills
@@ -183,6 +242,7 @@ jobs:
           "$HOME/.local/bin/agy" --version || true
       - name: Install Claude Code (rate-limit fallback)
         # Optional: if this fails, Gemini still reviews and run_model reports a missing claude.
+        if: steps.context.outputs.skip_model != 'true'
         continue-on-error: true
         # npm ci checks every package against the committed lockfile hashes; the package's own
         # installer then links the platform binary that the lockfile already verified.
@@ -196,14 +256,37 @@ jobs:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
           PRG_MODEL: ${{ inputs.model }}
+          SKIP_MODEL: ${{ steps.context.outputs.skip_model }}
         run: |
-          test -n "$GEMINI_API_KEY" || { echo "::error::GEMINI_API_KEY secret is not set on this repo"; exit 1; }
-          agy models || echo "::warning::agy models failed"
+          escalate="$(jq -r '((.escalate_reason // "" | tostring | gsub("^\\s+|\\s+$"; "")) != "" and (.escalate_reason | type) != "boolean") or .size_exceeded == true or .cost_exceeded == true' "$RUNNER_TEMP/triage.json" 2>/dev/null || true)"
+          [ "$escalate" = "true" ] || escalate=false
+          if [ "$SKIP_MODEL" != "true" ] && [ "$escalate" != "true" ]; then
+            if [ -z "$GEMINI_API_KEY" ] && [ -z "$ANTHROPIC_API_KEY" ]; then
+              if [ "$GITHUB_ACTOR" = "dependabot[bot]" ]; then
+                echo "::error::No model API key (GEMINI_API_KEY or ANTHROPIC_API_KEY) is available to this Dependabot run. Dependabot PRs only receive Dependabot secrets: run the governor with --dependabot-secrets, or add the key under Settings > Secrets and variables > Dependabot."
+              else
+                echo "::error::Neither GEMINI_API_KEY nor ANTHROPIC_API_KEY secret is set on this repo"
+              fi
+              exit 1
+            fi
+            if [ -n "$GEMINI_API_KEY" ]; then
+              agy models || echo "::warning::agy models failed"
+            fi
+          fi
           python3 .prg/scripts/run_model.py --context "$RUNNER_TEMP/ctx/context.md" \
             --triage "$RUNNER_TEMP/triage.json" \
             --findings-lib .forge/skills/review/scripts/findings.py \
             --out "$RUNNER_TEMP/out/findings.json" --usage-out "$RUNNER_TEMP/out/agy.json" \
             --workdir src
+      - name: Job summary
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        env:
+          SCAN_ARTIFACT: ${{ steps.scan_artifact.outcome }}
+        run: |
+          python3 .prg/scripts/step_summary.py review --triage "$RUNNER_TEMP/triage.json" \
+            --scan "$RUNNER_TEMP/scan/scan.json" --usage "$RUNNER_TEMP/out/agy.json" \
+            --findings "$RUNNER_TEMP/out/findings.json" --scan-artifact "$SCAN_ARTIFACT"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
@@ -251,13 +334,19 @@ jobs:
           # The governor's caller rollout PR is exempt from the workflow tripwire only when
           # its caller is the template rendered with exactly this ref (GHSA-v7qp-pmhq-cf47).
           GUARDIAN_REF: ${{ inputs.guardian_ref }}
+        # shell: bash sets pipefail, so a failed publish still fails the step through tee.
+        shell: bash
         run: |
           python3 .prg/scripts/publish_review.py --repo "$GITHUB_REPOSITORY" --pr "$PR" --sha "$SHA" \
             --base="$BASE" --guardian-ref="$GUARDIAN_REF" --findings "$RUNNER_TEMP/out/findings.json" \
-            --usage "$RUNNER_TEMP/out/agy.json"
+            --usage "$RUNNER_TEMP/out/agy.json" | tee "$RUNNER_TEMP/publish.json"
+      - name: Job summary
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        run: python3 .prg/scripts/step_summary.py publish --result "$RUNNER_TEMP/publish.json"
 
   verdict:
-    needs: [route, scan, review, publish]
+    needs: [route, announce, scan, review, publish]
     # !cancelled(), not always(): a cancelled run (superseded by a newer one) must not stamp
     # "error" on the PR, whereas failed or timed-out jobs still report it (GHSA-6wg7-gfpx-8639).
     if: ${{ !cancelled() && needs.route.result == 'success' && needs.route.outputs.action != 'skip' }}
@@ -294,7 +383,13 @@ jobs:
           # Stale overrides are removed on every verdict run, not only on synchronize
           # (GHSA-q4j9-99qr-cfhw).
           BIND_OVERRIDE: ${{ needs.route.outputs.bind_override }}
+        # shell: bash sets pipefail, so a failed verdict still fails the step through tee.
+        shell: bash
         run: |
           python3 .prg/scripts/verdict.py --repo "$GITHUB_REPOSITORY" --pr "$PR" --sha "$SHA" \
             --escalate "$ESCALATE" --reason "$REASON" --review-result "$RESULT" \
-            --bind-override "$BIND_OVERRIDE"
+            --bind-override "$BIND_OVERRIDE" | tee "$RUNNER_TEMP/verdict.json"
+      - name: Job summary
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        run: python3 .prg/scripts/step_summary.py verdict --result "$RUNNER_TEMP/verdict.json"

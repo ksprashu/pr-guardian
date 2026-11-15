@@ -1,0 +1,14 @@
+diff --git a/app/files.py b/app/files.py
+index b1e0d68..da0d856 100644
+--- a/app/files.py
++++ b/app/files.py
+@@ -6,3 +6,9 @@ EXPORT_ROOT = Path("/var/app/exports")
+ 
+ def list_exports() -> list[str]:
+     return sorted(p.name for p in EXPORT_ROOT.iterdir() if p.is_file())
++
++
++def read_export(user_path: str) -> bytes:
++    target = os.path.join(str(EXPORT_ROOT), user_path)
++    with open(target, "rb") as fh:
++        return fh.read()

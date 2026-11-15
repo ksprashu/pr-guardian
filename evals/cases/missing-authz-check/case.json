@@ -1,0 +1,7 @@
+{
+  "title": "Add order detail route handler",
+  "description": "Intentional seeded defect for reviewer evaluation; not shipped code. Returns order record without verifying ownership.",
+  "files": {
+    "src/routes/orders.js": "async function listMyOrders(req, res, db) {\n  const rows = await db.findOrdersByOwner(req.user.id);\n  return res.json({ orders: rows });\n}\n\nmodule.exports = { listMyOrders };\n"
+  }
+}

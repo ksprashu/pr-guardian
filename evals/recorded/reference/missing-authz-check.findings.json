@@ -1,0 +1,30 @@
+{
+  "schema_version": "1",
+  "producer": "review",
+  "mode": "pr",
+  "summary": "Found 1 blocking defect(s) in missing-authz-check.",
+  "inspected": [
+    "src/routes/orders.js"
+  ],
+  "not_inspected": [],
+  "findings": [
+    {
+      "id": "E-001",
+      "severity": "P1",
+      "axis": "security",
+      "rule": "CWE-639: Missing object-level authorization check",
+      "title": "getOrder returns any order matching req.params.id without owner check",
+      "file": "src/routes/orders.js",
+      "start_line": 6,
+      "end_line": 10,
+      "rationale": "Any authenticated user can read another user's order by guessing `req.params.id`.",
+      "evidence": "const order = await db.findOrderById(req.params.id);",
+      "suggestion": "Verify `order.ownerId === req.user.id` (or scope DB query by ownerId).",
+      "references": [],
+      "confidence": "high",
+      "status": "new",
+      "prior_id": "",
+      "security_verdict": "confirmed"
+    }
+  ]
+}

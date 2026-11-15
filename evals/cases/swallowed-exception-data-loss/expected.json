@@ -1,0 +1,20 @@
+{
+  "clean": false,
+  "expect": [
+    {
+      "label": "swallowed-exception",
+      "file": "app/ledger.py",
+      "start_line": 8,
+      "end_line": 10,
+      "rules": [
+        "swallowed",
+        "exception"
+      ],
+      "axes": [
+        "reliability",
+        "correctness"
+      ],
+      "min_severity": "P1"
+    }
+  ]
+}

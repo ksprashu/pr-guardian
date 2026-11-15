@@ -1,0 +1,12 @@
+{
+  "schema_version": "1",
+  "producer": "review",
+  "mode": "pr",
+  "summary": "No blocking issues found.",
+  "inspected": [
+    "docs/usage.md",
+    "tests/test_format.py"
+  ],
+  "not_inspected": [],
+  "findings": []
+}

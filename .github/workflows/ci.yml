@@ -18,6 +18,23 @@ jobs:
         run: python3 -m unittest discover -s tests -t . -v
       - name: Install linters
         run: scripts/install_scanners.sh
+      - name: Coverage floor
+        run: |
+          python3 -m pip install --quiet --user --require-hashes --only-binary=:all: -r scripts/requirements-dev.txt
+          python3 -m coverage run --branch --source=scripts -m unittest discover -s tests -t .
+          python3 -m coverage report --fail-under=80
+      - name: Golden evals (fixture lint and recorded scorecards)
+        run: |
+          python3 scripts/eval.py lint
+          python3 scripts/eval.py score --recorded all --check-fresh
+      - name: Pins (FORGE_REF and agy; drift only warns)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/check_pins.py --online
+      - name: agy install (pinned build, checksum)
+        run: scripts/install_agy.sh
+      - name: shellcheck
+        run: shellcheck scripts/*.sh
       - name: actionlint (workflows + rendered caller templates)
         run: |
           mkdir -p "$RUNNER_TEMP/caller/.github/workflows"
@@ -27,4 +44,4 @@ jobs:
             > "$RUNNER_TEMP/caller/.github/workflows/stack-restack.yml"
           actionlint .github/workflows/*.yml "$RUNNER_TEMP/caller/.github/workflows/"*.yml
       - name: zizmor
-        run: zizmor --offline .github/workflows "$RUNNER_TEMP/caller/.github/workflows"
+        run: zizmor --offline . "$RUNNER_TEMP/caller/.github/workflows"

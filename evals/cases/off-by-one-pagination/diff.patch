@@ -1,0 +1,12 @@
+diff --git a/src/pagination.js b/src/pagination.js
+index c372c61..1ea4eba 100644
+--- a/src/pagination.js
++++ b/src/pagination.js
+@@ -1,6 +1,6 @@
+ function paginate(items, page, pageSize) {
+   const totalPages = Math.max(1, Math.ceil(items.length / pageSize));
+-  if (page < 1) return [];
++  if (page < 1 || !(page < totalPages)) return [];
+   const start = (page - 1) * pageSize;
+   return items.slice(start, start + pageSize);
+ }
