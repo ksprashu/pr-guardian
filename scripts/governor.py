@@ -4,7 +4,7 @@
 Usage:
   governor.py [--dry-run] [--repos a,b,c] [--batch N] [--offset N] [--report-issue]
               [--rotate-secrets] [--dependabot-secrets] [--canary a,b] [--exempt a,b]
-              [--promote] [--stats] [--allow-unmerged-ref]
+              [--promote] [--stats] [--allow-unmerged-ref] [--restack]
 
 Needs GH_TOKEN = a fine-grained PAT on all repos with Administration, Secrets,
 Contents, Pull requests and Workflows (read/write) (plus Dependabot secrets
@@ -29,6 +29,9 @@ Per repo, in this order (so no repo ever requires a check that cannot run):
                 delivered through a PR, never a direct push
   4. ruleset    "main-via-pr" on the default branch, empty bypass list, only
                 once the caller is on the default branch
+  5. restack    (opt-in via --restack or PRG_RESTACK_REPOS) .github/workflows/stack-restack.yml
+                delivered idempotently on a separate install branch so pr-guardian.yml rollout
+                PRs keep their single-file workflow-tripwire exemption
 
 Empty repos (no default branch) get settings + secret only; the ruleset waits
 for the first commit. Exit 0 = no drift left, 1 = drift remains unresolved; empty
@@ -57,6 +60,8 @@ from textsafe import inline
 ROOT = Path(__file__).resolve().parent.parent
 CALLER_PATH = ".github/workflows/pr-guardian.yml"
 INSTALL_BRANCH = "pr-guardian/install"
+RESTACK_CALLER_PATH = ".github/workflows/stack-restack.yml"
+RESTACK_INSTALL_BRANCH = "pr-guardian/install-restack"
 RULESET_NAME = "main-via-pr"
 VERDICT_CONTEXT = "pr-guardian/verdict"
 ACTIONS_APP_ID = 15368
@@ -103,6 +108,8 @@ class Config:
 
     rotate: bool = False
     dependabot: bool = False
+    restack: bool = False
+    restack_repos: frozenset[str] = frozenset()
     canaries: frozenset[str] = frozenset()
     held: bool = False
     hold_reason: str = ""
@@ -231,6 +238,15 @@ def settings_drift(repo: dict[str, Any]) -> list[str]:
 
 def render_caller(ref: str) -> str:
     return (ROOT / "templates" / "pr-guardian.yml").read_text(encoding="utf-8").replace("{{REF}}", ref)
+
+
+def render_restack_caller(ref: str) -> str:
+    return (ROOT / "templates" / "stack-restack.yml").read_text(encoding="utf-8").replace("{{REF}}", ref)
+
+
+def restack_repo_names(env_raw: str | None = None) -> set[str]:
+    raw = os.environ.get("PRG_RESTACK_REPOS", "") if env_raw is None else env_raw
+    return _names(raw)
 
 
 # --- GitHub reads -------------------------------------------------------------
@@ -435,21 +451,23 @@ def classic_protection(full: str, default: str) -> list[str]:
     return out
 
 
-def _open_install_prs(full: str, default: str) -> list[dict[str, Any]]:
+def _open_install_prs(full: str, default: str, *, branch: str = INSTALL_BRANCH) -> list[dict[str, Any]]:
     owner = full.split("/")[0]
-    prs = gh.api(f"repos/{full}/pulls?head={owner}:{INSTALL_BRANCH}&state=open&per_page=10") or []
+    prs = gh.api(f"repos/{full}/pulls?head={owner}:{branch}&state=open&per_page=10") or []
     return [
         p for p in prs
         if isinstance(p, dict)
         and (p.get("base") or {}).get("ref") == default
-        and (p.get("head") or {}).get("ref") == INSTALL_BRANCH
+        and (p.get("head") or {}).get("ref") == branch
         and ((p.get("head") or {}).get("repo") or {}).get("full_name") == full
     ]
 
 
-def inspect_install(full: str, default: str, content: str, now: datetime | None = None) -> Install:
-    """Inspect any open install PR and blocking protections. Reads only."""
-    matches = _open_install_prs(full, default)
+def inspect_install(full: str, default: str, content: str, now: datetime | None = None,
+                    *, path: str = CALLER_PATH, branch: str = INSTALL_BRANCH,
+                    pr_label: str = "install") -> Install:
+    """Inspect any open workflow rollout PR and blocking protections. Reads only."""
+    matches = _open_install_prs(full, default, branch=branch)
     if not matches:
         return Install()
     n = matches[0]["number"]
@@ -459,8 +477,8 @@ def inspect_install(full: str, default: str, content: str, now: datetime | None 
     caller_only = False
     if detail.get("changed_files") == 1:
         files = gh.pr_files(full, n)
-        caller_only = [f["filename"] for f in files] == [CALLER_PATH] and not files[0].get("previous_filename")
-    text, blob = caller_blob(full, INSTALL_BRANCH)
+        caller_only = [f["filename"] for f in files] == [path] and not files[0].get("previous_filename")
+    text, blob = caller_blob(full, branch) if path == CALLER_PATH else _file_with_sha(full, path, branch)
     current = text == content and caller_only
     blockers: list[str] = []
     ref_now = now or datetime.now(timezone.utc)
@@ -474,65 +492,113 @@ def inspect_install(full: str, default: str, content: str, now: datetime | None 
         age = (ref_now - created_at).days
         if age >= STUCK_DAYS:
             state = detail.get("mergeable_state") or "unknown"
-            blockers.append(f"install PR #{n} open {age}d, merge state {state}")
+            blockers.append(f"{pr_label} PR #{n} open {age}d, merge state {state}")
     blockers.extend(classic_protection(full, default))
     return Install(pr=detail, text=text, blob=blob, caller_only=caller_only,
                    current=current, blockers=blockers)
 
 
-def _merge_install_pr(full: str, number: int, head: str) -> Delivery:
+def inspect_restack_install(full: str, default: str, content: str, now: datetime | None = None) -> Install:
+    """Inspect any open opt-in stack-restack rollout PR. Reads only."""
+    return inspect_install(
+        full, default, content, now=now,
+        path=RESTACK_CALLER_PATH, branch=RESTACK_INSTALL_BRANCH, pr_label="restack install",
+    )
+
+
+def _merge_install_pr(full: str, number: int, head: str, *, label: str = "caller") -> Delivery:
     match = ["--match-head-commit", head]
     try:
         gh._run(["pr", "merge", str(number), "-R", full, "--squash", "--auto", *match])
-        return Delivery(f"caller PR #{number} queued for auto-merge", merged=False)
+        return Delivery(f"{label} PR #{number} queued for auto-merge", merged=False)
     except gh.GhError:
         # No ruleset yet means nothing to wait for; auto-merge refuses, so merge now.
         gh._run(["pr", "merge", str(number), "-R", full, "--squash", "--delete-branch", *match])
-        return Delivery(f"caller PR #{number} merged", merged=True)
+        return Delivery(f"{label} PR #{number} merged", merged=True)
 
 
-def _put_caller(full: str, content: str, blob: str | None) -> str:
+def _put_workflow(full: str, content: str, blob: str | None, *,
+                  path: str, branch: str, message: str) -> str:
     body: dict[str, Any] = {
-        "message": "ci: install pr-guardian review gate",
-        "branch": INSTALL_BRANCH,
+        "message": message,
+        "branch": branch,
         "content": base64.b64encode(content.encode()).decode(),
     }
     if blob:
         body["sha"] = blob
-    put = gh.api(f"repos/{full}/contents/{CALLER_PATH}", "PUT", body)
+    put = gh.api(f"repos/{full}/contents/{path}", "PUT", body)
     return put["commit"]["sha"]
 
 
-def deliver_caller(full: str, default: str, content: str, inst: Install | None = None) -> Delivery:
-    """Idempotently update/open the install PR and queue or complete its merge."""
-    inst = inst or inspect_install(full, default, content)
+def _put_caller(full: str, content: str, blob: str | None) -> str:
+    return _put_workflow(
+        full, content, blob,
+        path=CALLER_PATH, branch=INSTALL_BRANCH, message="ci: install pr-guardian review gate",
+    )
+
+
+def _deliver_workflow(full: str, default: str, content: str, inst: Install | None = None, *,
+                      path: str, branch: str, title: str, pr_body: str,
+                      label: str, pr_label: str) -> Delivery:
+    """Idempotently update/open a single-file workflow rollout PR and queue or merge it."""
+    inst = inst or inspect_install(full, default, content, path=path, branch=branch, pr_label=pr_label)
     if inst.pr and inst.current and inst.pr.get("auto_merge"):
-        return Delivery(f"caller PR #{inst.pr['number']} waiting (auto-merge queued)", merged=False)
+        return Delivery(f"{label} PR #{inst.pr['number']} waiting (auto-merge queued)", merged=False)
     if inst.pr and inst.current:
-        return _merge_install_pr(full, inst.pr["number"], inst.pr["head"]["sha"])
+        return _merge_install_pr(full, inst.pr["number"], inst.pr["head"]["sha"], label=label)
     if inst.pr and inst.caller_only:
-        head = _put_caller(full, content, inst.blob)
-        return _merge_install_pr(full, inst.pr["number"], head)
+        head = _put_workflow(full, content, inst.blob, path=path, branch=branch, message=title)
+        return _merge_install_pr(full, inst.pr["number"], head, label=label)
 
     base_sha = gh.api(f"repos/{full}/git/ref/heads/{urllib.parse.quote(default, safe='/')}")["object"]["sha"]
     try:
-        gh.api(f"repos/{full}/git/refs", "POST", {"ref": f"refs/heads/{INSTALL_BRANCH}", "sha": base_sha})
+        gh.api(f"repos/{full}/git/refs", "POST", {"ref": f"refs/heads/{branch}", "sha": base_sha})
     except gh.GhError:
-        gh.api(f"repos/{full}/git/refs/heads/{INSTALL_BRANCH}", "PATCH", {"sha": base_sha, "force": True})
-    _, blob = caller_blob(full, INSTALL_BRANCH)
-    head = _put_caller(full, content, blob)
+        gh.api(f"repos/{full}/git/refs/heads/{branch}", "PATCH", {"sha": base_sha, "force": True})
+    _, blob = caller_blob(full, branch) if path == CALLER_PATH else _file_with_sha(full, path, branch)
+    head = _put_workflow(full, content, blob, path=path, branch=branch, message=title)
 
     # A force-reset closes any foreign-content PR on GitHub; re-check before opening.
-    prs = _open_install_prs(full, default) if inst.pr else []
+    prs = _open_install_prs(full, default, branch=branch) if inst.pr else []
     if prs:
         number = prs[0]["number"]
     else:
         number = gh.api(f"repos/{full}/pulls", "POST", {
-            "title": "ci: install pr-guardian review gate", "head": INSTALL_BRANCH, "base": default,
-            "body": "Adds the caller for the pr-guardian reusable review workflow. Every PR to "
-                    f"`{default}` gets an automated code and security review, and the "
-                    f"`{VERDICT_CONTEXT}` status gates merging.\n\nOpened by the pr-guardian governor."})["number"]
-    return _merge_install_pr(full, number, head)
+            "title": title, "head": branch, "base": default, "body": pr_body})["number"]
+    return _merge_install_pr(full, number, head, label=label)
+
+
+def deliver_caller(full: str, default: str, content: str, inst: Install | None = None) -> Delivery:
+    """Idempotently update/open the install PR and queue or complete its merge."""
+    return _deliver_workflow(
+        full, default, content, inst,
+        path=CALLER_PATH,
+        branch=INSTALL_BRANCH,
+        title="ci: install pr-guardian review gate",
+        pr_body=("Adds the caller for the pr-guardian reusable review workflow. Every PR to "
+                 f"`{default}` gets an automated code and security review, and the "
+                 f"`{VERDICT_CONTEXT}` status gates merging.\n\nOpened by the pr-guardian governor."),
+        label="caller",
+        pr_label="install",
+    )
+
+
+def deliver_restack_caller(full: str, default: str, content: str, inst: Install | None = None) -> Delivery:
+    """Idempotently update/open the opt-in stack-restack PR on its own branch."""
+    return _deliver_workflow(
+        full, default, content, inst,
+        path=RESTACK_CALLER_PATH,
+        branch=RESTACK_INSTALL_BRANCH,
+        title="ci: install pr-guardian stack-restack workflow",
+        pr_body=(f"Adds the opt-in post-merge stack-restack caller for `{default}`. Same-repo "
+                 "stacked PRs are retargeted and synced automatically when their base PR "
+                 "squash-merges, while `review.yml` remains read-only.\n\n"
+                 "Because this workflow grants `contents: write`, the workflow tripwire requires "
+                 "the owner's `human-override` label once to approve merging.\n\n"
+                 "Opened by the pr-guardian governor."),
+        label="restack caller",
+        pr_label="restack install",
+    )
 
 
 # --- reconcile ----------------------------------------------------------------
@@ -584,9 +650,10 @@ def _reconcile_ruleset(full: str, step: Callable[..., Any]) -> None:
 
 
 def reconcile(repo: dict[str, Any], ref: str, dry: bool, have_key: bool,
-              cfg: Config | None = None) -> dict[str, Any]:
+              cfg: Config | None = None, *, restack: bool = False) -> dict[str, Any]:
     cfg = cfg or Config()
     full, default = repo["full_name"], repo.get("default_branch") or ""
+    repo_name = repo.get("name") or full.split("/", 1)[-1]
     out = _blank(full)
 
     def step(name: str, drift: list[str], fix: Callable[[], Any]) -> Any:
@@ -648,6 +715,34 @@ def reconcile(repo: dict[str, Any], ref: str, dry: bool, have_key: bool,
         return out
 
     _reconcile_ruleset(full, step)
+
+    if restack or cfg.restack or repo_name in cfg.restack_repos:
+        want_restack = render_restack_caller(ref)
+        have_restack = file_on_branch(full, RESTACK_CALLER_PATH, default)
+        restack_drift = ([] if have_restack == want_restack
+                         else ["restack caller missing" if have_restack is None else "restack caller stale"])
+        if restack_drift and cfg.held and repo_name not in cfg.canaries:
+            out["drift"] += restack_drift
+            out["pending"] += [f"{restack_drift[0]}: held for the canary ring ({cfg.hold_reason})"]
+        elif restack_drift:
+            try:
+                r_inst = inspect_restack_install(full, default, want_restack, now=cfg.now)
+            except Exception as exc:  # noqa: BLE001
+                out["drift"] += restack_drift
+                out["pending"] += restack_drift
+                out["errors"].append(f"restack: {_exc(exc)}")
+            else:
+                r_res = step(
+                    "restack",
+                    restack_drift,
+                    lambda: (lambda d: (d.note, d.merged))(
+                        deliver_restack_caller(full, default, want_restack, r_inst)
+                    ),
+                )
+                r_merged = bool(r_res and r_res[1])
+                if not r_merged:
+                    out["pending"] += r_inst.blockers
+
     return out
 
 
@@ -806,6 +901,8 @@ def main() -> int:
     ap.add_argument("--promote", action="store_true", default=_env_flag("PRG_PROMOTE"))
     ap.add_argument("--stats", action="store_true", default=_env_flag("PRG_STATS"))
     ap.add_argument("--allow-unmerged-ref", action="store_true", default=_env_flag("PRG_ALLOW_UNMERGED_REF"))
+    ap.add_argument("--restack", action="store_true", default=_env_flag("PRG_RESTACK"),
+                    help="also reconcile opt-in stack-restack caller on selected repos")
     args = ap.parse_args()
 
     try:  # once, before any repo is touched: a bad id must not half-apply a ruleset
@@ -842,6 +939,11 @@ def main() -> int:
     if unknown:
         print(f"::error::unknown repo(s) in --canary/--exempt: {', '.join(unknown)}", file=sys.stderr)
         return 2
+    want_restack_repos = restack_repo_names()
+    unknown_restack = sorted(want_restack_repos - fleet_names)
+    if unknown_restack:
+        print(f"::error::unknown repo(s) in PRG_RESTACK_REPOS: {', '.join(unknown_restack)}", file=sys.stderr)
+        return 2
     try:
         topics_by_name = {r["name"]: repo_topics(r) for r in repos}
     except gh.GhError as exc:
@@ -871,6 +973,8 @@ def main() -> int:
     cfg = Config(
         rotate=args.rotate_secrets,
         dependabot=args.dependabot_secrets,
+        restack=args.restack,
+        restack_repos=frozenset(want_restack_repos),
         canaries=frozenset(canaries),
         held=held,
         hold_reason=gate if held else "",

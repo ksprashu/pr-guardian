@@ -13,6 +13,10 @@ on:
         description: Comma-separated repo names (blank = all owned)
         type: string
         default: ""
+      restack:
+        description: Also reconcile opt-in stack-restack caller on selected repos
+        type: boolean
+        default: false
       batch:
         description: Max repos this run (0 = all)
         type: number
@@ -47,14 +51,17 @@ jobs:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           PRG_OWNER: ${{ github.repository_owner }}
           PRG_REF: ${{ vars.PRG_REF || 'v1' }}
+          PRG_RESTACK_REPOS: ${{ vars.PRG_RESTACK_REPOS }}
           # Unset = GitHub Actions (15368). Set only once a dedicated verdict app exists (README).
           PRG_VERDICT_APP_ID: ${{ vars.PRG_VERDICT_APP_ID }}
           DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
+          RESTACK: ${{ github.event_name == 'workflow_dispatch' && inputs.restack }}
           REPOS: ${{ inputs.repos }}
           BATCH: ${{ inputs.batch || 0 }}
           OFFSET: ${{ inputs.offset || 0 }}
         run: |
           args=(--report-issue --batch "$BATCH" --offset "$OFFSET")
           [ "$DRY_RUN" = "true" ] && args+=(--dry-run)
+          [ "$RESTACK" = "true" ] && args+=(--restack)
           [ -n "$REPOS" ] && args+=(--repos "$REPOS")
           python3 scripts/governor.py "${args[@]}"

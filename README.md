@@ -70,6 +70,16 @@ Optionally, set these variables:
 
 - `PRG_REF`: the pr-guardian ref callers pin. Use a full 40-hex commit SHA. The workflow tripwire exempts the caller rollout PR only when the caller pins a commit SHA, so a tag or branch makes every rollout PR wait for the owner's `human-override`.
 - `PRG_VERDICT_APP_ID`: the app id the ruleset requires `pr-guardian/verdict` from. Leave it unset, which keeps `15368` (GitHub Actions), until the Phase 2 verdict app posts the status. Setting it earlier makes every governed PR wait on a status nobody sends. The governor exits with code 2, before touching any repo, if the value is not a positive integer.
+- `PRG_RESTACK_REPOS`: comma-separated repo names that also receive the opt-in `templates/stack-restack.yml` caller (or pass `--restack` to `governor.py`).
+
+## Stacked PRs (opt-in)
+
+Squash-merging the bottom PR of a stack rewrites its commits into one commit on `main`, which leaves stacked child PRs targeting a deleted branch or showing spurious add/add conflicts. `templates/stack-restack.yml` calls `.github/workflows/restack.yml` (`scripts/restack.py`) to handle this without giving `review.yml` write access:
+
+- **Privilege isolation.** `review.yml` remains read-only (`contents: read`). `stack-restack.yml` is a separate workflow that runs only when a same-repo PR merges into the default branch (`pull_request: types: [closed]` with `merged == true`, or default-branch `workflow_dispatch`), refuses fork PRs, disables git hooks and LFS smudge filters, validates every branch ref, and never holds `statuses: write`.
+- **Restack or notify.** Open same-repo PRs stacked on the merged PR are retargeted to the default branch if needed and synced via fast-forward merge push: `-s ours` is used **only** when the squashed PR's `head_sha` (or an identical-tree sync commit) is already an ancestor of the child PR and `head_sha^{tree} == origin/<default>^{tree}`; otherwise a regular 3-way `git merge --no-edit` runs. When semantic conflicts occur, `restack.py` aborts the merge and updates one idempotent `<!-- pr-guardian:restack -->` comment listing the conflicting files and [`pr-review-loop`](https://github.com/ksprashu/agent-skill-forge/tree/main/skills/pr-review-loop) commands.
+- **Rollout.** `governor.py --restack --repos <name>` (or `PRG_RESTACK_REPOS`) opens a separate `pr-guardian/install-restack` PR so `pr-guardian.yml` rollout PRs keep their single-file tripwire exemption. Because `stack-restack.yml` grants `contents: write`, the owner applies `human-override` to approve installing or updating it.
+- **Token behavior and CI triggers.** GitHub blocks pushes and base edits made with `GITHUB_TOKEN` from starting `pull_request` workflow runs. Configure an optional repo-scoped `STACK_RESTACK_TOKEN` secret (fine-grained PAT or GitHub App token scoped to that single repo with `Contents` and `Pull requests` read/write; never reuse `GOVERNOR_TOKEN`) so restacked PRs re-trigger `pull_request` checks automatically. When `STACK_RESTACK_TOKEN` is unset, `restack.py` falls back to `GITHUB_TOKEN`, dispatches `pr-guardian.yml` via `workflow_dispatch`, and posts a status note on the PR if CI could not be started automatically.
 
 ## Development
 
