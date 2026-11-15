@@ -1,0 +1,8 @@
+{
+  "title": "Rename emit_gauge helper to record_gauge",
+  "description": "Intentional seeded defect for reviewer evaluation; not shipped code. Clean negative-control PR performing a mechanical function rename across module and test.",
+  "files": {
+    "app/metrics.py": "def emit_gauge(sink: list[tuple[str, float]], name: str, value: float) -> None:\n    sink.append((name, float(value)))\n",
+    "tests/test_metrics.py": "import unittest\nfrom app.metrics import emit_gauge\n\n\nclass MetricsTest(unittest.TestCase):\n    def test_gauge_records_float(self):\n        sink = []\n        emit_gauge(sink, \"queue_depth\", 3)\n        self.assertEqual(sink, [(\"queue_depth\", 3.0)])\n"
+  }
+}

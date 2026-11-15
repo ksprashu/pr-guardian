@@ -1,0 +1,20 @@
+{
+  "clean": false,
+  "expect": [
+    {
+      "label": "unsafe-deserialization",
+      "file": "app/payloads.py",
+      "start_line": 9,
+      "end_line": 10,
+      "rules": [
+        "CWE-502",
+        "pickle",
+        "deserialization"
+      ],
+      "axes": [
+        "security"
+      ],
+      "min_severity": "P1"
+    }
+  ]
+}

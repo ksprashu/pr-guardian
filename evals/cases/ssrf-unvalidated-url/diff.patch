@@ -1,0 +1,13 @@
+diff --git a/app/webhook.py b/app/webhook.py
+index 109ca81..2919835 100644
+--- a/app/webhook.py
++++ b/app/webhook.py
+@@ -3,3 +3,8 @@ import urllib.request
+ 
+ def build_event_payload(event_id: str) -> dict[str, str]:
+     return {"event_id": event_id}
++
++
++def fetch_webhook_metadata(callback_url: str) -> bytes:
++    with urllib.request.urlopen(callback_url, timeout=5) as resp:
++        return resp.read(65536)

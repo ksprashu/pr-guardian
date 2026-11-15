@@ -1,0 +1,30 @@
+{
+  "schema_version": "1",
+  "producer": "review",
+  "mode": "pr",
+  "summary": "Found 1 blocking defect(s) in path-traversal-join.",
+  "inspected": [
+    "app/files.py"
+  ],
+  "not_inspected": [],
+  "findings": [
+    {
+      "id": "E-001",
+      "severity": "P1",
+      "axis": "security",
+      "rule": "CWE-22: Path traversal",
+      "title": "os.path.join allows '..' or leading '/' to escape EXPORT_ROOT",
+      "file": "app/files.py",
+      "start_line": 12,
+      "end_line": 14,
+      "rationale": "`os.path.join` discards `EXPORT_ROOT` on absolute paths and does not prevent `..` segments.",
+      "evidence": "target = os.path.join(str(EXPORT_ROOT), user_path)",
+      "suggestion": "Resolve `target` and verify `target.is_relative_to(EXPORT_ROOT.resolve())`.",
+      "references": [],
+      "confidence": "high",
+      "status": "new",
+      "prior_id": "",
+      "security_verdict": "confirmed"
+    }
+  ]
+}

@@ -1,0 +1,19 @@
+{
+  "clean": false,
+  "expect": [
+    {
+      "label": "cmd-injection",
+      "file": "app/runner.py",
+      "start_line": 12,
+      "end_line": 13,
+      "rules": [
+        "CWE-78",
+        "command"
+      ],
+      "axes": [
+        "security"
+      ],
+      "min_severity": "P1"
+    }
+  ]
+}

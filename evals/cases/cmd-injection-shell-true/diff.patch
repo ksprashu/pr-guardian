@@ -1,0 +1,14 @@
+diff --git a/app/runner.py b/app/runner.py
+index 4face07..68e5c94 100644
+--- a/app/runner.py
++++ b/app/runner.py
+@@ -5,3 +5,9 @@ import subprocess
+ def health_check() -> int:
+     proc = subprocess.run(["magick", "-version"], check=True)
+     return proc.returncode
++
++
++def convert_upload(upload_name: str, out_dir: Path) -> None:
++    dest = out_dir / "thumb.png"
++    cmd = f"magick {upload_name} -resize 256x256 {dest}"
++    subprocess.run(cmd, shell=True, check=True)

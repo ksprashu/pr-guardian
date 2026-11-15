@@ -1,0 +1,7 @@
+{
+  "title": "Add active users query using bound SQL parameters",
+  "description": "Intentional seeded defect for reviewer evaluation; not shipped code. Clean negative-control PR using parameterised SQLite queries.",
+  "files": {
+    "app/users.py": "import sqlite3\n\n\ndef get_user(conn: sqlite3.Connection, user_id: int) -> tuple | None:\n    return conn.execute(\n        \"SELECT id, email FROM users WHERE id = ?\",\n        (user_id,),\n    ).fetchone()\n"
+  }
+}

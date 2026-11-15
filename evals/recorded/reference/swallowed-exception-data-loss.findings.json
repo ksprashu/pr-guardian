@@ -1,0 +1,30 @@
+{
+  "schema_version": "1",
+  "producer": "review",
+  "mode": "pr",
+  "summary": "Found 1 blocking defect(s) in swallowed-exception-data-loss.",
+  "inspected": [
+    "app/ledger.py"
+  ],
+  "not_inspected": [],
+  "findings": [
+    {
+      "id": "E-001",
+      "severity": "P1",
+      "axis": "reliability",
+      "rule": "swallowed exception causes silent data loss",
+      "title": "OSError during ledger write is ignored and caller receives saved=True",
+      "file": "app/ledger.py",
+      "start_line": 8,
+      "end_line": 10,
+      "rationale": "Disk-full or permission errors are silently discarded while returning success to the caller.",
+      "evidence": "except OSError:\n        pass",
+      "suggestion": "Propagate the error or return saved=False after logging.",
+      "references": [],
+      "confidence": "high",
+      "status": "new",
+      "prior_id": "",
+      "security_verdict": ""
+    }
+  ]
+}

@@ -1,0 +1,12 @@
+diff --git a/app/payloads.py b/app/payloads.py
+index d58e8da..e8d19e2 100644
+--- a/app/payloads.py
++++ b/app/payloads.py
+@@ -4,3 +4,7 @@ import pickle
+ 
+ def decode_json_header(raw: bytes) -> dict:
+     return json.loads(raw.decode("utf-8"))
++
++
++def restore_session_cookie(cookie_bytes: bytes) -> dict:
++    return pickle.loads(cookie_bytes)

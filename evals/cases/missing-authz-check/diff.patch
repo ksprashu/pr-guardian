@@ -1,0 +1,16 @@
+diff --git a/src/routes/orders.js b/src/routes/orders.js
+index 8c306a8..667b33a 100644
+--- a/src/routes/orders.js
++++ b/src/routes/orders.js
+@@ -3,4 +3,10 @@ async function listMyOrders(req, res, db) {
+   return res.json({ orders: rows });
+ }
+ 
+-module.exports = { listMyOrders };
++async function getOrder(req, res, db) {
++  const order = await db.findOrderById(req.params.id);
++  if (!order) return res.status(404).json({ error: "not found" });
++  return res.json({ order });
++}
++
++module.exports = { listMyOrders, getOrder };

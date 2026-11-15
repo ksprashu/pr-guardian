@@ -1,0 +1,7 @@
+{
+  "title": "Fetch preview metadata for user webhook",
+  "description": "Intentional seeded defect for reviewer evaluation; not shipped code. Requests a caller-supplied URL with no scheme or host restriction.",
+  "files": {
+    "app/webhook.py": "import urllib.request\n\n\ndef build_event_payload(event_id: str) -> dict[str, str]:\n    return {\"event_id\": event_id}\n"
+  }
+}

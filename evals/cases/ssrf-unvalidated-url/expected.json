@@ -1,0 +1,19 @@
+{
+  "clean": false,
+  "expect": [
+    {
+      "label": "ssrf",
+      "file": "app/webhook.py",
+      "start_line": 8,
+      "end_line": 10,
+      "rules": [
+        "CWE-918",
+        "ssrf"
+      ],
+      "axes": [
+        "security"
+      ],
+      "min_severity": "P1"
+    }
+  ]
+}

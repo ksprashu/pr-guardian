@@ -25,6 +25,18 @@ on:
         description: Skip this many repos (sorted by name)
         type: number
         default: 0
+      rotate_secrets:
+        description: Set every managed secret again on every repo in scope (after a key rotation)
+        type: boolean
+        default: false
+      promote:
+        description: Roll PRG_REF out to every repo without waiting for the canary ring
+        type: boolean
+        default: false
+      stats:
+        description: Add fleet review stats (open PRs, rounds, cost) to the report
+        type: boolean
+        default: false
 permissions: {}
 concurrency:
   group: governor
@@ -49,6 +61,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GOVERNOR_TOKEN }}
           REPORT_TOKEN: ${{ github.token }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           PRG_OWNER: ${{ github.repository_owner }}
           PRG_REF: ${{ vars.PRG_REF || 'v1' }}
           PRG_RESTACK_REPOS: ${{ vars.PRG_RESTACK_REPOS }}
@@ -59,6 +72,12 @@ jobs:
           REPOS: ${{ inputs.repos }}
           BATCH: ${{ inputs.batch || 0 }}
           OFFSET: ${{ inputs.offset || 0 }}
+          PRG_ROTATE_SECRETS: ${{ inputs.rotate_secrets || false }}
+          PRG_PROMOTE: ${{ inputs.promote || false }}
+          PRG_STATS: ${{ inputs.stats || vars.PRG_STATS || false }}
+          PRG_CANARY: ${{ vars.PRG_CANARY }}
+          PRG_EXEMPT: ${{ vars.PRG_EXEMPT }}
+          PRG_DEPENDABOT_SECRETS: ${{ vars.PRG_DEPENDABOT_SECRETS || false }}
         run: |
           args=(--report-issue --batch "$BATCH" --offset "$OFFSET")
           [ "$DRY_RUN" = "true" ] && args+=(--dry-run)

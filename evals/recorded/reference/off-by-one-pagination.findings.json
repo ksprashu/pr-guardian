@@ -1,0 +1,30 @@
+{
+  "schema_version": "1",
+  "producer": "review",
+  "mode": "pr",
+  "summary": "Found 1 blocking defect(s) in off-by-one-pagination.",
+  "inspected": [
+    "src/pagination.js"
+  ],
+  "not_inspected": [],
+  "findings": [
+    {
+      "id": "E-001",
+      "severity": "P2",
+      "axis": "correctness",
+      "rule": "off-by-one pagination bound",
+      "title": "1-based page check rejects page === totalPages",
+      "file": "src/pagination.js",
+      "start_line": 3,
+      "end_line": 3,
+      "rationale": "Because `page` is 1-based, `!(page < totalPages)` drops the final page (and returns empty on 1-page lists).",
+      "evidence": "if (page < 1 || !(page < totalPages)) return [];",
+      "suggestion": "Use `page > totalPages` instead of `!(page < totalPages)`.",
+      "references": [],
+      "confidence": "high",
+      "status": "new",
+      "prior_id": "",
+      "security_verdict": ""
+    }
+  ]
+}

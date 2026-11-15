@@ -1,0 +1,30 @@
+{
+  "schema_version": "1",
+  "producer": "review",
+  "mode": "pr",
+  "summary": "Found 1 blocking defect(s) in unsafe-deserialization.",
+  "inspected": [
+    "app/payloads.py"
+  ],
+  "not_inspected": [],
+  "findings": [
+    {
+      "id": "E-001",
+      "severity": "P1",
+      "axis": "security",
+      "rule": "CWE-502: Unsafe deserialization",
+      "title": "pickle.loads called on untrusted cookie bytes",
+      "file": "app/payloads.py",
+      "start_line": 9,
+      "end_line": 10,
+      "rationale": "Untrusted pickle payloads execute arbitrary code during unpickling.",
+      "evidence": "return pickle.loads(cookie_bytes)",
+      "suggestion": "Use signed JSON instead of pickle.",
+      "references": [],
+      "confidence": "high",
+      "status": "new",
+      "prior_id": "",
+      "security_verdict": "confirmed"
+    }
+  ]
+}

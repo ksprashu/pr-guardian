@@ -1,0 +1,8 @@
+{
+  "title": "Document percentage formatter and add unit test",
+  "description": "Intentional seeded defect for reviewer evaluation; not shipped code. Clean negative-control PR updating documentation and adding unit test.",
+  "files": {
+    "docs/usage.md": "# Usage\n\nRun `format_pct(0.25)` to display `25.0%`.\n",
+    "tests/test_format.py": "import unittest\n\n\ndef format_pct(ratio: float) -> str:\n    return f\"{ratio * 100:.1f}%\"\n\n\nclass FormatTest(unittest.TestCase):\n    def test_quarter(self):\n        self.assertEqual(format_pct(0.25), \"25.0%\")\n"
+  }
+}

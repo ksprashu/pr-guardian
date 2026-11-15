@@ -1,0 +1,30 @@
+{
+  "schema_version": "1",
+  "producer": "review",
+  "mode": "pr",
+  "summary": "Found 1 blocking defect(s) in cmd-injection-shell-true.",
+  "inspected": [
+    "app/runner.py"
+  ],
+  "not_inspected": [],
+  "findings": [
+    {
+      "id": "E-001",
+      "severity": "P1",
+      "axis": "security",
+      "rule": "CWE-78: OS command injection",
+      "title": "Caller-controlled filename interpolated into shell=True command",
+      "file": "app/runner.py",
+      "start_line": 12,
+      "end_line": 13,
+      "rationale": "Metacharacters in `upload_name` execute arbitrary shell commands under `shell=True`.",
+      "evidence": "subprocess.run(cmd, shell=True, check=True)",
+      "suggestion": "Pass an argument list with shell=False.",
+      "references": [],
+      "confidence": "high",
+      "status": "new",
+      "prior_id": "",
+      "security_verdict": "confirmed"
+    }
+  ]
+}

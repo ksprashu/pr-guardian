@@ -1,0 +1,21 @@
+{
+  "clean": false,
+  "expect": [
+    {
+      "label": "missing-authz",
+      "file": "src/routes/orders.js",
+      "start_line": 6,
+      "end_line": 10,
+      "rules": [
+        "CWE-862",
+        "CWE-639",
+        "authz",
+        "authorization"
+      ],
+      "axes": [
+        "security"
+      ],
+      "min_severity": "P1"
+    }
+  ]
+}
