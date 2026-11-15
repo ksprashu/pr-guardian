@@ -98,7 +98,14 @@ class FakeGh:
             summary = ", ".join(f"{c.kind}:{c.method}:{c.path}" for c in w)
             raise AssertionError(f"unexpected GitHub writes: {summary}")
 
-    def _run(self, args: list[str], stdin: str | None = None, token: str | None = None) -> str:
+    def _run(
+        self,
+        args: list[str],
+        stdin: str | None = None,
+        token: str | None = None,
+        *,
+        idempotent: bool = True,
+    ) -> str:
         args_tuple = tuple(args)
         if args[:2] == ["api", "graphql"]:
             payload = _parse_json_or_raw(stdin)

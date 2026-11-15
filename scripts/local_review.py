@@ -215,9 +215,17 @@ class Capture:
         self.overlay = Overlay(repo, pr)
         self._patcher: Any = None
 
-    def _run(self, args: list[str], stdin: str | None = None, token: str | None = None) -> str:
+    def _run(
+        self,
+        args: list[str],
+        stdin: str | None = None,
+        token: str | None = None,
+        *,
+        idempotent: bool | None = None,
+    ) -> str:
         if classify(args, stdin) == "read":
-            return self.overlay.apply(args, self.real(args, stdin, token))
+            call_kw = {"idempotent": idempotent} if idempotent is not None else {}
+            return self.overlay.apply(args, self.real(args, stdin, token, **call_kw))
         self.writes.append(decode(args, stdin))
         self.overlay.record(args, stdin)
         return '{"data": {}}' if args[1:2] == ["graphql"] else ("{}" if args[:1] == ["api"] else "")

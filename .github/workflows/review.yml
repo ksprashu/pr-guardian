@@ -32,7 +32,7 @@ permissions: {}
 env:
   # agent-skill-forge commit the review / security-review skills are loaded from.
   FORGE_REPO: ksprashu/agent-skill-forge
-  FORGE_REF: f8c0b1a401913136e5ce5747ad49ae7455e29617 # review-security-hardening (PR #9) after rebase; repin to the merged main SHA
+  FORGE_REF: 5934386b0165d6481fd34a37461d56853351a3cf # ksprashu/agent-skill-forge main
 
 jobs:
   route:
@@ -258,16 +258,20 @@ jobs:
           PRG_MODEL: ${{ inputs.model }}
           SKIP_MODEL: ${{ steps.context.outputs.skip_model }}
         run: |
-          if [ "$SKIP_MODEL" != "true" ]; then
-            if [ -z "$GEMINI_API_KEY" ]; then
+          escalate="$(jq -r '((.escalate_reason // "" | tostring | gsub("^\\s+|\\s+$"; "")) != "" and (.escalate_reason | type) != "boolean") or .size_exceeded == true or .cost_exceeded == true' "$RUNNER_TEMP/triage.json" 2>/dev/null || true)"
+          [ "$escalate" = "true" ] || escalate=false
+          if [ "$SKIP_MODEL" != "true" ] && [ "$escalate" != "true" ]; then
+            if [ -z "$GEMINI_API_KEY" ] && [ -z "$ANTHROPIC_API_KEY" ]; then
               if [ "$GITHUB_ACTOR" = "dependabot[bot]" ]; then
-                echo "::error::GEMINI_API_KEY is not available to this Dependabot run. Dependabot PRs only receive Dependabot secrets: run the governor with --dependabot-secrets, or add the key under Settings > Secrets and variables > Dependabot."
+                echo "::error::No model API key (GEMINI_API_KEY or ANTHROPIC_API_KEY) is available to this Dependabot run. Dependabot PRs only receive Dependabot secrets: run the governor with --dependabot-secrets, or add the key under Settings > Secrets and variables > Dependabot."
               else
-                echo "::error::GEMINI_API_KEY secret is not set on this repo"
+                echo "::error::Neither GEMINI_API_KEY nor ANTHROPIC_API_KEY secret is set on this repo"
               fi
               exit 1
             fi
-            agy models || echo "::warning::agy models failed"
+            if [ -n "$GEMINI_API_KEY" ]; then
+              agy models || echo "::warning::agy models failed"
+            fi
           fi
           python3 .prg/scripts/run_model.py --context "$RUNNER_TEMP/ctx/context.md" \
             --triage "$RUNNER_TEMP/triage.json" \

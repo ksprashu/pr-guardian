@@ -106,6 +106,89 @@ class Track6WorkflowWiringTests(unittest.TestCase):
         self.assertIn(".skip_model == true", self.review)
         self.assertIn("--dependabot-secrets", review_block)
 
+    def test_review_preflight_allows_anthropic_only_and_premodel_escalation(self):
+        import json
+        import os
+        import subprocess
+        import tempfile
+
+        review_block = _job_block(self.review, "review")
+        review_steps = [s for s in _steps(review_block) if "run_model.py" in s]
+        self.assertEqual(len(review_steps), 1)
+        m = re.search(r"(?m)^\s+run:\s*\|\n(.*)$", review_steps[0], re.S)
+        self.assertIsNotNone(m)
+        script = "\n".join(line[10:] if line.startswith(" " * 10) else line for line in m.group(1).splitlines())
+
+        def run_preflight(triage: dict, *, gemini: str = "", anthropic: str = "",
+                          skip: str = "false", actor: str = "dev"):
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                rtemp = root / "rt"
+                bin_dir = root / "bin"
+                (rtemp / "ctx").mkdir(parents=True)
+                (rtemp / "out").mkdir(parents=True)
+                (root / ".prg" / "scripts").mkdir(parents=True)
+                (root / ".forge" / "skills" / "review" / "scripts").mkdir(parents=True)
+                (root / "src").mkdir()
+                bin_dir.mkdir()
+                (rtemp / "triage.json").write_text(json.dumps(triage), encoding="utf-8")
+                agy_log = root / "agy.log"
+                rm_log = root / "rm.log"
+                agy_bin = bin_dir / "agy"
+                agy_bin.write_text(f"#!/usr/bin/env bash\necho \"$*\" >> {str(agy_log)!r}\n", encoding="utf-8")
+                agy_bin.chmod(0o755)
+                (root / ".prg" / "scripts" / "run_model.py").write_text(
+                    f"import pathlib, sys\npathlib.Path({str(rm_log)!r}).write_text(' '.join(sys.argv[1:]))\n",
+                    encoding="utf-8",
+                )
+                env = {
+                    "PATH": f"{bin_dir}:{os.environ.get('PATH', '')}",
+                    "RUNNER_TEMP": str(rtemp),
+                    "SKIP_MODEL": skip,
+                    "GEMINI_API_KEY": gemini,
+                    "ANTHROPIC_API_KEY": anthropic,
+                    "GITHUB_ACTOR": actor,
+                }
+                proc = subprocess.run(["bash", "-eo", "pipefail", "-c", script],
+                                      cwd=str(root), env=env, capture_output=True, text=True, check=False)
+                return (
+                    proc.returncode,
+                    proc.stdout + proc.stderr,
+                    agy_log.read_text(encoding="utf-8") if agy_log.exists() else "",
+                    rm_log.exists(),
+                )
+
+        # 1. Missing both keys on normal review fails closed (normal actor & Dependabot).
+        rc, out, agy_calls, rm_ran = run_preflight({"skip_model": False})
+        self.assertEqual((rc, agy_calls, rm_ran), (1, "", False))
+        self.assertIn("ANTHROPIC_API_KEY", out)
+
+        rc_dep, out_dep, _, rm_dep = run_preflight({"skip_model": False}, actor="dependabot[bot]")
+        self.assertEqual((rc_dep, rm_dep), (1, False))
+        self.assertIn("--dependabot-secrets", out_dep)
+
+        # 2. Whitespace-only or boolean escalate_reason still requires an API key.
+        for non_esc in ({"escalate_reason": "   "}, {"escalate_reason": True}):
+            rc_ws, _, _, rm_ws = run_preflight(non_esc)
+            self.assertEqual((rc_ws, rm_ws), (1, False), non_esc)
+
+        # 3. ANTHROPIC_API_KEY-only passes preflight without calling `agy models`.
+        rc_cc, _, agy_cc, rm_cc = run_preflight({"skip_model": False}, anthropic="sk-ant-test")
+        self.assertEqual((rc_cc, agy_cc, rm_cc), (0, "", True))
+
+        # 4. Pre-model triage escalations reach run_model.py without API keys or `agy models`.
+        for esc_triage in (
+            {"skip_model": False, "escalate_reason": "PR size limit exceeded"},
+            {"skip_model": False, "size_exceeded": True},
+            {"skip_model": False, "cost_exceeded": True},
+        ):
+            rc_esc, _, agy_esc, rm_esc = run_preflight(esc_triage, actor="dependabot[bot]")
+            self.assertEqual((rc_esc, agy_esc, rm_esc), (0, "", True), esc_triage)
+
+        # 5. GEMINI_API_KEY normal run executes `agy models` preflight and reaches run_model.py.
+        rc_gem, _, agy_gem, rm_gem = run_preflight({"skip_model": False}, gemini="g-key")
+        self.assertEqual((rc_gem, agy_gem.strip(), rm_gem), (0, "models", True))
+
     def test_no_pipe_to_shell_in_any_workflow(self):
         for wf in WORKFLOW_FILES:
             text = wf.read_text(encoding="utf-8")

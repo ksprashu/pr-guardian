@@ -46,8 +46,14 @@ def _wire_pr7(fake: FakeGh, *, pr_files=None, diff: str = helpers.DIFF) -> None:
         },
     )
     fake.on("GET", r"repos/o/r/pulls/7/files\?per_page=100", files)
+    fake.on("GET", r"repos/o/r/pulls/7/comments\?per_page=100", Pages([[]]))
+    fake.on("GET", r"repos/o/r/contents/\.github/pr-guardian\.yml\?ref=main", gh.GhError("HTTP 404"))
     fake.on("GET", r"repos/o/r/issues/7/comments", Pages([[]]))
     fake.on("GET", r"repos/o/r/issues/7/events", Pages([[]]))
+    fake.on_graphql(
+        "closingIssuesReferences",
+        {"repository": {"pullRequest": {"closingIssuesReferences": {"nodes": []}}}},
+    )
     fake.on_graphql(
         "reviewThreads",
         {"repository": {"pullRequest": {"reviewThreads": {"pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": []}}}},
@@ -168,6 +174,18 @@ class OverlayTest(unittest.TestCase):
         self.assertEqual(fake.writes, [])
         self.assertEqual(len(cap.writes), 5)
         self.assertEqual(local_review._tilde_fence("a ~~~~ b"), "~~~~~")
+
+    def test_capture_forwards_idempotent_kwarg_on_reads(self):
+        real_mock = mock.Mock(return_value='{"number": 7}')
+        with mock.patch.object(gh, "_run", real_mock):
+            with local_review.Capture("o/r", 7) as cap:
+                read_out = cap._run(["api", "repos/o/r/pulls/7", "-X", "GET"], None, "tok", idempotent=False)
+                write_out = cap._run(["api", "repos/o/r/issues/7/comments", "-X", "POST"], '{"body":"x"}', "tok", idempotent=False)
+
+        self.assertEqual(json.loads(read_out), {"number": 7})
+        self.assertEqual(write_out, "{}")
+        real_mock.assert_called_once_with(["api", "repos/o/r/pulls/7", "-X", "GET"], None, "tok", idempotent=False)
+        self.assertEqual(len(cap.writes), 1)
 
 
 class ModelEngineTest(unittest.TestCase):
