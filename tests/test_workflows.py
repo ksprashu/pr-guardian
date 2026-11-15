@@ -445,6 +445,8 @@ class _Expr:
                 if isinstance(args[0], list):
                     return any(_eq(x, args[1]) for x in args[0])
                 return _to_str(args[1]).casefold() in _to_str(args[0]).casefold()
+            if name == "format":
+                return re.sub(r"\{(\d+)\}", lambda m: _to_str(args[int(m.group(1)) + 1]), _to_str(args[0]))
             raise ValueError(f"unsupported function {node[1]}")
         raise ValueError(f"bad node {node!r}")
 

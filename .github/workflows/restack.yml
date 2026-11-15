@@ -1,0 +1,65 @@
+# Reusable post-merge stack restacker. Callers: templates/stack-restack.yml (opt-in).
+#
+# Isolated from review.yml so PR review jobs stay strictly read-only (contents: read).
+# Runs only after a same-repo PR merges into the repository's default branch (or on a
+# default-branch workflow_dispatch) and never executes code or git hooks from the repo.
+name: pr-guardian stack restack
+on:
+  workflow_call:
+    inputs:
+      guardian_ref:
+        description: pr-guardian ref the scripts are loaded from (match the uses@ ref)
+        type: string
+        required: true
+      merged_pr:
+        description: Optional merged PR number when triggered via workflow_dispatch
+        type: string
+        required: false
+        default: ""
+    secrets:
+      STACK_RESTACK_TOKEN:
+        description: Optional repo-scoped token so restack pushes re-trigger pull_request workflows
+        required: false
+
+permissions: {}
+
+jobs:
+  restack:
+    if: >-
+      (github.event_name == 'pull_request'
+      && github.event.action == 'closed'
+      && github.event.pull_request.merged == true
+      && github.event.pull_request.base.ref == github.event.repository.default_branch
+      && github.event.pull_request.head.repo.full_name == github.repository)
+      || ((github.event_name == 'workflow_dispatch' || github.event_name == 'push')
+      && github.ref == format('refs/heads/{0}', github.event.repository.default_branch))
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      actions: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ksprashu/pr-guardian
+          ref: ${{ inputs.guardian_ref }}
+          path: .prg
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          path: repo
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Restack open stacked PRs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_TOKEN: ${{ github.token }}
+          STACK_RESTACK_TOKEN: ${{ secrets.STACK_RESTACK_TOKEN }}
+          MERGED_PR: ${{ inputs.merged_pr }}
+        run: |
+          args=(--repo "$GITHUB_REPOSITORY" --workdir repo)
+          [ -n "$MERGED_PR" ] && args+=("--merged-pr=$MERGED_PR")
+          python3 .prg/scripts/restack.py "${args[@]}"
