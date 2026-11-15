@@ -6,6 +6,7 @@ import contextlib
 import copy
 import io
 import json
+import os
 import subprocess
 import tempfile
 import unittest
@@ -110,9 +111,9 @@ class _GitHarness:
         self._git(self.author, "push", "-u", "origin", "main")
         self._git(self.root, "clone", str(self.origin), str(self.workdir))
 
-    def _git(self, cwd: Path, *args: str) -> str:
+    def run_git_raw(self, cwd: Path, *args: str, check: bool = False) -> subprocess.CompletedProcess[str]:
         env = {
-            "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin",
+            "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
             "HOME": str(self.root),
             "TMPDIR": str(self.root),
             "GIT_CONFIG_GLOBAL": "/dev/null",
@@ -121,13 +122,16 @@ class _GitHarness:
         }
         cmd = [
             "git", "-C", str(cwd),
+            "-c", "core.hooksPath=/dev/null",
             "-c", "commit.gpgsign=false",
             "-c", "user.name=Test",
             "-c", "user.email=test@example.com",
             *args,
         ]
-        proc = subprocess.run(cmd, capture_output=True, text=True, shell=False, check=True, env=env)
-        return proc.stdout.strip()
+        return subprocess.run(cmd, capture_output=True, text=True, shell=False, check=check, env=env)
+
+    def _git(self, cwd: Path, *args: str) -> str:
+        return self.run_git_raw(cwd, *args, check=True).stdout.strip()
 
     def write(self, repo_dir: Path, rel: str, content: str) -> None:
         target = repo_dir / rel
@@ -234,12 +238,12 @@ class RealGitStackRestackTest(unittest.TestCase):
             squash_sha = h.squash_merge_to_main("feat/one", delete_remote_branch=True)
 
             # Confirm naive 3-way git merge of origin/main into feat/two WOULD conflict.
+            h._git(h.author, "fetch", "origin", "main")
             h._git(h.author, "checkout", "feat/two")
-            naive = subprocess.run(
-                ["git", "-C", str(h.author), "merge", "--no-commit", "--no-ff", "origin/main"],
-                capture_output=True, text=True, shell=False,
-            )
-            self.assertNotEqual(naive.returncode, 0, "expected naive 3-way merge to conflict on calc.py")
+            naive = h.run_git_raw(h.author, "merge", "--no-commit", "--no-ff", "origin/main")
+            diag = f"rc={naive.returncode}\nstdout={naive.stdout}\nstderr={naive.stderr}"
+            self.assertEqual(naive.returncode, 1, diag)
+            self.assertIn("CONFLICT", naive.stdout + naive.stderr, diag)
             h._git(h.author, "merge", "--abort")
 
             fake = FakeGitHub([_pr_payload(2, head_ref="feat/two", head_sha=h2, base_ref="feat/one")])
