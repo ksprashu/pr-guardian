@@ -268,7 +268,7 @@ def escalation_doc(reason: str, triage: dict[str, Any] | None = None) -> dict[st
             "id": fid,
             "severity": "P2",
             "axis": "scope-architecture",
-            "rule": "prg:review-budget-exceeded",
+            "rule": "PRG-GATE",
             "title": title,
             "file": ".github/pr-guardian.yml",
             "start_line": 1,
@@ -367,7 +367,7 @@ def run_agy(prompt: str, schema: str, model: str, workdir: str, extra_dir: str,
 
 def run_claude(prompt: str, schema: str, model: str, workdir: str, extra_dir: str,
                *, timeout_s: int | None = None, max_turns: int | None = None,
-               max_budget_usd: float | None = None) -> dict[str, Any]:
+               max_budget_usd: float | None = None, include_skills: bool = True) -> dict[str, Any]:
     """Run Claude Code read-only and return the result in agy's shape."""
     validate_model_slug(model, "claude")
     eff = _effective_timeout(timeout_s)
@@ -375,14 +375,16 @@ def run_claude(prompt: str, schema: str, model: str, workdir: str, extra_dir: st
              else (_ACTIVE_CLAUDE_TURNS if _ACTIVE_CLAUDE_TURNS is not None else CLAUDE_MAX_TURNS))
     budget = (max_budget_usd if max_budget_usd is not None
               else (_ACTIVE_CLAUDE_BUDGET_USD if _ACTIVE_CLAUDE_BUDGET_USD is not None else CLAUDE_MAX_BUDGET_USD))
+    full_prompt = prompt + CLAUDE_SKILLS_NOTE.format(d=CLAUDE_SKILLS) if include_skills else prompt
+    add_dirs = [extra_dir, str(CLAUDE_SKILLS)] if include_skills else [extra_dir]
     # --add-dir is variadic, so every fixed flag must precede it.
-    cmd = ["claude", "-p", prompt + CLAUDE_SKILLS_NOTE.format(d=CLAUDE_SKILLS), "--model", model,
+    cmd = ["claude", "-p", full_prompt, "--model", model,
            "--output-format", "json", "--json-schema", Path(schema).read_text(encoding="utf-8"),
            "--bare", "--restricted", "--strict-mcp-config",
            "--max-turns", str(turns),
            "--max-budget-usd", f"{budget:.2f}",
            "--tools", CLAUDE_TOOLS,
-           "--add-dir", extra_dir, str(CLAUDE_SKILLS)]
+           "--add-dir", *add_dirs]
     proc = subprocess.run(cmd, capture_output=True, text=True, shell=False, cwd=workdir,
                           env=_engine_env("claude"), timeout=eff)
     try:
@@ -783,12 +785,13 @@ def apply_verifier_verdicts(doc: dict[str, Any], candidates: list[dict[str, Any]
 
 
 def _select_verifier_target(verify_mode: str, winning: EngineSpec, *,
-                            agy_model: str, claude_model: str) -> tuple[str, str, str]:
+                            agy_model: str, claude_model: str,
+                            failed_engines: set[str] | frozenset[str] = frozenset()) -> tuple[str, str, str]:
     if verify_mode == "self":
         return winning.engine, winning.model, "self"
     other_engine = "claude" if winning.engine == "agy" else "agy"
     other_model = claude_model if other_engine == "claude" else agy_model
-    if can_use_engine(other_engine):
+    if other_engine not in failed_engines and can_use_engine(other_engine):
         return other_engine, other_model, "cross"
     effective = "self_fallback" if verify_mode == "cross" else "self"
     return winning.engine, winning.model, effective
@@ -832,7 +835,8 @@ def run_verifier_pass(doc: dict[str, Any], *, verify_mode: str, winning: EngineS
                       agy_model: str, claude_model: str, out_path: Path,
                       context_path: Path, workdir: str, ctx_dir: str, lib: Any,
                       usage_by_engine: dict[str, dict[str, int]],
-                      attempt_details: list[dict[str, Any]]) -> tuple[dict[str, Any], dict[str, Any], float]:
+                      attempt_details: list[dict[str, Any]],
+                      failed_engines: set[str] | frozenset[str] = frozenset()) -> tuple[dict[str, Any], dict[str, Any], float]:
     """Optionally verify new P0/P1 findings and return (doc, verifier_meta, added_cost_raw)."""
     candidates = [
         f for f in doc.get("findings", [])
@@ -855,6 +859,7 @@ def run_verifier_pass(doc: dict[str, Any], *, verify_mode: str, winning: EngineS
 
     v_engine, v_model, effective_mode = _select_verifier_target(
         verify_mode, winning, agy_model=agy_model, claude_model=claude_model,
+        failed_engines=failed_engines,
     )
     validate_model_slug(v_model, v_engine)
     v_schema = out_path.with_name("verifier.schema.json")
@@ -866,7 +871,7 @@ def run_verifier_pass(doc: dict[str, Any], *, verify_mode: str, winning: EngineS
         with _deadline_scope(cap_s=VERIFIER_TIMEOUT_S, claude_turns=VERIFIER_CLAUDE_MAX_TURNS,
                              claude_budget=VERIFIER_CLAUDE_MAX_BUDGET_USD):
             if v_engine == "claude":
-                v_res = run_claude(v_prompt, str(v_schema), v_model, workdir, ctx_dir)
+                v_res = run_claude(v_prompt, str(v_schema), v_model, workdir, ctx_dir, include_skills=False)
             else:
                 v_res = run_agy(v_prompt, str(v_schema), v_model, workdir, ctx_dir)
     except RUN_ERRORS as exc:
@@ -1177,6 +1182,9 @@ def main() -> int:
             if verify_mode != "off":
                 agy_m = next((s.model for s in chain if s.engine == "agy"), args.model)
                 claude_m = next((s.model for s in chain if s.engine == "claude"), args.claude_model)
+                failed_primary = {
+                    r["from"] for r in failover_reasons if isinstance(r, dict) and isinstance(r.get("from"), str)
+                }
                 doc, verifier_meta, v_cost = run_verifier_pass(
                     doc, verify_mode=verify_mode, winning=winning_spec,
                     agy_model=agy_m, claude_model=claude_m,
@@ -1184,6 +1192,7 @@ def main() -> int:
                     workdir=args.workdir, ctx_dir=ctx_dir, lib=lib,
                     usage_by_engine=usage_by_engine,
                     attempt_details=attempt_details,
+                    failed_engines=failed_primary,
                 )
                 total_cost_raw += v_cost
                 v_eng = verifier_meta.get("engine") if isinstance(verifier_meta, dict) else None

@@ -830,6 +830,27 @@ class DeadlineAndFlagContractTest(unittest.TestCase):
         self.assertEqual(cmd[cmd.index("--max-budget-usd") + 1], f"{rm.VERIFIER_CLAUDE_MAX_BUDGET_USD:.2f}")
         self.assertEqual(run.call_args.kwargs["timeout"], rm.VERIFIER_TIMEOUT_S)
 
+    def test_run_claude_include_skills_toggle(self):
+        import json
+        from unittest import mock
+
+        proc = mock.Mock(returncode=0, stdout=json.dumps({"is_error": False, "result": "{}"}), stderr="")
+        with mock.patch.object(rm.subprocess, "run", return_value=proc) as run, \
+                mock.patch.object(rm.Path, "read_text", return_value="{}"):
+            rm.run_claude("base-prompt", "s.json", "claude-opus-5-5", ".", "/ctx")
+            cmd_primary = run.call_args.args[0]
+            rm.run_claude("verify-prompt", "s.json", "claude-opus-5-5", ".", "/ctx", include_skills=False)
+            cmd_verify = run.call_args.args[0]
+
+        p_primary = cmd_primary[cmd_primary.index("-p") + 1]
+        self.assertIn("review/SKILL.md", p_primary)
+        self.assertIn(str(rm.CLAUDE_SKILLS), cmd_primary[cmd_primary.index("--add-dir") + 1:])
+
+        p_verify = cmd_verify[cmd_verify.index("-p") + 1]
+        self.assertEqual(p_verify, "verify-prompt")
+        self.assertNotIn("SKILL.md", p_verify)
+        self.assertEqual(cmd_verify[cmd_verify.index("--add-dir") + 1:], ["/ctx"])
+
     def test_run_agy_print_timeout_tracks_effective_timeout(self):
         import json
         from unittest import mock
@@ -1366,7 +1387,7 @@ class TriageEscalationAndCarryForwardTest(unittest.TestCase):
         self.assertEqual(len(res.findings["findings"]), 1)
         f = res.findings["findings"][0]
         self.assertEqual((f["id"], f["severity"], f["axis"], f["rule"]),
-                         ("R-998", "P2", "scope-architecture", "prg:review-budget-exceeded"))
+                         ("R-998", "P2", "scope-architecture", "PRG-GATE"))
         self.assertEqual(f["file"], ".github/pr-guardian.yml")
         self.assertTrue(res.usage["escalated"])
         self.assertIn("[REDACTED]", res.usage["escalate_reason"])
@@ -1439,6 +1460,27 @@ class TriageEscalationAndCarryForwardTest(unittest.TestCase):
         self.assertEqual(res_bad.code, 0)
         self.assertEqual(_strict_findings_validate(res_bad.findings), [])
         self.assertEqual(res_bad.findings["findings"], [])
+
+    def test_escalation_doc_prg_gate_auto_closes_and_dedupes_in_publish_plan(self):
+        import publish_review as pub
+        import state as st
+
+        doc1 = rm.escalation_doc("PR exceeded configured size limit")
+        self.assertEqual(doc1["findings"][0]["rule"], "PRG-GATE")
+        r1 = pub.plan(doc1, st.empty_state(), [], DIFF, budget_reason="PR exceeded configured size limit")
+        self.assertEqual(len(r1["actions"]["outside"]), 1)
+        self.assertEqual(r1["state"]["findings"][0]["rule"], "PRG-GATE")
+
+        # Next round still exceeding limit emits fresh PRG-GATE and auto-closes prior R-999 cleanly.
+        doc2 = rm.escalation_doc("PR exceeded configured size limit", {"reserved_ids": ["R-999"]})
+        r2 = pub.plan(doc2, r1["state"], [], DIFF, budget_reason="PR exceeded configured size limit")
+        open_gates = [f for f in r2["state"]["findings"] if f["status"] not in ("fixed", "accepted_pushback")]
+        self.assertEqual([f["id"] for f in open_gates], ["R-998"])
+
+        # Once PR shrinks and model returns empty findings, PRG-GATE auto-closes without unaccounted signal.
+        r3 = pub.plan(_valid_doc(), r2["state"], [], DIFF)
+        self.assertEqual([f["status"] for f in r3["state"]["findings"]], ["fixed", "fixed"])
+        self.assertEqual(r3["actions"]["signals"], [])
 
 
 class BlockingFindingVerifierTest(unittest.TestCase):
@@ -1684,3 +1726,61 @@ class BlockingFindingVerifierTest(unittest.TestCase):
         self.assertEqual(res_rev.code, 0)
         self.assertEqual(res_rev.findings["findings"][0]["severity"], "P1")
         self.assertTrue(res_rev.usage["verifier"]["reverted"])
+
+    def test_cross_verifier_omits_claude_skills_note_and_skips_failed_primary_engine(self):
+        import tempfile
+
+        p1 = _valid_finding("R-001", severity="P1")
+        primary = {"status": "SUCCESS", "structured_output": _valid_doc(p1),
+                   "usage": {"input_tokens": 1000, "output_tokens": 100}}
+        verdict_drop = {
+            "status": "SUCCESS",
+            "structured_output": {"verdicts": [{"id": "R-001", "verdict": "refuted", "action": "drop",
+                                                "explanation": "Guarded"}]},
+            "usage": {"input_tokens": 200, "output_tokens": 40},
+            "cost_usd": 0.05,
+        }
+
+        # 1. Cross verifier calls run_claude with include_skills=False.
+        with tempfile.TemporaryDirectory() as tmp:
+            res_cross = _run_main_cli(
+                tmp,
+                argv_extra=["--verify", "cross"],
+                env={"ANTHROPIC_API_KEY": "a-key"},
+                agy_side_effect=[primary],
+                claude_side_effect=[verdict_drop],
+            )
+        self.assertEqual(res_cross.code, 0)
+        self.assertIs(res_cross.cc.call_args.kwargs.get("include_skills"), False)
+
+        # 2. When agy fails in primary (quota_cap) and claude wins, cross/auto must NOT re-call failed agy.
+        quota = RuntimeError("agy ERROR (exit 3): spending cap exceeded")
+        for mode, expected_mode in (("cross", "self_fallback"), ("auto", "self")):
+            with tempfile.TemporaryDirectory() as tmp:
+                res = _run_main_cli(
+                    tmp,
+                    argv_extra=["--verify", mode],
+                    env={"GEMINI_API_KEY": "g-key", "ANTHROPIC_API_KEY": "a-key"},
+                    agy_side_effect=[quota],
+                    claude_side_effect=[primary, verdict_drop],
+                )
+            self.assertEqual((res.code, res.agy.call_count, res.cc.call_count), (0, 1, 2), mode)
+            self.assertEqual(res.usage["verifier"]["mode"], expected_mode, mode)
+            self.assertEqual(res.usage["verifier"]["engine"], "claude", mode)
+            self.assertEqual(res.usage["verifier"]["dropped"], ["R-001"], mode)
+            self.assertEqual(res.findings["findings"], [], mode)
+
+        # 3. Symmetric case: claude fails first -> agy wins -> cross verifier does NOT re-call failed claude.
+        cc_quota = RuntimeError("claude error (exit 1): spending cap exceeded")
+        with tempfile.TemporaryDirectory() as tmp:
+            res_sym = _run_main_cli(
+                tmp,
+                argv_extra=["--engines", "claude,agy", "--verify", "cross"],
+                env={"GEMINI_API_KEY": "g-key", "ANTHROPIC_API_KEY": "a-key"},
+                claude_side_effect=[cc_quota],
+                agy_side_effect=[primary, verdict_drop],
+            )
+        self.assertEqual((res_sym.code, res_sym.cc.call_count, res_sym.agy.call_count), (0, 1, 2))
+        self.assertEqual(res_sym.usage["verifier"]["mode"], "self_fallback")
+        self.assertEqual(res_sym.usage["verifier"]["engine"], "agy")
+        self.assertEqual(res_sym.usage["verifier"]["dropped"], ["R-001"])
