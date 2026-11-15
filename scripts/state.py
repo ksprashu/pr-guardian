@@ -29,9 +29,34 @@ _STATE_RE = re.compile(r"<!-- pr-guardian:state v1 ([A-Za-z0-9+/=]+) -->\s*\Z")
 FINDING_MARKER = "<!-- pr-guardian:finding id={id} severity={severity} -->"
 FINDING_RE = re.compile(r"<!-- pr-guardian:finding id=([A-Z][A-Z0-9]*-[0-9]{3,}) severity=(P[0-3]|nit) -->")
 ID_RE = re.compile(r"\A[A-Z][A-Z0-9]*-[0-9]{3,}\Z")
+REV_SHA_RE = re.compile(r"\A[0-9a-f]{7,64}\Z")
+GUARDIAN_REF_RE = re.compile(r"\A(?:[0-9a-f]{40})?\Z")
+ENGINE_RE = re.compile(r"\A[A-Za-z0-9._:-]{0,32}\Z")
+PREFIX_RE = re.compile(r"\A[A-Z][A-Z0-9]*\Z")
 SEVERITIES = ("P0", "P1", "P2", "P3", "nit")
+CLOSED = ("fixed", "accepted_pushback")
 MAX_STATE_BYTES = 1024 * 1024
 TRUSTED_BOT_LOGIN = "github-actions[bot]"
+
+STATE_FINDING_KEYS = (
+    "id", "prior_id", "thread_key", "posted", "severity", "status", "axis",
+    "rule", "title", "file", "start_line", "end_line", "rationale",
+    "confidence", "raised_by",
+)
+CLOSED_FINDING_KEYS = (
+    "id", "prior_id", "thread_key", "posted", "severity", "status",
+    "rule", "file", "raised_by",
+)
+CAPS = {
+    "accepted": 200,
+    "escalation_reasons": 50,
+    "reviewed_shas": 20,
+    "rounds_log": 20,
+    "publish_failures": 20,
+    "cost_usd": 50,
+    "reopen_counts": 200,
+}
+TEXT_CAPS = {"title": 300, "rationale": 1500, "rule": 120, "file": 500, "reason": 300}
 
 
 def empty_state() -> dict[str, Any]:
@@ -45,12 +70,129 @@ def empty_state() -> dict[str, Any]:
         "cost_usd": [],          # per-round estimates
         "last_reviewed_sha": "",
         "last_reviewed_base": "",  # base ref the last review ran against (GHSA-6h55-p37r-jc34)
+        "reviewed_shas": [],
+        "guardian_ref": "",
+        "engine": "",
+        "rounds_log": [],
+        "publish_incomplete": False,
+        "publish_failures": [],
+        "id_high_water": {},
     }
 
 
 def encode(state: dict[str, Any]) -> str:
     raw = zlib.compress(json.dumps(state, separators=(",", ":")).encode(), 9)
     return f"<!-- pr-guardian:state v1 {base64.b64encode(raw).decode()} -->"
+
+
+def split_state(body: str) -> tuple[str, str]:
+    """Split a comment body into `(visible_text, trailing_state_marker_or_empty)`."""
+    if not isinstance(body, str) or not body:
+        return "", ""
+    m = _STATE_RE.search(body)
+    if not m:
+        return body, ""
+    return body[:m.start()].rstrip("\n"), body[m.start():].strip()
+
+
+def _compact_finding(f: dict[str, Any], level: int) -> dict[str, Any]:
+    is_closed = f.get("status") in CLOSED
+    keys = CLOSED_FINDING_KEYS if (level >= 1 and is_closed) else STATE_FINDING_KEYS
+    out = {k: f[k] for k in keys if k in f}
+    for short_k, limit in (
+        ("title", TEXT_CAPS["title"]),
+        ("rule", TEXT_CAPS["rule"]),
+        ("file", TEXT_CAPS["file"]),
+        ("axis", 60),
+        ("confidence", 40),
+        ("status", 40),
+        ("raised_by", 32),
+        ("posted", 32),
+        ("thread_key", 64),
+    ):
+        if short_k in out and isinstance(out[short_k], str):
+            out[short_k] = out[short_k][:limit]
+    if "rationale" in out and isinstance(out["rationale"], str):
+        if level >= 2:
+            out["rationale"] = ""
+        elif level == 1:
+            out["rationale"] = out["rationale"][:300]
+        else:
+            out["rationale"] = out["rationale"][:TEXT_CAPS["rationale"]]
+    return out
+
+
+def compact_state(s: dict[str, Any], *, level: int = 0) -> dict[str, Any]:
+    """Pure, idempotent state compaction across levels 0, 1, and 2."""
+    out: dict[str, Any] = {}
+    for k, v in s.items():
+        if isinstance(v, list):
+            out[k] = [dict(x) if isinstance(x, dict) else x for x in v]
+        elif isinstance(v, dict):
+            out[k] = dict(v)
+        else:
+            out[k] = v
+
+    if isinstance(s.get("findings"), list):
+        out["findings"] = [
+            _compact_finding(f, level) if isinstance(f, dict) else f
+            for f in s["findings"]
+        ]
+
+    if isinstance(s.get("accepted"), list):
+        dedup_rev: list[dict[str, Any]] = []
+        seen: set[tuple[str, str]] = set()
+        for a in reversed(s["accepted"]):
+            if not isinstance(a, dict):
+                continue
+            file_val = (a.get("file") or "")[:TEXT_CAPS["file"]]
+            rule_val = (a.get("rule") or "")[:TEXT_CAPS["rule"]]
+            key = (file_val, rule_val)
+            if key in seen:
+                continue
+            seen.add(key)
+            dedup_rev.append({"id": a.get("id"), "file": file_val, "rule": rule_val})
+        dedup_rev.reverse()
+        out["accepted"] = dedup_rev[-CAPS["accepted"]:]
+
+    if isinstance(s.get("escalation_reasons"), list):
+        out["escalation_reasons"] = [
+            r[:1300] if isinstance(r, str) else r
+            for r in s["escalation_reasons"][-CAPS["escalation_reasons"]:]
+        ]
+
+    if isinstance(s.get("cost_usd"), list):
+        costs = list(s["cost_usd"])
+        cap = CAPS["cost_usd"]
+        if len(costs) > cap:
+            head_n = len(costs) - (cap - 1)
+            costs = [round(sum(costs[:head_n]), 4), *costs[head_n:]]
+        out["cost_usd"] = costs
+
+    if isinstance(s.get("reopen_counts"), dict):
+        rc = s["reopen_counts"]
+        if len(rc) > CAPS["reopen_counts"]:
+            top = sorted(rc.items(), key=lambda kv: (-kv[1], kv[0]))[:CAPS["reopen_counts"]]
+            out["reopen_counts"] = dict(top)
+        else:
+            out["reopen_counts"] = dict(rc)
+
+    if isinstance(s.get("reviewed_shas"), list):
+        out["reviewed_shas"] = list(s["reviewed_shas"][-CAPS["reviewed_shas"]:])
+
+    if isinstance(s.get("rounds_log"), list):
+        out["rounds_log"] = [
+            dict(e) if isinstance(e, dict) else e
+            for e in s["rounds_log"][-CAPS["rounds_log"]:]
+        ]
+
+    if isinstance(s.get("publish_failures"), list):
+        out["publish_failures"] = [
+            x[:TEXT_CAPS["reason"]] if isinstance(x, str) else x
+            for x in s["publish_failures"][-CAPS["publish_failures"]:]
+        ]
+
+    return out
 
 
 def _reject_constant(name: str) -> Any:
@@ -99,7 +241,10 @@ def _valid_finding(f: Any) -> bool:
         return False
     if "prior_id" in f and not _is_str_or_none(f["prior_id"]):
         return False
-    if any(k in f and not isinstance(f[k], str) for k in ("file", "rule")):
+    if any(k in f and not isinstance(f[k], str)
+           for k in ("file", "rule", "title", "rationale", "axis", "raised_by", "thread_key", "posted")):
+        return False
+    if "confidence" in f and not _is_str_or_none(f["confidence"]):
         return False
     return not any(k in f and not _is_int(f[k]) for k in ("start_line", "end_line"))
 
@@ -114,8 +259,20 @@ def _valid_cost(c: Any) -> bool:
             and math.isfinite(c) and c >= 0)
 
 
+def _valid_round_log(entry: Any) -> bool:
+    return (
+        isinstance(entry, dict)
+        and _is_int(entry.get("round"), 0)
+        and isinstance(entry.get("sha"), str) and len(entry["sha"]) <= 12
+        and isinstance(entry.get("engine"), str) and len(entry["engine"]) <= 32
+        and isinstance(entry.get("ref"), str) and len(entry["ref"]) <= 12
+        and _valid_cost(entry.get("cost"))
+    )
+
+
 _CHECKS = {
     "round": lambda v: _is_int(v, 0),
+    "sha_rounds": lambda v: _is_int(v, 0),
     "findings": lambda v: isinstance(v, list) and all(_valid_finding(f) for f in v),
     "accepted": lambda v: isinstance(v, list) and all(_valid_accepted(a) for a in v),
     "reopen_counts": lambda v: isinstance(v, dict) and all(
@@ -125,6 +282,16 @@ _CHECKS = {
     "cost_usd": lambda v: isinstance(v, list) and all(_valid_cost(c) for c in v),
     "last_reviewed_sha": lambda v: isinstance(v, str),
     "last_reviewed_base": lambda v: isinstance(v, str),
+    "reviewed_shas": lambda v: isinstance(v, list) and all(
+        isinstance(x, str) and bool(REV_SHA_RE.match(x)) for x in v),
+    "guardian_ref": lambda v: isinstance(v, str) and bool(GUARDIAN_REF_RE.match(v)),
+    "engine": lambda v: isinstance(v, str) and bool(ENGINE_RE.match(v)),
+    "rounds_log": lambda v: isinstance(v, list) and all(_valid_round_log(e) for e in v),
+    "publish_incomplete": lambda v: isinstance(v, bool),
+    "publish_failures": lambda v: isinstance(v, list) and all(
+        isinstance(x, str) and len(x) <= 300 for x in v),
+    "id_high_water": lambda v: isinstance(v, dict) and all(
+        isinstance(k, str) and bool(PREFIX_RE.match(k)) and _is_int(n, 0) for k, n in v.items()),
 }
 
 

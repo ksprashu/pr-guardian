@@ -2,43 +2,60 @@
 """Reconcile every owned repo to the PR-only + pr-guardian baseline.
 
 Usage:
-  governor.py [--dry-run] [--repos a,b,c] [--batch N] [--offset N] [--restack] [--report-issue]
+  governor.py [--dry-run] [--repos a,b,c] [--batch N] [--offset N] [--report-issue]
+              [--rotate-secrets] [--dependabot-secrets] [--canary a,b] [--exempt a,b]
+              [--promote] [--stats] [--allow-unmerged-ref] [--restack]
 
 Needs GH_TOKEN = a fine-grained PAT on all repos with Administration, Secrets,
-Contents, Pull requests and Workflows (read/write), and GEMINI_API_KEY in the
-environment to distribute. PRG_REF pins the reusable workflow ref the callers use
-(a 40-hex commit SHA, so the publish job can exempt the caller rollout PR from its
-workflow tripwire). PRG_VERDICT_APP_ID optionally overrides the app id the ruleset
-pins pr-guardian/verdict to (default 15368, GitHub Actions; GHSA-v7qp-pmhq-cf47).
+Contents, Pull requests and Workflows (read/write) (plus Dependabot secrets
+read/write when --dependabot-secrets is set), and GEMINI_API_KEY in the
+environment to distribute (ANTHROPIC_API_KEY is optional and distributed when
+present in the env). PRG_REF pins the reusable workflow ref the callers use
+(must be a 40-hex commit SHA on pr-guardian's default branch, so the publish job
+can exempt the caller rollout PR from its workflow tripwire).
+PRG_VERDICT_APP_ID optionally overrides the app id the ruleset pins
+pr-guardian/verdict to (default 15368, GitHub Actions; GHSA-v7qp-pmhq-cf47).
+
+Repos with topic `pr-guardian-exempt` (or in --exempt) are skipped untouched.
+Repos with topic `pr-guardian-canary` (or in --canary) prove a new PRG_REF
+before the rest of the fleet upgrades (bypass with --promote).
 
 Per repo, in this order (so no repo ever requires a check that cannot run):
   1. settings   squash-only, delete merged branches, auto-merge on
-  2. secret     GEMINI_API_KEY present (value is never compared or printed)
+  2. secret     GEMINI_API_KEY required, ANTHROPIC_API_KEY when present in the env
+                (values are never compared or printed; --dependabot-secrets also
+                provisions Dependabot secrets)
   3. caller     .github/workflows/pr-guardian.yml current on the default branch,
                 delivered through a PR, never a direct push
   4. ruleset    "main-via-pr" on the default branch, empty bypass list, only
                 once the caller is on the default branch
   5. restack    (opt-in via --restack or PRG_RESTACK_REPOS) .github/workflows/stack-restack.yml
-                delivered on a separate install branch so pr-guardian.yml rollout PRs keep
-                their single-file workflow-tripwire exemption
+                delivered idempotently on a separate install branch so pr-guardian.yml rollout
+                PRs keep their single-file workflow-tripwire exemption
 
 Empty repos (no default branch) get settings + secret only; the ruleset waits
-for the first commit. Exit 0 = no drift left, 1 = drift remains (or dry run
-found drift), 2 = errors.
+for the first commit. Exit 0 = no drift left, 1 = drift remains unresolved; empty
+and exempt repos do not count (or dry run found drift), 2 = errors or invalid config.
 """
 
 from __future__ import annotations
 
 import argparse
 import base64
+import binascii
+import dataclasses
+from datetime import datetime, timezone
 import json
 import os
 import re
 import sys
+import urllib.parse
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Sequence
 
 import gh
+import state as st
+from textsafe import inline
 
 ROOT = Path(__file__).resolve().parent.parent
 CALLER_PATH = ".github/workflows/pr-guardian.yml"
@@ -49,11 +66,98 @@ RULESET_NAME = "main-via-pr"
 VERDICT_CONTEXT = "pr-guardian/verdict"
 ACTIONS_APP_ID = 15368
 APP_ID_RE = re.compile(r"\A[1-9][0-9]*\Z")
-SECRET = "GEMINI_API_KEY"
+REF_RE = re.compile(r"\A[0-9a-f]{40}\Z")  # same grammar as publish_review.SHA_RE
+PIN_RE = re.compile(r"/\.github/workflows/review\.yml@([0-9A-Za-z._/-]{1,100})")
+SECRETS = (("GEMINI_API_KEY", True), ("ANTHROPIC_API_KEY", False))  # (name, required)
+SECRET = SECRETS[0][0]  # kept: main() and existing tests use g.SECRET
 HOME_REPO = "pr-guardian"
+STUCK_DAYS = 2
+CANARY_TOPIC = "pr-guardian-canary"
+EXEMPT_TOPIC = "pr-guardian-exempt"
+STATS_PR_CAP = 50
+REPORT_CAP = 60_000
+_TRUNC_NOTE = "\n\n_Report truncated._"
 
 SETTINGS = {"allow_squash_merge": True, "allow_merge_commit": False, "allow_rebase_merge": False,
             "delete_branch_on_merge": True, "allow_auto_merge": True}
+
+
+@dataclasses.dataclass
+class Install:
+    """What is already open for the caller rollout. Built from reads only."""
+
+    pr: dict[str, Any] | None = None
+    text: str | None = None
+    blob: str | None = None
+    caller_only: bool = False
+    current: bool = False
+    blockers: list[str] = dataclasses.field(default_factory=list)
+
+
+@dataclasses.dataclass
+class Delivery:
+    """Outcome of delivering the caller workflow to a governed repo."""
+
+    note: str
+    merged: bool
+
+
+@dataclasses.dataclass
+class Config:
+    """Run-wide reconciliation options and read cache passed into reconcile()."""
+
+    rotate: bool = False
+    dependabot: bool = False
+    restack: bool = False
+    restack_repos: frozenset[str] = frozenset()
+    canaries: frozenset[str] = frozenset()
+    held: bool = False
+    hold_reason: str = ""
+    now: datetime | None = None
+    caller_cache: dict[str, str | None] = dataclasses.field(default_factory=dict)
+
+
+def _exc(exc: Exception) -> str:
+    if isinstance(exc, gh.GhError):
+        return str(exc)[:500]
+    return f"{type(exc).__name__}: {str(exc)[:300]}"
+
+
+def _blank(full: str) -> dict[str, Any]:
+    return {
+        "repo": full,
+        "drift": [],
+        "done": [],
+        "errors": [],
+        "pending": [],
+        "waiting": [],
+        "info": [],
+        "optional": [],
+        "pinned": "",
+    }
+
+
+def _names(csv: str | None) -> set[str]:
+    return {x.strip() for x in (csv or "").split(",") if x.strip()}
+
+
+def _env_flag(name: str) -> bool:
+    return (os.environ.get(name) or "").strip().lower() == "true"
+
+
+def _cell(text: Any) -> str:
+    return inline(text)[:400].replace("|", "\\|")
+
+
+def _short_ref(ref: str) -> str:
+    if not ref:
+        return "—"
+    return ref[:7] if REF_RE.match(ref) else _cell(ref)[:20]
+
+
+def pinned_ref(text: str | None) -> str:
+    m = PIN_RE.search(text or "")
+    return m.group(1) if m else ""
 
 
 def verdict_app_id() -> int:
@@ -142,7 +246,7 @@ def render_restack_caller(ref: str) -> str:
 
 def restack_repo_names(env_raw: str | None = None) -> set[str]:
     raw = os.environ.get("PRG_RESTACK_REPOS", "") if env_raw is None else env_raw
-    return {x.strip() for x in raw.split(",") if x.strip()}
+    return _names(raw)
 
 
 # --- GitHub reads -------------------------------------------------------------
@@ -153,14 +257,40 @@ def list_repos(owner: str) -> list[dict[str, Any]]:
                   key=lambda r: r["name"])
 
 
-def file_on_branch(full: str, path: str, ref: str) -> str | None:
+def repo_topics(repo: dict[str, Any]) -> set[str]:
+    """Topics from the list payload; one GET when the payload has no topics key at all."""
+    t = repo.get("topics")
+    if "topics" not in repo:
+        resp = gh.api(f"repos/{repo['full_name']}/topics")
+        t = resp.get("names") if isinstance(resp, dict) else None
+    return {x for x in t if isinstance(x, str)} if isinstance(t, list) else set()
+
+
+def _file_with_sha(full: str, path: str, ref: str) -> tuple[str | None, str | None]:
     try:
-        data = gh.api(f"repos/{full}/contents/{path}?ref={ref}")
+        data = gh.api(f"repos/{full}/contents/{path}?ref={urllib.parse.quote(ref, safe='')}")
     except gh.GhError as exc:
         if "404" in str(exc) or "Not Found" in str(exc):
-            return None
+            return None, None
         raise
-    return base64.b64decode(data["content"]).decode("utf-8")
+    if not (isinstance(data, dict) and data.get("type") == "file"
+            and data.get("encoding") == "base64" and isinstance(data.get("content"), str)):
+        raise gh.GhError(f"{path} at {ref} is not a regular file (directory, symlink, submodule or over 1 MB)")
+    try:
+        text = base64.b64decode(data["content"]).decode("utf-8")
+    except (binascii.Error, ValueError) as exc:
+        raise gh.GhError(f"{path} at {ref} is not UTF-8 text: {exc}") from None
+    sha = data.get("sha") if isinstance(data.get("sha"), str) else None
+    return text, sha
+
+
+def file_on_branch(full: str, path: str, ref: str) -> str | None:
+    text, _ = _file_with_sha(full, path, ref)
+    return text
+
+
+def caller_blob(full: str, branch: str) -> tuple[str | None, str | None]:
+    return _file_with_sha(full, CALLER_PATH, branch)
 
 
 def find_ruleset(full: str) -> dict[str, Any] | None:
@@ -175,7 +305,7 @@ def has_branch(full: str, branch: str) -> bool:
     if not branch:
         return False
     try:
-        gh.api(f"repos/{full}/branches/{branch}")
+        gh.api(f"repos/{full}/branches/{urllib.parse.quote(branch, safe='/')}")
         return True
     except gh.GhError as exc:
         if "404" in str(exc) or "409" in str(exc):
@@ -183,63 +313,280 @@ def has_branch(full: str, branch: str) -> bool:
         raise
 
 
-def has_secret(full: str) -> bool:
-    names = json.loads(gh._run(["secret", "list", "-R", full, "--json", "name"]))
-    return any(n["name"] == SECRET for n in names)
+def secret_names(full: str, app: str = "actions") -> set[str]:
+    args = ["secret", "list", "-R", full, "--json", "name"]
+    if app != "actions":
+        args += ["--app", app]
+    data = json.loads(gh._run(args))
+    return {n["name"] for n in data if isinstance(n, dict) and isinstance(n.get("name"), str)}
 
 
-# --- reconcile ------------------------------------------------------------------
+def set_secret(full: str, name: str, value: str, app: str = "actions") -> None:
+    args = ["secret", "set", name, "-R", full]
+    if app != "actions":
+        args += ["--app", app]
+    gh._run(args, stdin=value)  # value on stdin only: never argv, never printed
 
-def _deliver_workflow(full: str, default: str, content: str, *, path: str, branch: str,
-                      title: str, pr_body: str, label: str) -> str:
-    """Open (or refresh) a single-file workflow PR and queue it to merge."""
-    head = gh.api(f"repos/{full}/git/ref/heads/{default}")["object"]["sha"]
+
+def has_secret(full: str) -> bool:  # kept for compatibility
+    return SECRET in secret_names(full)
+
+
+# --- Ref and canary gates -----------------------------------------------------
+
+def _check_ref(owner: str, ref: str) -> tuple[str | None, bool]:
+    """Return (problem, unmerged_only). unmerged_only=True iff commit exists but is not on default."""
+    home = f"{owner}/{HOME_REPO}"
     try:
-        gh.api(f"repos/{full}/git/refs", "POST", {"ref": f"refs/heads/{branch}", "sha": head})
-    except gh.GhError:
-        gh.api(f"repos/{full}/git/refs/heads/{branch}", "PATCH", {"sha": head, "force": True})
-    body = {"message": title, "branch": branch,
-            "content": base64.b64encode(content.encode()).decode()}
-    try:
-        current = gh.api(f"repos/{full}/contents/{path}?ref={branch}")
-        body["sha"] = current["sha"]
-    except gh.GhError:
-        pass
-    gh.api(f"repos/{full}/contents/{path}", "PUT", body)
+        commit = gh.api(f"repos/{home}/commits/{ref}")
+        if not (isinstance(commit, dict) and commit.get("sha") == ref):
+            return f"PRG_REF {ref[:12]} is not a commit in {home}", False
+        repo_info = gh.api(f"repos/{home}")
+        default = repo_info["default_branch"]
+        if not isinstance(default, str) or not default:
+            raise gh.GhError(f"{home} has no default_branch")
+        cmp = gh.api(f"repos/{home}/compare/{ref}...{urllib.parse.quote(default, safe='/')}")
+    except (gh.GhError, KeyError, TypeError) as exc:
+        return f"PRG_REF {ref[:12]} could not be verified in {home}: {_exc(exc)}", False
+    if not isinstance(cmp, dict) or cmp.get("status") not in ("ahead", "identical"):
+        status = cmp.get("status") if isinstance(cmp, dict) else "?"
+        return f"PRG_REF {ref[:12]} is not on {home}@{default} (compare status {status})", True
+    return None, False
 
-    prs = gh.api(f"repos/{full}/pulls?head={full.split('/')[0]}:{branch}&state=open")
+
+def verify_ref(owner: str, ref: str) -> str | None:
+    """None when ref is a commit on pr-guardian's default branch, else the problem."""
+    problem, _ = _check_ref(owner, ref)
+    return problem
+
+
+def canary_proof(repo: dict[str, Any], ref: str, want: str, cache: dict[str, str | None]) -> tuple[bool, str]:
+    """(proven, why). Proven = the canary's default branch carries the caller for `ref` and
+    the install PR that delivered it got a success verdict from GitHub Actions on its head."""
+    full, default = repo["full_name"], repo.get("default_branch") or ""
+    if not has_branch(full, default):
+        return False, "empty repo"
+    have = cache[full] = file_on_branch(full, CALLER_PATH, default)
+    if have != want:
+        return False, "caller not on the new ref yet"
+    owner = full.split("/")[0]
+    prs = gh.api(f"repos/{full}/pulls?state=closed&head={owner}:{INSTALL_BRANCH}"
+                 "&sort=updated&direction=desc&per_page=10") or []
+    merged = [p for p in prs if isinstance(p, dict) and p.get("merged_at")]
+    if not merged:
+        return False, "no merged install PR"
+    sha = merged[0]["head"]["sha"]
+    if file_on_branch(full, CALLER_PATH, sha) != want:
+        return False, f"install PR #{merged[0]['number']} delivered another ref"
+    statuses = gh.api(f"repos/{full}/commits/{sha}/statuses?per_page=100") or []
+    verdict = next((s for s in statuses if isinstance(s, dict) and s.get("context") == VERDICT_CONTEXT), None)
+    if not verdict:
+        return False, f"no {VERDICT_CONTEXT} on install PR #{merged[0]['number']}"
+    by = (verdict.get("creator") or {}).get("login")
+    # Phase 2 (#50): the verdict app's login when PRG_VERDICT_APP_ID overrides Actions.
+    if verdict.get("state") != "success" or by != "github-actions[bot]":
+        return False, f"{VERDICT_CONTEXT} is {verdict.get('state')} on install PR #{merged[0]['number']}"
+    return True, f"install PR #{merged[0]['number']} passed"
+
+
+def _safe_proof(repo: dict[str, Any], ref: str, want: str, cache: dict[str, str | None]) -> tuple[bool, str]:
+    try:
+        return canary_proof(repo, ref, want, cache)
+    except Exception as exc:  # noqa: BLE001
+        return False, _exc(exc)
+
+
+def canary_gate(repos: list[dict[str, Any]], canaries: set[str] | frozenset[str],
+                ref: str, want: str, promote: bool, cache: dict[str, str | None]) -> tuple[bool, str]:
+    """(held, reason). held=True keeps the caller off non-canary repos this run."""
+    ring = [r for r in repos if r["name"] in canaries]
+    if not ring:
+        return False, "no canary ring"
+    if promote:
+        return False, "promoted explicitly"
+    proofs = {r["name"]: _safe_proof(r, ref, want, cache) for r in ring}
+    if all(ok for ok, _ in proofs.values()):
+        return False, f"canary ring proven ({len(ring)}/{len(ring)})"
+    for r in repos:  # an earlier promotion leaves this trace so new repos are not held
+        if r["name"] in canaries:
+            continue
+        full, default = r["full_name"], r.get("default_branch") or ""
+        if full not in cache:
+            try:
+                cache[full] = file_on_branch(full, CALLER_PATH, default) if default else None
+            except Exception:  # noqa: BLE001
+                continue  # leave uncached: reconcile() reads it again and records the error
+        if cache[full] == want:
+            return False, f"ref already promoted (seen on {r['name']})"
+    waiting = "; ".join(f"{n}: {why}" for n, (ok, why) in sorted(proofs.items()) if not ok)
+    return True, f"waiting on {waiting}"[:300]
+
+
+# --- Install PR inspection & delivery -----------------------------------------
+
+def classic_protection(full: str, default: str) -> list[str]:
+    """Classic branch protection that can block the install PR. [] when there is none."""
+    try:
+        p = gh.api(f"repos/{full}/branches/{urllib.parse.quote(default, safe='/')}/protection")
+    except gh.GhError as exc:
+        if "404" in str(exc) or "not protected" in str(exc).lower():
+            return []
+        return [f"classic branch protection on {default} could not be read"]
+    if not isinstance(p, dict):
+        return []
+    out = []
+    n = (p.get("required_pull_request_reviews") or {}).get("required_approving_review_count") or 0
+    if n:
+        out.append(f"classic protection on {default} requires {n} approving review(s); "
+                   "approve the install PR or move the branch to the ruleset")
+    rsc = p.get("required_status_checks") or {}
+    checks = rsc.get("contexts") or []
+    if not checks and isinstance(rsc.get("checks"), list):
+        checks = [c.get("context") for c in rsc["checks"] if isinstance(c, dict)]
+    other = [c for c in checks if isinstance(c, str) and c != VERDICT_CONTEXT]
+    if other:
+        out.append(f"classic protection on {default} requires checks: {', '.join(sorted(other))[:200]}")
+    if (p.get("restrictions") or None) is not None:
+        out.append(f"classic protection on {default} restricts who can push")
+    return out
+
+
+def _open_install_prs(full: str, default: str, *, branch: str = INSTALL_BRANCH) -> list[dict[str, Any]]:
+    owner = full.split("/")[0]
+    prs = gh.api(f"repos/{full}/pulls?head={owner}:{branch}&state=open&per_page=10") or []
+    return [
+        p for p in prs
+        if isinstance(p, dict)
+        and (p.get("base") or {}).get("ref") == default
+        and (p.get("head") or {}).get("ref") == branch
+        and ((p.get("head") or {}).get("repo") or {}).get("full_name") == full
+    ]
+
+
+def inspect_install(full: str, default: str, content: str, now: datetime | None = None,
+                    *, path: str = CALLER_PATH, branch: str = INSTALL_BRANCH,
+                    pr_label: str = "install") -> Install:
+    """Inspect any open workflow rollout PR and blocking protections. Reads only."""
+    matches = _open_install_prs(full, default, branch=branch)
+    if not matches:
+        return Install()
+    n = matches[0]["number"]
+    detail = gh.api(f"repos/{full}/pulls/{n}")
+    if not isinstance(detail, dict):
+        raise gh.GhError(f"pulls/{n}: expected object, got {type(detail).__name__}")
+    caller_only = False
+    if detail.get("changed_files") == 1:
+        files = gh.pr_files(full, n)
+        caller_only = [f["filename"] for f in files] == [path] and not files[0].get("previous_filename")
+    text, blob = caller_blob(full, branch) if path == CALLER_PATH else _file_with_sha(full, path, branch)
+    current = text == content and caller_only
+    blockers: list[str] = []
+    ref_now = now or datetime.now(timezone.utc)
+    if ref_now.tzinfo is None:
+        ref_now = ref_now.replace(tzinfo=timezone.utc)
+    created_raw = detail.get("created_at")
+    if isinstance(created_raw, str) and created_raw:
+        created_at = datetime.fromisoformat(created_raw.replace("Z", "+00:00"))
+        if created_at.tzinfo is None:
+            created_at = created_at.replace(tzinfo=timezone.utc)
+        age = (ref_now - created_at).days
+        if age >= STUCK_DAYS:
+            state = detail.get("mergeable_state") or "unknown"
+            blockers.append(f"{pr_label} PR #{n} open {age}d, merge state {state}")
+    blockers.extend(classic_protection(full, default))
+    return Install(pr=detail, text=text, blob=blob, caller_only=caller_only,
+                   current=current, blockers=blockers)
+
+
+def inspect_restack_install(full: str, default: str, content: str, now: datetime | None = None) -> Install:
+    """Inspect any open opt-in stack-restack rollout PR. Reads only."""
+    return inspect_install(
+        full, default, content, now=now,
+        path=RESTACK_CALLER_PATH, branch=RESTACK_INSTALL_BRANCH, pr_label="restack install",
+    )
+
+
+def _merge_install_pr(full: str, number: int, head: str, *, label: str = "caller") -> Delivery:
+    match = ["--match-head-commit", head]
+    try:
+        gh._run(["pr", "merge", str(number), "-R", full, "--squash", "--auto", *match])
+        return Delivery(f"{label} PR #{number} queued for auto-merge", merged=False)
+    except gh.GhError:
+        # No ruleset yet means nothing to wait for; auto-merge refuses, so merge now.
+        gh._run(["pr", "merge", str(number), "-R", full, "--squash", "--delete-branch", *match])
+        return Delivery(f"{label} PR #{number} merged", merged=True)
+
+
+def _put_workflow(full: str, content: str, blob: str | None, *,
+                  path: str, branch: str, message: str) -> str:
+    body: dict[str, Any] = {
+        "message": message,
+        "branch": branch,
+        "content": base64.b64encode(content.encode()).decode(),
+    }
+    if blob:
+        body["sha"] = blob
+    put = gh.api(f"repos/{full}/contents/{path}", "PUT", body)
+    return put["commit"]["sha"]
+
+
+def _put_caller(full: str, content: str, blob: str | None) -> str:
+    return _put_workflow(
+        full, content, blob,
+        path=CALLER_PATH, branch=INSTALL_BRANCH, message="ci: install pr-guardian review gate",
+    )
+
+
+def _deliver_workflow(full: str, default: str, content: str, inst: Install | None = None, *,
+                      path: str, branch: str, title: str, pr_body: str,
+                      label: str, pr_label: str) -> Delivery:
+    """Idempotently update/open a single-file workflow rollout PR and queue or merge it."""
+    inst = inst or inspect_install(full, default, content, path=path, branch=branch, pr_label=pr_label)
+    if inst.pr and inst.current and inst.pr.get("auto_merge"):
+        return Delivery(f"{label} PR #{inst.pr['number']} waiting (auto-merge queued)", merged=False)
+    if inst.pr and inst.current:
+        return _merge_install_pr(full, inst.pr["number"], inst.pr["head"]["sha"], label=label)
+    if inst.pr and inst.caller_only:
+        head = _put_workflow(full, content, inst.blob, path=path, branch=branch, message=title)
+        return _merge_install_pr(full, inst.pr["number"], head, label=label)
+
+    base_sha = gh.api(f"repos/{full}/git/ref/heads/{urllib.parse.quote(default, safe='/')}")["object"]["sha"]
+    try:
+        gh.api(f"repos/{full}/git/refs", "POST", {"ref": f"refs/heads/{branch}", "sha": base_sha})
+    except gh.GhError:
+        gh.api(f"repos/{full}/git/refs/heads/{branch}", "PATCH", {"sha": base_sha, "force": True})
+    _, blob = caller_blob(full, branch) if path == CALLER_PATH else _file_with_sha(full, path, branch)
+    head = _put_workflow(full, content, blob, path=path, branch=branch, message=title)
+
+    # A force-reset closes any foreign-content PR on GitHub; re-check before opening.
+    prs = _open_install_prs(full, default, branch=branch) if inst.pr else []
     if prs:
         number = prs[0]["number"]
     else:
         number = gh.api(f"repos/{full}/pulls", "POST", {
             "title": title, "head": branch, "base": default, "body": pr_body})["number"]
-    try:
-        gh._run(["pr", "merge", str(number), "-R", full, "--squash", "--auto"])
-        return f"{label} PR #{number} queued for auto-merge"
-    except gh.GhError:
-        # No ruleset yet means nothing to wait for; auto-merge refuses, so merge now.
-        gh._run(["pr", "merge", str(number), "-R", full, "--squash", "--delete-branch"])
-        return f"{label} PR #{number} merged"
+    return _merge_install_pr(full, number, head, label=label)
 
 
-def deliver_caller(full: str, default: str, content: str) -> str:
-    """Open (or refresh) the install PR and queue it to merge. Returns a status note."""
+def deliver_caller(full: str, default: str, content: str, inst: Install | None = None) -> Delivery:
+    """Idempotently update/open the install PR and queue or complete its merge."""
     return _deliver_workflow(
-        full, default, content,
+        full, default, content, inst,
         path=CALLER_PATH,
         branch=INSTALL_BRANCH,
         title="ci: install pr-guardian review gate",
-        pr_body=(f"Adds the caller for the pr-guardian reusable review workflow. Every PR to "
+        pr_body=("Adds the caller for the pr-guardian reusable review workflow. Every PR to "
                  f"`{default}` gets an automated code and security review, and the "
                  f"`{VERDICT_CONTEXT}` status gates merging.\n\nOpened by the pr-guardian governor."),
         label="caller",
+        pr_label="install",
     )
 
 
-def deliver_restack_caller(full: str, default: str, content: str) -> str:
-    """Open (or refresh) the opt-in stack-restack caller PR on its own branch."""
+def deliver_restack_caller(full: str, default: str, content: str, inst: Install | None = None) -> Delivery:
+    """Idempotently update/open the opt-in stack-restack PR on its own branch."""
     return _deliver_workflow(
-        full, default, content,
+        full, default, content, inst,
         path=RESTACK_CALLER_PATH,
         branch=RESTACK_INSTALL_BRANCH,
         title="ci: install pr-guardian stack-restack workflow",
@@ -250,47 +597,46 @@ def deliver_restack_caller(full: str, default: str, content: str) -> str:
                  "the owner's `human-override` label once to approve merging.\n\n"
                  "Opened by the pr-guardian governor."),
         label="restack caller",
+        pr_label="restack install",
     )
 
 
-def reconcile(repo: dict[str, Any], ref: str, dry: bool, have_key: bool,
-              *, restack: bool = False) -> dict[str, Any]:
-    full, default = repo["full_name"], repo.get("default_branch") or ""
-    out: dict[str, Any] = {"repo": full, "drift": [], "done": [], "errors": []}
+# --- reconcile ----------------------------------------------------------------
 
-    def step(name: str, drift: list[str], fix) -> None:
-        out["drift"] += drift
-        if drift and not dry:
-            try:
-                note = fix()
-                out["done"].append(note or name)
-            except gh.GhError as exc:
-                out["errors"].append(f"{name}: {exc}")
-
-    step("settings", settings_drift(gh.api(f"repos/{full}")),
-         lambda: gh.api(f"repos/{full}", "PATCH", SETTINGS) and "settings applied")
-
-    if have_key:
-        missing = [] if has_secret(full) else ["secret missing"]
-        step("secret", missing,
-             lambda: gh._run(["secret", "set", SECRET, "-R", full], stdin=os.environ[SECRET]) and "secret set")
-    else:
+def _reconcile_secrets(full: str, dry: bool, have_key: bool, cfg: Config,
+                       out: dict[str, Any], step: Callable[..., Any]) -> None:
+    if not have_key:
         out["errors"].append(f"{SECRET} not in governor env; secret step skipped")
+        return
+    apps = ("actions", "dependabot") if cfg.dependabot else ("actions",)
+    for app in apps:
+        prefix = "" if app == "actions" else f"{app} "
+        try:
+            names = secret_names(full, app)
+        except Exception as exc:  # noqa: BLE001
+            out["errors"].append(f"{prefix}secret list: {_exc(exc)}")
+            continue
+        for name, required in SECRETS:
+            value = os.environ.get(name) or ""
+            label = f"{prefix}secret {name}"
+            if not value:
+                if not required and app == "actions" and name not in names:
+                    out["optional"].append(name)
+                continue
+            if name not in names:
+                step(label, [f"{label} missing"],
+                     lambda n=name, v=value, a=app, lab=label: set_secret(full, n, v, a) or f"{lab} set")
+            elif cfg.rotate and dry:
+                out["info"].append(f"would rotate {label}")
+            elif cfg.rotate:
+                try:
+                    set_secret(full, name, value, app)
+                    out["done"].append(f"{label} rotated")
+                except Exception as exc:  # noqa: BLE001
+                    out["errors"].append(f"{label}: {_exc(exc)}")
 
-    empty = repo.get("size", 0) == 0 or not has_branch(full, default)
-    if empty or not default:
-        out["drift"].append("empty repo: caller and ruleset wait for the first commit")
-        return out
 
-    want = render_caller(ref)
-    have = file_on_branch(full, CALLER_PATH, default)
-    caller_drift = [] if have == want else ["caller missing" if have is None else "caller stale"]
-    step("caller", caller_drift, lambda: deliver_caller(full, default, want))
-    caller_live = have is not None or any(d.startswith("caller ") and "merged" in d for d in out["done"])
-
-    if not caller_live:
-        out["drift"].append("ruleset deferred until the caller is on the default branch")
-        return out
+def _reconcile_ruleset(full: str, step: Callable[..., Any]) -> None:
     existing = find_ruleset(full)
 
     def fix_ruleset() -> str:
@@ -302,25 +648,243 @@ def reconcile(repo: dict[str, Any], ref: str, dry: bool, have_key: bool,
 
     step("ruleset", ruleset_drift(existing), fix_ruleset)
 
-    if restack:
+
+def reconcile(repo: dict[str, Any], ref: str, dry: bool, have_key: bool,
+              cfg: Config | None = None, *, restack: bool = False) -> dict[str, Any]:
+    cfg = cfg or Config()
+    full, default = repo["full_name"], repo.get("default_branch") or ""
+    repo_name = repo.get("name") or full.split("/", 1)[-1]
+    out = _blank(full)
+
+    def step(name: str, drift: list[str], fix: Callable[[], Any]) -> Any:
+        """Record drift; in apply mode run fix(). fix() returns a note, or (note, resolved)."""
+        out["drift"] += drift
+        if not drift:
+            return None
+        if dry:
+            out["pending"] += drift
+            return None
+        try:
+            res = fix()
+        except Exception as exc:  # noqa: BLE001  (#28: TimeoutExpired, KeyError, JSON errors)
+            out["errors"].append(f"{name}: {_exc(exc)}")
+            out["pending"] += drift
+            return None
+        note, resolved = res if isinstance(res, tuple) else (res, True)
+        out["done"].append(note or name)
+        if not resolved:
+            out["pending"] += drift
+        return res
+
+    step("settings", settings_drift(gh.api(f"repos/{full}")),
+         lambda: gh.api(f"repos/{full}", "PATCH", SETTINGS) and "settings applied")
+
+    _reconcile_secrets(full, dry, have_key, cfg, out, step)
+
+    if not has_branch(full, default):  # has_branch("") is already False
+        out["waiting"].append("empty repo: caller and ruleset wait for the first commit")
+        return out
+
+    want = render_caller(ref)
+    have = cfg.caller_cache[full] if full in cfg.caller_cache else file_on_branch(full, CALLER_PATH, default)
+    out["pinned"] = pinned_ref(have)
+    caller_drift = [] if have == want else ["caller missing" if have is None else "caller stale"]
+    merged = False
+    if caller_drift and cfg.held and repo["name"] not in cfg.canaries:
+        out["drift"] += caller_drift
+        out["pending"] += [f"{caller_drift[0]}: held for the canary ring ({cfg.hold_reason})"]
+    elif caller_drift:
+        try:
+            inst = inspect_install(full, default, want, now=cfg.now)
+        except Exception as exc:  # noqa: BLE001
+            out["drift"] += caller_drift
+            out["pending"] += caller_drift
+            out["errors"].append(f"caller: {_exc(exc)}")
+        else:
+            res = step("caller", caller_drift,
+                       lambda: (lambda d: (d.note, d.merged))(deliver_caller(full, default, want, inst)))
+            merged = bool(res and res[1])
+            if not merged:
+                out["pending"] += inst.blockers
+
+    caller_live = have is not None or merged
+    if not caller_live:
+        msg = "ruleset deferred until the caller is on the default branch"
+        out["drift"].append(msg)
+        out["pending"].append(msg)
+        return out
+
+    _reconcile_ruleset(full, step)
+
+    if restack or cfg.restack or repo_name in cfg.restack_repos:
         want_restack = render_restack_caller(ref)
         have_restack = file_on_branch(full, RESTACK_CALLER_PATH, default)
         restack_drift = ([] if have_restack == want_restack
                          else ["restack caller missing" if have_restack is None else "restack caller stale"])
-        step("restack", restack_drift, lambda: deliver_restack_caller(full, default, want_restack))
+        if restack_drift and cfg.held and repo_name not in cfg.canaries:
+            out["drift"] += restack_drift
+            out["pending"] += [f"{restack_drift[0]}: held for the canary ring ({cfg.hold_reason})"]
+        elif restack_drift:
+            try:
+                r_inst = inspect_restack_install(full, default, want_restack, now=cfg.now)
+            except Exception as exc:  # noqa: BLE001
+                out["drift"] += restack_drift
+                out["pending"] += restack_drift
+                out["errors"].append(f"restack: {_exc(exc)}")
+            else:
+                r_res = step(
+                    "restack",
+                    restack_drift,
+                    lambda: (lambda d: (d.note, d.merged))(
+                        deliver_restack_caller(full, default, want_restack, r_inst)
+                    ),
+                )
+                r_merged = bool(r_res and r_res[1])
+                if not r_merged:
+                    out["pending"] += r_inst.blockers
 
     return out
 
 
-def report(results: list[dict[str, Any]], dry: bool) -> str:
-    rows = ["| repo | drift | done | errors |", "|---|---|---|---|"]
+# --- Fleet stats & reporting --------------------------------------------------
+
+def _repo_stats(full: str) -> tuple[int, int, int, int, float, int, int]:
+    prs = (gh.api(f"repos/{full}/pulls?state=open&per_page=100", paginate=True) or [])[:STATS_PR_CAP]
+    if not prs:
+        return (0, 0, 0, 0, 0.0, 0, 0)
+    reviewed = rounds_sum = rounds_max = needs_human = open_blocking = 0
+    cost = 0.0
+    for pr in prs:
+        labels = pr.get("labels") or []
+        if any(isinstance(lb, dict) and lb.get("name") == "needs-human" for lb in labels):
+            needs_human += 1
+        comments = gh.api(f"repos/{full}/issues/{pr['number']}/comments?per_page=100", paginate=True) or []
+        summary = st.find_summary_comment(comments)
+        decoded = st.decode(summary["body"]) if summary else None
+        if not decoded:
+            continue
+        reviewed += 1
+        rnd = decoded.get("round")
+        if isinstance(rnd, int) and not isinstance(rnd, bool):
+            rounds_sum += rnd
+            rounds_max = max(rounds_max, rnd)
+        for c in decoded.get("cost_usd") or []:
+            if isinstance(c, (int, float)) and not isinstance(c, bool):
+                cost += float(c)
+        for f in decoded.get("findings") or []:
+            if isinstance(f, dict) and f.get("severity") != "nit" and f.get("status") not in ("fixed", "accepted_pushback"):
+                open_blocking += 1
+    return (len(prs), reviewed, rounds_sum, rounds_max, cost, needs_human, open_blocking)
+
+
+def fleet_stats(results_repos: list[dict[str, Any]]) -> str:
+    """Markdown section: open PRs with pr-guardian state, per repo. Reads only."""
+    eligible = [r["repo"] for r in results_repos if not r.get("errors") and r.get("pinned")]
+    if not eligible:
+        return "## Fleet stats\n\nNo repos with callers."
+    rows: list[str] = []
+    tot_open = tot_rev = tot_rounds = tot_max = tot_human = tot_blocking = zero_open = 0
+    tot_cost = 0.0
+    for full in eligible:
+        try:
+            open_n, rev, r_sum, r_max, cost, human, blocking = _repo_stats(full)
+        except Exception as exc:  # noqa: BLE001
+            rows.append(f"| {_cell(full)} | {_cell(f'stats unavailable: {_exc(exc)}')} | — | — | — | — | — |")
+            continue
+        if open_n == 0:
+            zero_open += 1
+            continue
+        tot_open += open_n
+        tot_rev += rev
+        tot_rounds += r_sum
+        tot_max = max(tot_max, r_max)
+        tot_cost += cost
+        tot_human += human
+        tot_blocking += blocking
+        rows.append(f"| {_cell(full)} | {open_n} | {rev} | {r_sum} ({r_max}) | {cost:.2f} | {human} | {blocking} |")
+
+    parts = ["## Fleet stats"]
+    if rows:
+        header = [
+            "| repo | open PRs | reviewed | rounds (max) | cost $ | needs-human | open blocking |",
+            "|---|---|---|---|---|---|---|",
+        ]
+        total_row = (f"| **Total** | {tot_open} | {tot_rev} | {tot_rounds} ({tot_max}) "
+                     f"| {tot_cost:.2f} | {tot_human} | {tot_blocking} |")
+        parts.append("\n".join(header + rows + [total_row]))
+    if zero_open:
+        parts.append(f"{zero_open} repo{'s' if zero_open != 1 else ''} with no open PRs.")
+    return "\n\n".join(parts)
+
+
+def report(results: list[dict[str, Any]], dry: bool, *, ref: str = "",
+           ref_problem: str | None = None, gate: str = "",
+           exempt: Sequence[str] = (), stats: str = "") -> str:
+    waiting_repos = [r["repo"] for r in results if r.get("waiting")]
+    clean = sum(1 for r in results
+                if not r["drift"] and not r["pending"] and not r["errors"] and not r.get("waiting"))
+    pending_n = sum(1 for r in results if r["pending"])
+    err_n = sum(1 for r in results if r["errors"])
+    total = len(results) + len(exempt)
+
+    head_bits = [
+        f"{total} repos",
+        f"{clean} clean",
+        f"{pending_n} pending",
+        f"{err_n} error{'s' if err_n != 1 else ''}",
+    ]
+    if waiting_repos:
+        head_bits.append(f"{len(waiting_repos)} waiting")
+    if exempt:
+        head_bits.append(f"{len(exempt)} exempt")
+    if ref:
+        head_bits.append(f"ref `{_short_ref(ref)}`")
+    if gate:
+        head_bits.append(f"canary: {inline(gate)[:400]}")
+
+    sections = [f"**{'Dry run' if dry else 'Run'}**: {' · '.join(head_bits)}"]
+    if ref_problem:
+        sections.append(f"> ⚠️ {inline(ref_problem)[:400]}")
+
+    rows = ["| repo | pinned | drift | done | pending | errors |", "|---|---|---|---|---|---|"]
     for r in results:
-        if r["drift"] or r["errors"]:
-            rows.append(f"| {r['repo']} | {'; '.join(r['drift']) or '—'} | "
-                        f"{'; '.join(r['done']) or '—'} | {'; '.join(r['errors']) or '—'} |")
-    clean = sum(1 for r in results if not r["drift"] and not r["errors"])
-    head = f"**{'Dry run' if dry else 'Run'}**: {len(results)} repos, {clean} clean.\n\n"
-    return head + ("\n".join(rows) if len(rows) > 2 else "No drift.")
+        done_items = list(r["done"])
+        for info in r.get("info") or ():
+            done_items.append(f"(dry run) {info}" if dry else info)
+        if r["drift"] or r["pending"] or r["errors"] or r.get("info"):
+            pin = f"`{_short_ref(r.get('pinned') or '')}`" if r.get("pinned") else "—"
+            rows.append(
+                f"| {_cell(r['repo'])} | {pin} | {_cell('; '.join(r['drift'])) or '—'} | "
+                f"{_cell('; '.join(done_items)) or '—'} | {_cell('; '.join(r['pending'])) or '—'} | "
+                f"{_cell('; '.join(r['errors'])) or '—'} |"
+            )
+    sections.append("\n".join(rows) if len(rows) > 2 else "No drift.")
+
+    if waiting_repos:
+        sections.append(f"<details><summary>Waiting for a first commit ({len(waiting_repos)})</summary>\n\n"
+                        f"{', '.join(_cell(x) for x in waiting_repos)}\n\n</details>")
+    if exempt:
+        sections.append(f"<details><summary>Exempt ({EXEMPT_TOPIC}) ({len(exempt)})</summary>\n\n"
+                        f"{', '.join(_cell(x) for x in exempt)}\n\n</details>")
+
+    for name, _ in SECRETS:
+        missing_on = [r["repo"] for r in results if name in (r.get("optional") or ())]
+        if missing_on:
+            shown = [_cell(x) for x in missing_on[:10]]
+            more = len(missing_on) - len(shown)
+            tail = f", ... (+{more} more)" if more else ""
+            sections.append(f"Optional secret `{name}` is not in the governor env and is missing on "
+                            f"{len(missing_on)} repo{'s' if len(missing_on) != 1 else ''}: {', '.join(shown)}{tail}")
+
+    if stats:
+        sections.append(stats)
+
+    text = "\n\n".join(sections)
+    if len(text) > REPORT_CAP:
+        limit = REPORT_CAP - len(_TRUNC_NOTE)
+        cut = text.rfind("\n", 0, limit + 1)
+        text = (text[:cut] if cut > 0 else text[:limit]) + _TRUNC_NOTE
+    return text
 
 
 def main() -> int:
@@ -329,9 +893,16 @@ def main() -> int:
     ap.add_argument("--repos", help="comma-separated repo names (default: all owned)")
     ap.add_argument("--batch", type=int, default=0)
     ap.add_argument("--offset", type=int, default=0)
-    ap.add_argument("--restack", action="store_true",
-                    help="also reconcile optional stack-restack caller on selected repos")
     ap.add_argument("--report-issue", action="store_true")
+    ap.add_argument("--rotate-secrets", action="store_true", default=_env_flag("PRG_ROTATE_SECRETS"))
+    ap.add_argument("--dependabot-secrets", action="store_true", default=_env_flag("PRG_DEPENDABOT_SECRETS"))
+    ap.add_argument("--canary", default=os.environ.get("PRG_CANARY", ""))
+    ap.add_argument("--exempt", default=os.environ.get("PRG_EXEMPT", ""))
+    ap.add_argument("--promote", action="store_true", default=_env_flag("PRG_PROMOTE"))
+    ap.add_argument("--stats", action="store_true", default=_env_flag("PRG_STATS"))
+    ap.add_argument("--allow-unmerged-ref", action="store_true", default=_env_flag("PRG_ALLOW_UNMERGED_REF"))
+    ap.add_argument("--restack", action="store_true", default=_env_flag("PRG_RESTACK"),
+                    help="also reconcile opt-in stack-restack caller on selected repos")
     args = ap.parse_args()
 
     try:  # once, before any repo is touched: a bad id must not half-apply a ruleset
@@ -340,34 +911,100 @@ def main() -> int:
         print(f"::error::{exc}", file=sys.stderr)
         return 2
 
-    owner = os.environ.get("PRG_OWNER") or gh.api("user")["login"]
-    ref = os.environ.get("PRG_REF", "v1")
-    restack_repos = restack_repo_names()
-    repos = list_repos(owner)
-    if args.repos:
-        wanted = set(args.repos.split(","))
-        repos = [r for r in repos if r["name"] in wanted]
-    repos = repos[args.offset:]
-    if args.batch:
-        repos = repos[:args.batch]
+    ref = (os.environ.get("PRG_REF") or "v1").strip()
+    ref_problem = None if REF_RE.match(ref) else (
+        f"PRG_REF={ref[:60]!r} is not a 40-hex commit SHA; callers pinned to a tag or branch are "
+        "never exempt from the workflow tripwire, so every rollout PR would need human-override")
+    if ref_problem and not args.dry_run:
+        print(f"::error::{ref_problem}", file=sys.stderr)
+        return 2
+    if ref_problem:
+        print(f"::warning::{ref_problem} (dry run: continuing)", file=sys.stderr)
 
+    owner = os.environ.get("PRG_OWNER") or gh.api("user")["login"]
+    if not ref_problem:
+        verify_problem, unmerged = _check_ref(owner, ref)
+        if verify_problem:
+            if not args.dry_run and not (unmerged and args.allow_unmerged_ref):
+                print(f"::error::{verify_problem}", file=sys.stderr)
+                return 2
+            ref_problem = verify_problem
+            why = "dry run" if args.dry_run else "--allow-unmerged-ref"
+            print(f"::warning::{verify_problem} ({why}: continuing)", file=sys.stderr)
+
+    repos = list_repos(owner)
+    fleet_names = {r["name"] for r in repos}
+    want_exempt, want_canary = _names(args.exempt), _names(args.canary)
+    unknown = sorted((want_exempt | want_canary) - fleet_names)
+    if unknown:
+        print(f"::error::unknown repo(s) in --canary/--exempt: {', '.join(unknown)}", file=sys.stderr)
+        return 2
+    want_restack_repos = restack_repo_names()
+    unknown_restack = sorted(want_restack_repos - fleet_names)
+    if unknown_restack:
+        print(f"::error::unknown repo(s) in PRG_RESTACK_REPOS: {', '.join(unknown_restack)}", file=sys.stderr)
+        return 2
+    try:
+        topics_by_name = {r["name"]: repo_topics(r) for r in repos}
+    except gh.GhError as exc:
+        print(f"::error::could not read repository topics: {_exc(exc)}", file=sys.stderr)
+        return 2
+    exempt = {name for name, t in topics_by_name.items() if EXEMPT_TOPIC in t} | want_exempt
+    canaries = {name for name, t in topics_by_name.items() if CANARY_TOPIC in t} | want_canary
+    overlap = sorted(exempt & canaries)
+    if overlap:
+        print(f"::error::repo(s) cannot be both canary and exempt: {', '.join(overlap)}", file=sys.stderr)
+        return 2
+
+    exempt_repos = [r["full_name"] for r in repos if r["name"] in exempt]
+    fleet = [r for r in repos if r["name"] not in exempt]
+    want = render_caller(ref)
+    cache: dict[str, str | None] = {}
+    held, gate = canary_gate(fleet, canaries, ref, want, args.promote, cache)
+
+    target = fleet
+    if args.repos:
+        wanted = _names(args.repos)
+        target = [r for r in target if r["name"] in wanted]
+    target = target[args.offset:]
+    if args.batch:
+        target = target[:args.batch]
+
+    cfg = Config(
+        rotate=args.rotate_secrets,
+        dependabot=args.dependabot_secrets,
+        restack=args.restack,
+        restack_repos=frozenset(want_restack_repos),
+        canaries=frozenset(canaries),
+        held=held,
+        hold_reason=gate if held else "",
+        caller_cache=cache,
+    )
     have_key = bool(os.environ.get(SECRET))
     results = []
-    for repo in repos:
-        use_restack = args.restack or repo["name"] in restack_repos
+    for repo in target:
         try:
-            results.append(reconcile(repo, ref, args.dry_run, have_key, restack=use_restack))
-        except gh.GhError as exc:
-            results.append({"repo": repo["full_name"], "drift": [], "done": [], "errors": [str(exc)]})
+            results.append(reconcile(repo, ref, args.dry_run, have_key, cfg))
+        except Exception as exc:  # noqa: BLE001
+            r = _blank(repo["full_name"])
+            r["errors"].append(_exc(exc))
+            results.append(r)
         r = results[-1]
         print(f"{r['repo']}: drift={len(r['drift'])} done={r['done']} errors={len(r['errors'])}", file=sys.stderr)
 
-    text = report(results, args.dry_run)
+    stats = fleet_stats(results) if args.stats else ""
+    text = report(results, args.dry_run, ref=ref, ref_problem=ref_problem,
+                  gate=gate, exempt=exempt_repos, stats=stats)
     print(text)
     summary = os.environ.get("GITHUB_STEP_SUMMARY")
     if summary:
         Path(summary).write_text(text + "\n", encoding="utf-8")
-    if args.report_issue:
+
+    partial = bool(args.repos or args.batch or args.offset)
+    if args.report_issue and (args.dry_run or partial):
+        why = "dry run" if args.dry_run else "partial run (--repos/--batch/--offset)"
+        print(f"::notice::drift report issue not updated: {why}", file=sys.stderr)
+    elif args.report_issue:
         title = "Governor drift report"
         # The workflow token writes the report, so GOVERNOR_TOKEN needs no Issues access.
         token = os.environ.get("REPORT_TOKEN") or None
@@ -387,8 +1024,7 @@ def main() -> int:
 
     if any(r["errors"] for r in results):
         return 2
-    remaining = [r for r in results if r["drift"] and (args.dry_run or not r["done"])]
-    return 1 if remaining else 0
+    return 1 if any(r["pending"] for r in results) else 0
 
 
 if __name__ == "__main__":

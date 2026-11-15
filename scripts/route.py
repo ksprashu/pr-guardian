@@ -2,7 +2,8 @@
 """Decide what a pr-guardian run should do for the triggering event.
 
 Reads GITHUB_EVENT_NAME / GITHUB_EVENT_PATH and writes `action`, `pr`,
-`head_sha`, `escalate`, `reason` and `bind_override` to GITHUB_OUTPUT (or stdout).
+`head_sha`, `escalate`, `reason`, `bind_override` and `mode` to GITHUB_OUTPUT
+(or stdout).
 
 action:
   review   full scan + model review + publish + verdict
@@ -21,6 +22,16 @@ the new base (GHSA-6h55-p37r-jc34). Title and body edits are skipped.
 bind_override is "true" only for a `human-override` label the owner (a User,
 not a Bot) just applied: verdict.py then records which head SHA and base ref
 that application covers (GHSA-q4j9-99qr-cfhw).
+
+mode is set only for `review`: `wontfix_only` for a writer's pushback inside a
+finding thread (scanners can be skipped), `full` otherwise.
+
+Comment commands are parsed by commands.py, only after the commenter is
+authorised. No command text ever reaches an output: `reason` is one of the
+fixed REASONS, and verdict.py re-reads and re-authorises the comment itself
+from the event payload when it needs the text (help, explain, override).
+Removing `needs-human` routes to a verdict, which acknowledges that round's
+escalation only when the owner removed it, and never for a workflow change.
 """
 
 from __future__ import annotations
@@ -31,14 +42,18 @@ import re
 import sys
 from typing import Any
 
+import commands
+
 WRITE_ASSOCIATIONS = ("OWNER", "MEMBER", "COLLABORATOR")
 PR_REVIEW_TYPES = ("opened", "synchronize", "reopened", "ready_for_review")
 BASE_CHANGE_TYPE = "edited"  # reviewed only when the edit retargets the base
-OUTPUT_KEYS = ("action", "pr", "head_sha", "escalate", "reason", "bind_override")
+OUTPUT_KEYS = ("action", "pr", "head_sha", "escalate", "reason", "bind_override", "mode")
 OVERRIDE_LABEL = "human-override"
+ESCALATION_LABEL = "needs-human"
 VALID_ACTIONS = frozenset({"review", "verdict", "skip"})
 VALID_ESCALATE = frozenset({"true", "false"})
 VALID_BOOL = VALID_ESCALATE
+REVIEW_MODES = frozenset({"full", "wontfix_only"})
 
 PR_REVIEW_REASONS = {
     "opened": "pull_request.opened",
@@ -55,6 +70,7 @@ SAFE_SKIP: dict[str, str] = {
     "escalate": "false",
     "reason": "invalid route output",
     "bind_override": "false",
+    "mode": "",
 }
 
 REASONS = frozenset({
@@ -77,6 +93,14 @@ REASONS = frozenset({
     "invalid workflow_dispatch pr",
     "invalid PR metadata",
     "event not handled",
+    "needs-human label removed",
+    "help requested",
+    "explain requested",
+    "override requested by owner",
+    "override needs a head SHA and a reason",
+    "only the owner can override",
+    "override must be a top-level PR comment",
+    "wontfix belongs in a finding thread",
     SAFE_SKIP["reason"],
 })
 
@@ -143,6 +167,8 @@ def _check_output(out: Any) -> str | None:
         return "invalid pr"
     if not _OUTPUT_SHA_RE.fullmatch(out["head_sha"]):
         return "invalid head_sha"
+    if out["mode"] not in (REVIEW_MODES if out["action"] == "review" else {""}):
+        return "invalid mode"
     reason = out["reason"]
     if not reason or not all(0x20 <= ord(ch) <= 0x7E for ch in reason) or reason not in REASONS:
         return "invalid reason"
@@ -160,7 +186,7 @@ def validate_output(out: Any) -> dict[str, str]:
 
 def decide(event_name: str, event: dict[str, Any], owner: str) -> dict[str, Any]:
     out = {"action": "skip", "pr": "", "head_sha": "", "escalate": "false", "reason": "",
-           "bind_override": "false"}
+           "bind_override": "false", "mode": ""}
 
     if event_name in ("pull_request", "pull_request_target"):
         pr = event.get("pull_request")
@@ -180,6 +206,11 @@ def decide(event_name: str, event: dict[str, Any], owner: str) -> dict[str, Any]
         if action in ("labeled", "unlabeled"):
             label = event.get("label")
             name = label.get("name") if isinstance(label, dict) else None
+            if name == ESCALATION_LABEL and action == "unlabeled":
+                # verdict.py acknowledges the round's escalation only when the owner removed it,
+                # and never one raised by a workflow change; otherwise it re-applies the label (#27).
+                out.update(action="verdict", reason="needs-human label removed")
+                return out
             if name != OVERRIDE_LABEL:
                 out["reason"] = "label is not a pr-guardian control"
                 return out
@@ -205,7 +236,7 @@ def decide(event_name: str, event: dict[str, Any], owner: str) -> dict[str, Any]
         if fork:
             out.update(action="verdict", reason="external fork PR: secrets are unavailable, owner review required")
             return out
-        out.update(action="review", reason=PR_REVIEW_REASONS[action])
+        out.update(action="review", reason=PR_REVIEW_REASONS[action], mode="full")
         return out
 
     if event_name in ("issue_comment", "pull_request_review_comment"):
@@ -214,10 +245,9 @@ def decide(event_name: str, event: dict[str, Any], owner: str) -> dict[str, Any]
             out["reason"] = "not a /ai-review command"
             return out
         raw_body = comment.get("body")
-        body = raw_body.strip() if isinstance(raw_body, str) else ""
         user = comment.get("user")
         user_dict = user if isinstance(user, dict) else {}
-        if user_dict.get("type") == "Bot" or not body.startswith("/ai-review"):
+        if user_dict.get("type") == "Bot" or not commands.has_prefix(raw_body):
             out["reason"] = "not a /ai-review command"
             return out
         if event_name == "issue_comment":
@@ -242,16 +272,36 @@ def decide(event_name: str, event: dict[str, Any], owner: str) -> dict[str, Any]
             out["reason"] = "commenter has no write access"
             return out
         login = user_dict.get("login", "")
-        rest = body[len("/ai-review"):].strip()
-        if rest.startswith("escalate"):
+        by_owner = isinstance(login, str) and bool(owner) and login == owner
+        cmd = commands.parse(raw_body)
+        name = cmd.name if cmd is not None else "unknown"
+        if name == "escalate":
             out.update(action="verdict", escalate="true", reason="escalated by a writer")
-        elif rest.startswith("wontfix"):
-            out.update(action="review", reason="pushback from a writer")
-        elif rest == "":
-            if not isinstance(login, str) or not owner or login != owner:
+        elif name == "wontfix":
+            if event_name == "pull_request_review_comment":
+                out.update(action="review", reason="pushback from a writer", mode="wontfix_only")
+            else:
+                # Pushback counts only inside a finding thread, so a top-level wontfix would
+                # spend a model round that changes nothing: answer with a hint instead (#39).
+                out.update(action="verdict", reason="wontfix belongs in a finding thread")
+        elif name == "review":
+            if not by_owner or assoc != "OWNER":
                 out["reason"] = "only the owner can force a re-review"
                 return out
-            out.update(action="review", reason="re-review requested by owner")
+            out.update(action="review", reason="re-review requested by owner", mode="full")
+        elif name == "help":
+            out.update(action="verdict", reason="help requested")
+        elif name == "explain":
+            out.update(action="verdict", reason="explain requested")
+        elif name == "override":
+            if not by_owner or assoc != "OWNER":
+                out["reason"] = "only the owner can override"
+            elif event_name == "pull_request_review_comment":
+                out.update(action="verdict", reason="override must be a top-level PR comment")
+            elif not cmd.ok:
+                out.update(action="verdict", reason="override needs a head SHA and a reason")
+            else:
+                out.update(action="verdict", reason="override requested by owner")
         else:
             out["reason"] = "unknown /ai-review command"
         return out
@@ -263,7 +313,7 @@ def decide(event_name: str, event: dict[str, Any], owner: str) -> dict[str, Any]
         if not pr:
             out["reason"] = "invalid workflow_dispatch pr"
             return out
-        out.update(action="review", pr=pr, reason="manual dispatch")
+        out.update(action="review", pr=pr, reason="manual dispatch", mode="full")
         return out
 
     out["reason"] = "event not handled"

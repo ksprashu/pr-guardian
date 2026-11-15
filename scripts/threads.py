@@ -8,6 +8,7 @@ association so callers can drop outsiders (GHSA-j3g5-fvc6-rrjw).
 
 from __future__ import annotations
 
+import sys
 from typing import Any
 
 import gh
@@ -22,7 +23,7 @@ query($owner:String!, $name:String!, $pr:Int!, $cursor:String) {
         nodes {
           id isResolved isOutdated path line
           comments(first:100) {
-            pageInfo { hasNextPage }
+            pageInfo { hasNextPage endCursor }
             nodes { author { __typename login } authorAssociation body createdAt url }
           }
         }
@@ -31,23 +32,95 @@ query($owner:String!, $name:String!, $pr:Int!, $cursor:String) {
   }
 }"""
 
+THREAD_COMMENTS_QUERY = """
+query($id:ID!, $cursor:String) {
+  node(id:$id) { ... on PullRequestReviewThread {
+    comments(first:100, after:$cursor) {
+      pageInfo { hasNextPage endCursor }
+      nodes { author { __typename login } authorAssociation body createdAt url }
+  } } }
+}"""
+
+MAX_COMMENT_PAGES = 10  # 1,100 comments per thread, then fail closed
+MAX_THREAD_PAGES = 50   # 5,000 threads per PR safety bound
+
 # The identity GITHUB_TOKEN posts as. Checked together with __typename == "Bot",
 # because a user account can be named "github-actions"-like but is never a Bot.
 BOT_LOGINS = ("github-actions", "github-actions[bot]")
 WRITE_ASSOCIATIONS = frozenset({"OWNER", "MEMBER", "COLLABORATOR"})
 
 
+def _complete_comments(thread: dict[str, Any]) -> None:
+    if not truncated(thread):
+        return
+    tid = thread.get("id")
+    block = thread.get("comments")
+    if not (isinstance(tid, str) and tid and isinstance(block, dict)
+            and isinstance(block.get("nodes"), list) and isinstance(block.get("pageInfo"), dict)):
+        print(f"::warning::thread {tid!r} has malformed comments block; leaving truncated",
+              file=sys.stderr)
+        return
+
+    pages = 0
+    while truncated(thread) and pages < MAX_COMMENT_PAGES:
+        cursor = block["pageInfo"].get("endCursor")
+        if not isinstance(cursor, str) or not cursor:
+            block["pageInfo"]["hasNextPage"] = True
+            print(f"::warning::thread {tid} missing endCursor; leaving truncated", file=sys.stderr)
+            return
+        try:
+            data = gh.graphql(THREAD_COMMENTS_QUERY, id=tid, cursor=cursor)
+        except gh.GhError as exc:
+            block["pageInfo"]["hasNextPage"] = True
+            print(f"::warning::could not paginate comments for thread {tid}: {exc}", file=sys.stderr)
+            return
+
+        node = data.get("node") if isinstance(data, dict) else None
+        next_block = node.get("comments") if isinstance(node, dict) else None
+        next_nodes = next_block.get("nodes") if isinstance(next_block, dict) else None
+        next_info = next_block.get("pageInfo") if isinstance(next_block, dict) else None
+        if not (isinstance(next_nodes, list) and isinstance(next_info, dict)
+                and isinstance(next_info.get("hasNextPage"), bool)):
+            block["pageInfo"]["hasNextPage"] = True
+            print(f"::warning::malformed comment page for thread {tid}; leaving truncated",
+                  file=sys.stderr)
+            return
+
+        block["nodes"].extend(next_nodes)
+        block["pageInfo"] = dict(next_info)
+        pages += 1
+
+    if truncated(thread):
+        print(f"::warning::thread {tid} exceeds {MAX_COMMENT_PAGES} extra comment pages; leaving truncated",
+              file=sys.stderr)
+
+
 def fetch(repo: str, pr: int) -> list[dict[str, Any]]:
     owner, name = repo.split("/", 1)
     nodes: list[dict[str, Any]] = []
     cursor = None
-    while True:
+    exhausted = True
+    for _ in range(MAX_THREAD_PAGES):
         data = gh.graphql(THREADS_QUERY, owner=owner, name=name, pr=pr, cursor=cursor)
-        page = data["repository"]["pullRequest"]["reviewThreads"]
+        repo_obj = data.get("repository") if isinstance(data, dict) else None
+        pr_obj = repo_obj.get("pullRequest") if isinstance(repo_obj, dict) else None
+        page = pr_obj.get("reviewThreads") if isinstance(pr_obj, dict) else None
+        if not (isinstance(page, dict) and isinstance(page.get("nodes"), list)
+                and isinstance(page.get("pageInfo"), dict)):
+            raise gh.GhError(f"threads: malformed reviewThreads payload for {repo}#{pr}")
         nodes.extend(page["nodes"])
-        if not page["pageInfo"]["hasNextPage"]:
-            return nodes
-        cursor = page["pageInfo"]["endCursor"]
+        if not page["pageInfo"].get("hasNextPage"):
+            exhausted = False
+            break
+        cursor = page["pageInfo"].get("endCursor")
+        if not isinstance(cursor, str) or not cursor:
+            raise gh.GhError(f"threads: missing endCursor for {repo}#{pr}")
+    if exhausted:
+        raise gh.GhError(f"threads: more than {MAX_THREAD_PAGES * 100} review threads for {repo}#{pr}")
+    for t in nodes:
+        if isinstance(t, dict):
+            _complete_comments(t)
+    return nodes
 
 
 def comments(thread: dict[str, Any] | None) -> list[dict[str, Any]]:

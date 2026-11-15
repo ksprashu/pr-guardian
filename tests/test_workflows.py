@@ -526,7 +526,8 @@ SHA = "b" * 40
 
 
 def _ctx(event_name, event, inputs=None):
-    return {"github": {"event_name": event_name, "event": event}, "inputs": inputs or {}}
+    return {"github": {"event_name": event_name, "event": event, "repository_owner": OWNER_LOGIN},
+            "inputs": inputs or {}}
 
 
 def _pr_obj(number=7):
@@ -571,7 +572,20 @@ def dispatch_event(pr="7"):
     return _ctx("workflow_dispatch", {"inputs": {"pr": pr}}, inputs={"pr": pr})
 
 
-COMMANDS = ("/ai-review", "/ai-review escalate", "/ai-review wontfix: false positive", "/ai-review bogus")
+COMMANDS = ("/ai-review", "/ai-review escalate", "/ai-review wontfix: false positive", "/ai-review bogus",
+            "/ai-review help", "/ai-review explain R-001", "/ai-review override " + "a" * 40 + ": reviewed")
+COMMAND_VARIANTS = COMMANDS + (
+    "/ai-review frobnicate", "/ai-review wontfix", "/ai-review explain", "/ai-review override",
+    "/ai-review ", "/ai-review  ", "/ai-review\n", "/ai-review\r\n", "/AI-REVIEW\r\n",
+    " /ai-review", "\n/ai-review", "  /ai-review help",
+    "/ai-reviewer", "/ai-reviewhelp",
+    "/AI-REVIEW", "/Ai-Review", "/AI-REVIEW help", "/ai-review HELP",
+    "/AI-REVIEW wontfix: fp", "/ai-review WONTFIX: fp", "/AI-REVIEW WONTFIX: fp",
+    "/ai-review wontfix\nreason", "/ai-review  wontfix: fp", "/ai-review\twontfix: fp",
+    "/ai-review\nwontfix: fp", "/ai-review  help", "/ai-review\nhelp",
+    "/AI-REVIEW escalate: why", "/AI-REVIEW EXPLAIN R-001",
+    "/AI-REVIEW OVERRIDE " + "a" * 40 + ": reviewed",
+)
 
 
 class ExpressionModel(unittest.TestCase):
@@ -663,19 +677,48 @@ class CallerGate(unittest.TestCase):
             self.assertFires(pr_event(action), False)
         for label in ("bug", "needs-human", "enhancement", "Human-Override-x", ""):
             self.assertFires(pr_event("labeled", label=label), False)
-        # Only the human-override label's removal recomputes the verdict (#27); removing
-        # needs-human would re-apply it from state and repost the escalation comment.
-        for label in ("bug", "needs-human", "Human-Override-x", ""):
+        # Removing human-override or needs-human recomputes the verdict (#27); other labels never
+        # start a run. needs-human removal is safe to act on: verdict.py acknowledges only the
+        # owner's removal, never a workflow-change escalation, and de-duplicates its comment.
+        for label in ("bug", "Human-Override-x", "needs-human-x", ""):
             self.assertFires(pr_event("unlabeled", label=label), False)
+        self.assertGroup(pr_event("unlabeled", label="needs-human"), "verdict", False)
         self.assertFires(_ctx("push", {"ref": "refs/heads/main"}), False)
 
     def test_writer_commands_start_a_run(self):
         for kind in ("issue_comment", "pull_request_review_comment"):
             for assoc in WRITERS:
                 self.assertGroup(comment_event("/ai-review escalate", assoc=assoc, kind=kind), "verdict", False)
-                self.assertGroup(comment_event("/ai-review", assoc=assoc, kind=kind), "review", True)
-                self.assertGroup(comment_event("/ai-review wontfix: fp", assoc=assoc, kind=kind),
-                                 "review", True)
+                # Only the owner's bare /ai-review is a review; anyone else's would only cancel one.
+                self.assertGroup(comment_event("/ai-review", assoc=assoc, kind=kind), "review" if assoc == "OWNER"
+                                 else "verdict", assoc == "OWNER")
+                self.assertGroup(comment_event("/ai-review", assoc=assoc, kind=kind, login="someone"),
+                                 "verdict", False)
+                for body in ("/ai-review help", "/ai-review explain R-001",
+                             "/ai-review override " + "a" * 40 + ": reviewed"):
+                    self.assertGroup(comment_event(body, assoc=assoc, kind=kind), "verdict", False)
+            # Pushback is a review only inside a finding thread; top level it gets a hint (#39).
+            self.assertGroup(comment_event("/ai-review wontfix: fp", kind="issue_comment"), "verdict", False)
+            self.assertGroup(comment_event("/ai-review wontfix: fp", kind="pull_request_review_comment"),
+                             "review", True)
+
+    def test_info_commands_never_cancel_reviews(self):
+        """Caller concurrency and route.decide() agree on every case and whitespace variant (#39, R-001)."""
+        import route  # noqa: E402
+        for kind in ("issue_comment", "pull_request_review_comment"):
+            # Logins are unique ignoring case on GitHub, so the expression's case-insensitive == on
+            # login cannot match a different account than route.py's exact comparison does.
+            for assoc, login in [(a, n) for a in WRITERS for n in (OWNER_LOGIN, "someone")]:
+                for body in COMMAND_VARIANTS:
+                    ctx = comment_event(body, assoc=assoc, kind=kind, login=login)
+                    decision = route.decide(kind, ctx["github"]["event"], OWNER_LOGIN)
+                    for cond, group, cip in self.each():
+                        if not eval_if(cond, ctx):
+                            self.assertEqual(decision["action"], "skip", (body, kind, decision))
+                            continue
+                        cancels = eval_value(cip, ctx)
+                        self.assertIs(cancels, eval_value(group, ctx).endswith("-review"), ctx)
+                        self.assertIs(cancels, decision["action"] == "review", (body, kind, decision))
 
     def test_review_actions_override_label_and_dispatch(self):
         for action in ("opened", "synchronize", "reopened", "ready_for_review"):
@@ -715,10 +758,10 @@ class CallerGate(unittest.TestCase):
         for kind in ("issue_comment", "pull_request_review_comment"):
             for assoc in WRITERS + OUTSIDERS:
                 for user_type in ("User", "Bot"):
-                    for body in COMMANDS + ("LGTM",):
+                    for body in COMMAND_VARIANTS + ("LGTM",):
                         for login in (OWNER_LOGIN, "someone"):
                             events.append(comment_event(body, assoc, user_type, kind, login=login))
-        events += [comment_event(b, on_pr=False) for b in COMMANDS]
+        events += [comment_event(b, on_pr=False) for b in COMMAND_VARIANTS]
         acted = 0
         for ctx in events:
             gh = ctx["github"]

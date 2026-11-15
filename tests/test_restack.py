@@ -832,13 +832,21 @@ class RestackWorkflowAndGovernorTest(unittest.TestCase):
         ruleset = copy.deepcopy(gov.desired_ruleset())
         ruleset["id"] = 1
 
+        def _b64_doc(text: str, sha: str = "blob1") -> dict:
+            return {
+                "type": "file",
+                "encoding": "base64",
+                "sha": sha,
+                "content": __import__("base64").b64encode(text.encode()).decode(),
+            }
+
         def fake_api(path: str, method: str = "GET", body: dict | None = None, **kw):
             if path == f"repos/{REPO}":
                 return dict(repo, **gov.SETTINGS)
             if path == f"repos/{REPO}/branches/main":
                 return {"name": "main"}
             if path == f"repos/{REPO}/contents/{gov.CALLER_PATH}?ref=main":
-                return {"content": __import__("base64").b64encode(rendered_caller.encode()).decode()}
+                return _b64_doc(rendered_caller)
             if path == f"repos/{REPO}/contents/{gov.RESTACK_CALLER_PATH}?ref=main":
                 raise gov.gh.GhError("HTTP 404 Not Found")
             if path.startswith(f"repos/{REPO}/rulesets"):
@@ -846,13 +854,50 @@ class RestackWorkflowAndGovernorTest(unittest.TestCase):
             return []
 
         with mock.patch.object(gov.gh, "api", side_effect=fake_api), \
-                mock.patch.object(gov, "has_secret", return_value=True):
+                mock.patch.object(gov, "secret_names", return_value={gov.SECRET}):
             # Default (restack=False): clean, never asks for stack-restack.yml.
             off = gov.reconcile(repo, ref, dry=True, have_key=True)
             self.assertEqual(off["drift"], [])
-            # Opt-in (restack=True): reports restack caller missing without touching caller/ruleset.
+            # Opt-in (restack=True or Config.restack_repos): reports restack caller missing cleanly.
             on = gov.reconcile(repo, ref, dry=True, have_key=True, restack=True)
             self.assertEqual(on["drift"], ["restack caller missing"])
+            self.assertEqual(on["pending"], ["restack caller missing"])
+            held_cfg = gov.Config(restack_repos=frozenset({"r"}), held=True, hold_reason="canary pending")
+            held_out = gov.reconcile(repo, ref, dry=False, have_key=True, cfg=held_cfg)
+            self.assertIn("held for the canary ring", held_out["pending"][0])
+
+        # Idempotent deliver_restack_caller: existing current PR with auto_merge makes zero writes.
+        open_pr = {
+            "number": 12,
+            "head": {"ref": gov.RESTACK_INSTALL_BRANCH, "sha": "h12", "repo": {"full_name": REPO}},
+            "base": {"ref": "main"},
+            "changed_files": 1,
+            "auto_merge": {"merge_method": "squash"},
+            "created_at": "2026-11-15T00:00:00Z",
+        }
+        idem_calls: list[tuple[str, str]] = []
+
+        def idem_api(path: str, method: str = "GET", body: dict | None = None, **kw):
+            idem_calls.append((method, path))
+            if path.startswith(f"repos/{REPO}/pulls?head=o:{gov.RESTACK_INSTALL_BRANCH}"):
+                return [open_pr]
+            if path == f"repos/{REPO}/pulls/12":
+                return open_pr
+            if path.startswith(f"repos/{REPO}/pulls/12/files"):
+                return [{"filename": gov.RESTACK_CALLER_PATH, "status": "added"}]
+            if path.startswith(f"repos/{REPO}/contents/{gov.RESTACK_CALLER_PATH}?ref="):
+                return _b64_doc(rendered_restack, sha="rb1")
+            if path.endswith("/protection"):
+                raise gov.gh.GhError("HTTP 404 Not Found")
+            raise AssertionError(f"unexpected call {method} {path}")
+
+        with mock.patch.object(gov.gh, "api", side_effect=idem_api), \
+                mock.patch.object(gov.gh, "_run") as gh_run:
+            d = gov.deliver_restack_caller(REPO, "main", rendered_restack)
+        self.assertFalse(d.merged)
+        self.assertIn("restack caller PR #12 waiting (auto-merge queued)", d.note)
+        self.assertTrue(all(m == "GET" for m, _ in idem_calls))
+        gh_run.assert_not_called()
 
         self.assertNotEqual(gov.INSTALL_BRANCH, gov.RESTACK_INSTALL_BRANCH)
         self.assertEqual(gov.restack_repo_names(" a , b ,, "), {"a", "b"})

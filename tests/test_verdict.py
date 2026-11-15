@@ -1,8 +1,10 @@
+import json
 import os
+import tempfile
 import unittest
 from unittest import mock
 
-from tests.helpers import finding
+from tests.helpers import finding, thread
 import state as st
 import verdict as v
 
@@ -164,38 +166,83 @@ class OverrideBindingDecideTest(unittest.TestCase):
         self.assertFalse(st_([marker(A), marker(B)]))  # ambiguous: left alone, never honoured
 
 
+FORBIDDEN = "gh api … failed: HTTP 403 Resource not accessible by integration"
+
+
 class FakeGitHub:
     def __init__(self, head=B, base="main", labels=OVR, events=(), comments=(), review_state=None,
-                 delete_error=False, default_branch="main"):
-        self.pr = {"head": {"sha": head, "repo": {"full_name": "o/r"}},
+                 delete_error=False, default_branch="main", fork=False, event_name="", event=None,
+                 threads=(), review_comments=(), forbid_writes=False):
+        self.pr = {"head": {"sha": head, "repo": {"full_name": "x/r" if fork else "o/r"}},
                    "base": {"ref": base, "repo": {"full_name": "o/r", "default_branch": default_branch}},
                    "labels": [{"name": n} for n in labels]}
         self.events, self.comments = list(events), list(comments)
+        self.review_comments = list(review_comments)
         if review_state is not None:
             self.comments.insert(0, {"id": 1, "user": BOT,
                                      "body": st.SUMMARY_MARKER + "\n" + st.encode(review_state)})
         self.delete_error, self.calls = delete_error, []
+        self.event_name, self.event, self.threads = event_name, event, list(threads)
+        self.forbid_writes, self.printed, self.next_id = forbid_writes, [], 5000
 
     def api(self, path, method="GET", body=None, paginate=False, token=None):
         self.calls.append((path, method, body))
+        if method != "GET" and self.forbid_writes:
+            raise v.gh.GhError(FORBIDDEN)
         if path.endswith("/pulls/7"):
             return self.pr
         if path.endswith("/events"):
             return list(self.events)
-        if path.endswith("/comments") and method == "GET":
+        if path.endswith("/issues/7/comments") and method == "GET":
             return list(self.comments)
+        if path.endswith("/pulls/7/comments") and method == "GET":
+            return list(self.review_comments)
         if method == "DELETE" and self.delete_error:
             raise v.gh.GhError("gh api … failed: HTTP 404 Label does not exist")
+        if method == "POST" and (path.endswith("/issues/7/comments") or path.endswith("/replies")):
+            self.next_id += 1
+            target = self.comments if path.endswith("/issues/7/comments") else self.review_comments
+            target.append({"id": self.next_id, "user": BOT, "body": body["body"]})
         return {}
 
-    def run(self, sha="", bind="false", escalate="false", reason="", result="success"):
+    def run(self, sha="", bind="false", escalate="false", reason="", result="success", summary=None):
         argv = ["verdict.py", "--repo", "o/r", "--pr", "7", "--sha", sha, "--escalate", escalate,
                 "--reason", reason, "--review-result", result, "--bind-override", bind]
-        with mock.patch.object(v.gh, "api", side_effect=self.api), \
-                mock.patch.object(v.sys, "argv", argv), \
-                mock.patch.dict(os.environ, {"PRG_OWNER": "o"}, clear=False), \
-                mock.patch("builtins.print"):
-            return v.main()
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {"PRG_OWNER": "o", "GITHUB_EVENT_NAME": self.event_name, "GITHUB_EVENT_PATH": "",
+                   "GITHUB_STEP_SUMMARY": summary or ""}
+            if self.event is not None:
+                env["GITHUB_EVENT_PATH"] = os.path.join(tmp, "event.json")
+                with open(env["GITHUB_EVENT_PATH"], "w", encoding="utf-8") as fh:
+                    json.dump(self.event, fh)
+            with mock.patch.object(v.gh, "api", side_effect=self.api), \
+                    mock.patch.object(v.th, "fetch", side_effect=lambda repo, pr: list(self.threads)), \
+                    mock.patch.object(v.sys, "argv", argv), \
+                    mock.patch.dict(os.environ, env, clear=False), \
+                    mock.patch("builtins.print", side_effect=lambda *a, **k: self.printed.append(" ".join(map(str, a)))):
+                return v.main()
+
+    @property
+    def writes(self):
+        return [(p, m) for p, m, _ in self.calls if m != "GET"]
+
+    @property
+    def posted(self):
+        """Bodies of every comment and reply pr-guardian posted."""
+        return [b["body"] for p, m, b in self.calls
+                if m == "POST" and (p.endswith("/issues/7/comments") or p.endswith("/replies"))]
+
+    @property
+    def replies(self):
+        return [(p, b["body"]) for p, m, b in self.calls if m == "POST" and "pr-guardian:reply" in (b or {}).get("body", "")]
+
+    @property
+    def reactions(self):
+        return [p for p, m, _ in self.calls if m == "POST" and p.endswith("/reactions")]
+
+    @property
+    def status_bodies(self):
+        return [b for p, m, b in self.calls if "/statuses/" in p]
 
     @property
     def statuses(self):
@@ -535,6 +582,550 @@ class BaseBindingMainTest(unittest.TestCase):
                                   reason="", review_result="success", fork=False, base_ref="main",
                                   require_default=True)["state"], "pending")
         self.assertEqual(decide(state(sha=A), sha=A, default_branch="")["state"], "success")
+
+
+OWNER_USER = {"login": "o", "type": "User"}
+
+
+def nh_event(action, by="o", eid=50, user_type="User"):
+    return {"id": eid, "event": action, "label": {"name": "needs-human"}, "actor": {"login": by, "type": user_type}}
+
+
+def owner_comment(body, cid=900, login="o", assoc="OWNER", user_type="User"):
+    return {"id": cid, "body": body, "author_association": assoc, "user": {"login": login, "type": user_type}}
+
+
+def issue_event(body, cid=900, pr=7, **kw):
+    return {"action": "created", "issue": {"number": pr, "pull_request": {"url": "u"}},
+            "comment": owner_comment(body, cid, **kw)}
+
+
+def review_event(body, cid=901, **kw):
+    return {"action": "created", "pull_request": {"number": 7, "head": {"sha": A}},
+            "comment": owner_comment(body, cid, **kw)}
+
+
+def finding_thread(fid, n=1):
+    t = thread(fid)
+    t["comments"]["nodes"][0]["url"] = f"https://github.com/o/r/pull/7#discussion_r{n}"
+    return t
+
+
+def ovr(sha_prefix=A[:12], reason="reviewed the fork by hand"):
+    return f"/ai-review override {sha_prefix}: {reason}"
+
+
+class ForkReadOnlyTest(unittest.TestCase):
+    """#30: a fork PR's pull_request* runs hold a read-only token, so they write nothing."""
+
+    def test_fork_pull_request_run_writes_nothing(self):
+        for name, extra in (("plain", {}),
+                            ("stale label", dict(events=[labeled("o")], comments=[marker(B)])),
+                            ("bind", dict(events=[labeled("o", eid=41)]))):
+            with self.subTest(name), tempfile.TemporaryDirectory() as tmp:
+                summary = os.path.join(tmp, "summary.md")
+                kw = dict(head=A, fork=True, event_name="pull_request", event={"action": "opened"},
+                          review_state=state(sha=A, escalated=True))
+                kw.update(extra)
+                gh = FakeGitHub(**kw)
+                self.assertEqual(gh.run(sha=A, bind="true" if name == "bind" else "false",
+                                        reason="external fork PR: secrets are unavailable, owner review required",
+                                        summary=summary), 0)
+                self.assertEqual(gh.writes, [])
+                self.assertTrue(any('"state": "failure"' in line for line in gh.printed))
+                self.assertTrue(any(line.startswith("::notice::") for line in gh.printed))
+                with open(summary, encoding="utf-8") as fh:
+                    self.assertIn("read-only fork run", fh.read())
+
+    def test_fork_review_comment_run_writes_nothing(self):
+        gh = FakeGitHub(head=A, fork=True, event_name="pull_request_review_comment",
+                        event=review_event("/ai-review help"), labels=[])
+        self.assertEqual(gh.run(sha=A, reason="help requested"), 0)
+        self.assertEqual(gh.writes, [])
+
+    def test_forbidden_status_on_fork_exits_zero_elsewhere_raises(self):
+        gh = FakeGitHub(head=A, fork=True, labels=[], event_name="issue_comment",
+                        event=issue_event("/ai-review escalate: x", login="c", assoc="COLLABORATOR"),
+                        forbid_writes=True)
+        self.assertEqual(gh.run(escalate="true", reason="escalated by a writer"), 0)
+        self.assertTrue(any("cannot write" in line for line in gh.printed))
+        gh = FakeGitHub(head=A, labels=[], review_state=state(sha=A), forbid_writes=True)
+        with self.assertRaises(v.gh.GhError):
+            gh.run(sha=A)
+
+    def test_fork_description_names_the_command(self):
+        r = decide(None, fork=True)
+        self.assertEqual(r["state"], "failure")
+        self.assertIn("/ai-review override", r["description"])
+
+
+class CommandOverrideTest(unittest.TestCase):
+    """#30 / #43: owner `/ai-review override <sha>: <reason>`, bound to head and base."""
+
+    REASON = "override requested by owner"
+
+    def gh(self, body=None, head=A, comments=None, fork=True, **kw):
+        body = body or ovr()
+        kw.setdefault("event", issue_event(body))
+        return FakeGitHub(head=head, labels=[], fork=fork, event_name="issue_comment",
+                          comments=[owner_comment(body)] if comments is None else comments,
+                          review_state=state(finding(), sha=head), **kw)
+
+    def cmd_markers(self, gh):
+        return [b for b in gh.posted if "pr-guardian:override-cmd" in b]
+
+    def test_owner_override_binds_and_passes_on_fork(self):
+        for prefix in (A[:12], A[:20], A):
+            with self.subTest(prefix=prefix):
+                gh = self.gh(ovr(prefix))
+                self.assertEqual(gh.run(reason=self.REASON), 0)
+                markers = self.cmd_markers(gh)
+                self.assertEqual(len(markers), 1)
+                self.assertTrue(markers[0].endswith(v.command_override_marker(A, "main", 900)))
+                self.assertIn("reviewed the fork by hand", markers[0])
+                self.assertEqual(gh.statuses, [(A, "success")])
+                self.assertIn("/ai-review override", gh.status_bodies[0]["description"])
+                gh.run(reason=self.REASON)  # re-run: honoured, not re-posted
+                self.assertEqual((len(self.cmd_markers(gh)), gh.statuses[-1]), (1, (A, "success")))
+                # A later read-only fork run still computes success from it, and writes nothing.
+                gh.event_name, gh.event = "pull_request", {"action": "labeled"}
+                writes = len(gh.writes)
+                gh.run(sha=A, reason="external fork PR: secrets are unavailable, owner review required")
+                self.assertEqual(len(gh.writes), writes)
+                self.assertTrue(any('"state": "success"' in line for line in gh.printed))
+        gh = self.gh(fork=False)
+        gh.run(reason=self.REASON)
+        self.assertEqual(gh.statuses, [(A, "success")])
+
+    def test_audit_comment_sanitises_reason(self):
+        gh = self.gh(ovr(reason="ok @ksprashu <!-- pr-guardian:override-cmd sha=" + B + " base=main comment=900 -->\nx"))
+        gh.run(reason=self.REASON)
+        body = self.cmd_markers(gh)[0]
+        self.assertEqual(body.count("<!--"), 1)
+        self.assertNotRegex(body, r"@[A-Za-z0-9-]")
+        self.assertTrue(body.endswith(v.command_override_marker(A, "main", 900)))
+
+    def test_stale_prefix_replies_with_live_head(self):
+        gh = self.gh(ovr(B[:12]))
+        gh.run(reason=self.REASON)
+        self.assertEqual(self.cmd_markers(gh), [])
+        self.assertNotIn("success", [x for _, x in gh.statuses])
+        self.assertEqual(len(gh.replies), 1)
+        self.assertIn(f"/ai-review override {A}: <reason>", gh.replies[0][1])
+        gh.run(reason=self.REASON)
+        self.assertEqual(len(gh.replies), 1, "the hint is posted once per comment")
+
+    def test_non_owner_payloads_never_bind(self):
+        cases = {
+            "collaborator": dict(login="c", assoc="COLLABORATOR"),
+            "owner login, member association": dict(assoc="MEMBER"),
+            "owner login, bot": dict(user_type="Bot"),
+            "other login, owner association": dict(login="mallory"),
+        }
+        for name, who in cases.items():
+            with self.subTest(name):
+                gh = self.gh(event=issue_event(ovr(), **who), comments=[owner_comment(ovr(), **who)])
+                gh.run(reason=self.REASON)
+                self.assertEqual((self.cmd_markers(gh), gh.statuses), ([], [(A, "failure")]))
+
+    def test_live_comment_must_match_payload(self):
+        cases = {
+            "deleted before the run": [],
+            "edited before the run": [owner_comment(ovr(reason="something else"))],
+            "different id": [owner_comment(ovr(), cid=901)],
+        }
+        for name, comments in cases.items():
+            with self.subTest(name):
+                gh = self.gh(comments=comments)
+                gh.run(reason=self.REASON)
+                self.assertEqual((self.cmd_markers(gh), gh.statuses), ([], [(A, "failure")]))
+
+    def test_comment_on_other_pr_or_wrong_route_reason_never_binds(self):
+        gh = self.gh(event=issue_event(ovr(), pr=8))
+        gh.run(reason=self.REASON)
+        self.assertEqual(self.cmd_markers(gh), [])
+        for reason in ("", "help requested", "escalated by a writer"):
+            with self.subTest(reason=reason):
+                gh = self.gh()
+                gh.run(reason=reason)
+                self.assertEqual(self.cmd_markers(gh), [])
+
+    def test_off_default_base_never_binds(self):
+        gh = self.gh(base="stage")
+        gh.run(reason=self.REASON)
+        self.assertEqual((self.cmd_markers(gh), gh.statuses), ([], [(A, "pending")]))
+
+    def test_marker_revoked_by_edit_or_delete_or_other_head(self):
+        bound = {"user": BOT, "body": "ok\n\n" + v.command_override_marker(A, "main", 900)}
+        live = owner_comment(ovr())
+        def ok(comments, sha=A, base="main"):
+            return v.decide(state=state(finding(), sha=sha), sha=sha, labels=[], events=[], owner="o",
+                            escalate=False, reason="", review_result="success", fork=True, base_ref=base,
+                            comments=comments, default_branch=base,
+                            cmd_overrides=v.command_override_bindings(comments, "o"))
+        ov = lambda comments: v.command_override_bindings(comments, "o")
+        self.assertEqual(ov([live, bound]), {(A, "main")})
+        self.assertEqual(ov([bound]), set(), "source comment deleted")
+        self.assertEqual(ov([owner_comment(ovr(reason="changed my mind")), bound]), {(A, "main")})
+        self.assertEqual(ov([owner_comment("thanks"), bound]), set(), "edited away")
+        self.assertEqual(ov([owner_comment(ovr(B[:12])), bound]), set(), "edited to another head")
+        self.assertEqual(ov([owner_comment(ovr(), assoc="MEMBER"), bound]), set())
+        self.assertEqual(ov([owner_comment(ovr(), login="mallory"), bound]), set())
+        forged = {"user": {"type": "User", "login": "o"}, "body": bound["body"]}
+        self.assertEqual(ov([live, forged]), set())
+        self.assertEqual(ov([live, {"user": {"type": "Bot", "login": "evil[bot]"}, "body": bound["body"]}]), set())
+        self.assertEqual(ov([live, {**bound, "body": bound["body"] + "\ntrailing"}]), set())
+        self.assertEqual(ov([live, bound, {"user": BOT, "body": v.command_override_marker(A, "stage", 900)}]), set())
+        self.assertEqual(ok([live, bound])["state"], "success")
+        self.assertEqual(ok([live, bound], sha=B)["state"], "failure")
+        self.assertEqual(ok([live, bound], base="stage")["state"], "failure")
+
+
+class NeedsHumanAckTest(unittest.TestCase):
+    """#27: removing needs-human acknowledges the round's escalation only for the owner."""
+
+    REASON = "needs-human label removed"
+
+    def gh(self, s, events=None, labels=(), comments=(), **kw):
+        return FakeGitHub(head=A, labels=list(labels), review_state=s, comments=comments,
+                          events=[nh_event("labeled", by="github-actions[bot]", eid=40, user_type="Bot"),
+                                  nh_event("unlabeled")] if events is None else events,
+                          event_name="pull_request", event={"action": "unlabeled"}, **kw)
+
+    def acks(self, gh):
+        return [b for b in gh.posted if "pr-guardian:ack " in b]
+
+    def test_owner_removal_acknowledges_and_falls_through(self):
+        for findings, want in (((finding(),), "failure"), ((), "success")):
+            with self.subTest(want=want):
+                s = state(*findings, sha=A, escalated=True, escalation_reasons=["round cap: 5 rounds"])
+                gh = self.gh(s)
+                gh.run(sha=A, reason=self.REASON)
+                self.assertEqual(len(self.acks(gh)), 1)
+                self.assertTrue(self.acks(gh)[0].endswith(v.ack_marker(A, "main", 2, 50)))
+                self.assertEqual((gh.label_posts, gh.statuses), ([], [(A, want)]))
+                self.assertNotIn("Needs human", gh.status_bodies[0]["description"])
+                gh.run(sha=A, reason="help requested")  # later runs keep honouring it, no re-post
+                self.assertEqual((len(self.acks(gh)), gh.label_posts, gh.statuses[-1]), (1, [], (A, want)))
+
+    def test_next_round_escalation_reapplies(self):
+        ack = {"user": BOT, "body": "ok\n\n" + v.ack_marker(A, "main", 2, 50)}
+        s = state(sha=A, escalated=True, escalation_reasons=["round cap: 5 rounds"])
+        s["round"] = 3
+        gh = self.gh(s, comments=[ack])
+        gh.run(sha=A, reason="pull_request.synchronize")
+        self.assertEqual((len(gh.label_posts), gh.statuses), (1, [(A, "failure")]))
+
+    def test_writer_escalate_or_relabel_after_ack_still_blocks(self):
+        ack = {"user": BOT, "body": "ok\n\n" + v.ack_marker(A, "main", 2, 50)}
+        s = state(sha=A, escalated=True, escalation_reasons=["round cap: 5 rounds"])
+        gh = self.gh(s, comments=[ack])
+        gh.run(escalate="true", reason="escalated by a writer")
+        self.assertEqual((len(gh.label_posts), gh.statuses), (1, [(A, "failure")]))
+        gh = self.gh(s, comments=[ack], labels=["needs-human"])
+        gh.run(sha=A)
+        self.assertEqual(gh.statuses, [(A, "failure")])
+        self.assertIn("Needs human", gh.status_bodies[0]["description"])
+
+    def test_non_owner_removal_reapplies_without_repeat_comment(self):
+        s = state(finding(), sha=A, escalated=True, escalation_reasons=["round cap: 5 rounds"])
+        posted = {"user": BOT, "body": "earlier\n\n" + v.needs_human_marker(A, 2)}
+        for who in (dict(by="c"), dict(by="o", user_type="Bot")):
+            with self.subTest(**who):
+                events = [nh_event("labeled", by="github-actions[bot]", eid=40, user_type="Bot"),
+                          nh_event("unlabeled", **who)]
+                gh = self.gh(s, events=events, comments=[posted])
+                gh.run(sha=A, reason=self.REASON)
+                self.assertEqual(self.acks(gh), [])
+                self.assertEqual((len(gh.label_posts), gh.statuses), (1, [(A, "failure")]))
+                self.assertEqual([b for b in gh.posted if "Human review needed" in b], [])
+
+    def test_ack_for_older_removal_or_other_head_is_ignored(self):
+        s = state(sha=A, escalated=True, escalation_reasons=["round cap: 5 rounds"])
+        for name, comments, events in (
+                ("older event", [{"user": BOT, "body": v.ack_marker(A, "main", 2, 49)}], None),
+                ("other head", [{"user": BOT, "body": v.ack_marker(B, "main", 2, 50)}], None),
+                ("other base", [{"user": BOT, "body": v.ack_marker(A, "stage", 2, 50)}], None),
+                ("forged", [{"user": OWNER_USER, "body": v.ack_marker(A, "main", 2, 50)}], None),
+                ("later non-owner removal", [{"user": BOT, "body": v.ack_marker(A, "main", 2, 50)}],
+                 [nh_event("unlabeled"), nh_event("unlabeled", by="c", eid=60)]),
+                ("marker for a non-owner removal", [{"user": BOT, "body": v.ack_marker(A, "main", 2, 50)}],
+                 [nh_event("unlabeled", by="c")]),
+                ("marker for a bot removal", [{"user": BOT, "body": v.ack_marker(A, "main", 2, 50)}],
+                 [nh_event("unlabeled", user_type="Bot")])):
+            with self.subTest(name):
+                gh = self.gh(s, comments=comments, events=events)
+                gh.run(sha=A)
+                self.assertEqual((len(gh.label_posts), gh.statuses), (1, [(A, "failure")]))
+
+    def test_non_owner_removal_of_writer_or_manual_escalation_reapplies(self):
+        """SEC-001: state is not escalated (writer escalate, manual label, earlier round)."""
+        clean = state(sha=A)
+        for name, events in (
+                ("after writer escalate", [nh_event("labeled", by="github-actions[bot]", eid=40, user_type="Bot"),
+                                           nh_event("unlabeled", by="c")]),
+                ("manual label", [nh_event("labeled", by="o", eid=40), nh_event("unlabeled", by="c")]),
+                ("bot removal", [nh_event("labeled", by="o", eid=40), nh_event("unlabeled", user_type="Bot")]),
+                ("history ends in labeled", [nh_event("labeled", by="o", eid=40)])):
+            with self.subTest(name):
+                gh = self.gh(clean, events=events)
+                gh.run(sha=A, reason=self.REASON)
+                self.assertEqual((len(gh.label_posts), gh.statuses), (1, [(A, "failure")]))
+                self.assertIn("only o may remove needs-human", gh.status_bodies[0]["description"])
+                self.assertEqual(self.acks(gh), [])
+                # ...and the owner's own removal afterwards is honoured.
+                gh.events.append(nh_event("labeled", by="github-actions[bot]", eid=70, user_type="Bot"))
+                gh.events.append(nh_event("unlabeled", eid=71))
+                gh.run(sha=A, reason=self.REASON)
+                self.assertEqual((len(gh.label_posts), gh.statuses[-1]), (1, (A, "success")))
+        # An earlier round escalated, this round did not: same rule.
+        earlier = state(sha=A, escalated=False, escalation_reasons=["round cap: 5 rounds"])
+        gh = self.gh(earlier, events=[nh_event("labeled", by="github-actions[bot]", eid=40, user_type="Bot"),
+                                      nh_event("unlabeled", by="c")])
+        gh.run(sha=A, reason=self.REASON)
+        self.assertEqual((len(gh.label_posts), gh.statuses), (1, [(A, "failure")]))
+        # An override still accepts the head whoever removed the label.
+        self.assertEqual(decide(clean, sha=A, labels=OVR, events=[labeled("o"), nh_event("unlabeled", by="c")],
+                                comments=[marker(A)])["state"], "success")
+        # No needs-human history at all: nothing to undo.
+        self.assertFalse(v.unauthorised_removal([labeled("o")], [], "o"))
+
+    def test_queued_removal_run_does_not_ack_a_relabelled_pr(self):
+        s = state(sha=A, escalated=True, escalation_reasons=["round cap: 5 rounds"])
+        gh = self.gh(s, labels=["needs-human"])
+        gh.run(sha=A, reason=self.REASON)
+        self.assertEqual(self.acks(gh), [])
+        self.assertEqual(gh.statuses, [(A, "failure")])
+
+    def test_workflow_escalation_is_never_acknowledged(self):
+        wf = "workflow modified: this PR changes CI workflow or action files (.github/workflows/x.yml)"
+        for reasons in ([wf], [wf, "round cap: 5 rounds"]):
+            with self.subTest(reasons=reasons):
+                s = state(sha=A, escalated=True, escalation_reasons=reasons)
+                gh = self.gh(s)
+                gh.run(sha=A, reason=self.REASON)
+                self.assertEqual(self.acks(gh), [])
+                refusals = [b for b in gh.posted if "pr-guardian:ack-refused" in b]
+                self.assertEqual(len(refusals), 1)
+                self.assertEqual((len(gh.label_posts), gh.statuses), (1, [(A, "failure")]))
+                gh.pr["labels"] = []
+                gh.run(sha=A, reason=self.REASON)
+                self.assertEqual(len([b for b in gh.posted if "pr-guardian:ack-refused" in b]), 1)
+        # Even a forged-into-place ack cannot clear it.
+        s = state(sha=A, escalated=True, escalation_reasons=[wf])
+        self.assertEqual(decide(s, sha=A, events=[nh_event("unlabeled")])["state"], "failure")
+        r = v.decide(state=s, sha=A, labels=[], events=[], owner="o", escalate=False, reason="",
+                     review_result="success", fork=False, base_ref="main", default_branch="main", acked=True)
+        self.assertEqual(r.get("label"), "needs-human")
+
+    def test_workflow_escalation_helper(self):
+        wf = "workflow modified: x"
+        self.assertTrue(v.workflow_escalation(state(escalated=True, escalation_reasons=["a", wf])))
+        self.assertFalse(v.workflow_escalation(state(escalated=False, escalation_reasons=[wf])))
+        self.assertFalse(v.workflow_escalation(state(escalated=True, escalation_reasons=["round cap: x"])))
+        self.assertFalse(v.workflow_escalation(None))
+
+
+class NeedsHumanCommentTest(unittest.TestCase):
+    """#43: the escalation comment lists blocking threads, is not capped at 140, and is posted once."""
+
+    def test_comment_lists_blocking_threads(self):
+        findings = [finding("R-001", severity="P1", title="SQL `injection` @ksprashu <!-- x -->"),
+                    finding("R-002", severity="P2", prior_id="R-000", start=4, end=9),
+                    finding("R-003", severity="nit"),
+                    finding("R-004", severity="P0", status="fixed")]
+        s = state(*findings, sha=A, escalated=True, escalation_reasons=["round cap: 5 rounds"])
+        gh = FakeGitHub(head=A, labels=[], review_state=s,
+                        threads=[finding_thread("R-001", 1), finding_thread("R-000", 2)])
+        gh.run(sha=A)
+        bodies = [b for b in gh.posted if "Human review needed" in b]
+        self.assertEqual(len(bodies), 1)
+        body = bodies[0]
+        self.assertGreater(len(body), 140)
+        self.assertTrue(body.endswith(v.needs_human_marker(A, 2)))
+        self.assertIn("**Open blocking findings (2)**", body)
+        self.assertIn("(https://github.com/o/r/pull/7#discussion_r1)", body)
+        self.assertIn("(https://github.com/o/r/pull/7#discussion_r2)", body)
+        self.assertIn("`app.py:4-9`", body)
+        self.assertNotIn("R-003", body)
+        self.assertNotIn("R-004", body)
+        self.assertIn("round cap: 5 rounds", body)
+        self.assertIn(f"/ai-review override {A}: <reason>", body)
+        self.assertEqual(body.count("<!--"), 1)
+        self.assertNotIn("@ksprashu", body)
+        self.assertLessEqual(len(gh.status_bodies[0]["description"]), 140)
+        gh.run(sha=A)
+        self.assertEqual(len([b for b in gh.posted if "Human review needed" in b]), 1)
+
+    def test_thread_fetch_failure_degrades_to_plain_list(self):
+        s = state(finding(), sha=A, escalated=True)
+        gh = FakeGitHub(head=A, labels=[], review_state=s)
+        with mock.patch.object(v.th, "fetch", side_effect=v.gh.GhError("graphql down")), \
+                mock.patch("builtins.print"):
+            body = v.needs_human_body(sha=A, round_=2, description="d", owner="o", state=s, extra=[],
+                                      thread_map_fn=lambda: v._thread_map("o/r", 7))
+        self.assertIn("- R-001 · P1 · CWE-89 `app.py:3` title R-001", body)
+        del gh
+
+    def test_writer_escalate_text_is_quoted_safely(self):
+        gh = FakeGitHub(head=A, labels=[], review_state=state(sha=A), event_name="issue_comment",
+                        event=issue_event("/ai-review escalate: loops on @ksprashu <!-- y -->", login="c",
+                                          assoc="COLLABORATOR"))
+        gh.run(escalate="true", reason="escalated by a writer")
+        body = [b for b in gh.posted if "Human review needed" in b][0]
+        self.assertIn("escalated by c: loops on @\u200bksprashu", body)
+        self.assertEqual(body.count("<!--"), 1)
+
+    def test_blocking_lines_cap(self):
+        s = state(*[finding(f"R-{i:03d}") for i in range(1, 26)])
+        lines = v.blocking_lines(s, {}, limit=20)
+        self.assertEqual(len(lines), 21)
+        self.assertEqual(lines[-1], "- … and 5 more")
+
+
+class InfoCommandTest(unittest.TestCase):
+    """#39: help, explain and hint replies, reactions, idempotent across re-runs."""
+
+    def gh(self, body, reason_state=None, kind="issue", head=A, **who):
+        event = issue_event(body, **who) if kind == "issue" else review_event(body, **who)
+        return FakeGitHub(head=head, labels=[], review_state=reason_state or state(finding(), sha=head),
+                          event_name="issue_comment" if kind == "issue" else "pull_request_review_comment",
+                          event=event, threads=[finding_thread("R-001", 1)])
+
+    def test_help_reply_once_and_reaction(self):
+        gh = self.gh("/ai-review help", login="c", assoc="COLLABORATOR")
+        gh.run(reason="help requested")
+        self.assertEqual(len(gh.replies), 1)
+        path, body = gh.replies[0]
+        self.assertEqual(path, "repos/o/r/issues/7/comments")
+        self.assertIn("/ai-review override <head-sha>: <reason>", body)
+        self.assertTrue(body.endswith(v.commands.reply_marker("issue", 900)))
+        self.assertEqual(gh.reactions, ["repos/o/r/issues/comments/900/reactions"])
+        self.assertEqual(gh.statuses, [(A, "failure")])
+        gh.run(reason="help requested")
+        self.assertEqual(len(gh.replies), 1)
+
+    def test_explain_by_id_prior_id_and_unknown(self):
+        s = state(finding("R-002", prior_id="R-001", rationale="because\n<!-- x --> @ksprashu"), sha=A)
+        for arg, want in (("R-002", "**R-002**"), ("R-001", "**R-002**"), ("R-404", "Current ids: `R-002`")):
+            with self.subTest(arg=arg):
+                gh = self.gh(f"/ai-review explain {arg}", reason_state=s)
+                gh.run(reason="explain requested")
+                self.assertEqual(len(gh.replies), 1)
+                body = gh.replies[0][1]
+                self.assertIn(want, body)
+                self.assertEqual(body.count("<!--"), 1)
+                self.assertNotRegex(body, r"@[A-Za-z0-9-]")
+                if arg != "R-404":
+                    self.assertIn("> because", body)
+                    self.assertIn("https://github.com/o/r/pull/7#discussion_r1", body)
+        gh = self.gh("/ai-review explain r-1")
+        gh.run(reason="explain requested")
+        self.assertIn("Usage: `/ai-review explain <ID>`", gh.replies[0][1])
+
+    def test_reply_to_a_thread_reply_targets_the_top_level_comment(self):
+        gh = self.gh("/ai-review explain R-001", kind="review")
+        gh.event["comment"]["in_reply_to_id"] = 500
+        gh.run(sha=A, reason="explain requested")
+        self.assertEqual([p for p, _ in gh.replies], ["repos/o/r/pulls/7/comments/500/replies"])
+        self.assertTrue(gh.replies[0][1].endswith(v.commands.reply_marker("review", 901)))
+        self.assertEqual(gh.reactions, ["repos/o/r/pulls/comments/901/reactions"])
+        gh.run(sha=A, reason="explain requested")
+        self.assertEqual(len(gh.replies), 1)
+
+    def test_rerun_does_not_recompute_answer(self):
+        gh = self.gh("/ai-review explain R-001")
+        gh.run(reason="explain requested")
+        with mock.patch.object(v, "explain_body", side_effect=AssertionError("recomputed")):
+            gh.run(reason="explain requested")
+        self.assertEqual(len(gh.replies), 1)
+
+    def test_review_comment_explain_replies_in_thread(self):
+        gh = self.gh("/ai-review explain R-001", kind="review", login="m", assoc="MEMBER")
+        gh.run(sha=A, reason="explain requested")
+        self.assertEqual([p for p, _ in gh.replies], ["repos/o/r/pulls/7/comments/901/replies"])
+        self.assertEqual(gh.reactions, ["repos/o/r/pulls/comments/901/reactions"])
+        gh.run(sha=A, reason="explain requested")
+        self.assertEqual(len(gh.replies), 1)
+
+    def test_replies_happen_even_when_sha_is_stale(self):
+        gh = self.gh("/ai-review help", kind="review")
+        gh.run(sha=B, reason="help requested")
+        self.assertEqual(len(gh.replies), 1)
+        self.assertEqual(gh.statuses, [])
+
+    def test_hints(self):
+        cases = (("/ai-review override", "issue", "override needs a head SHA and a reason",
+                  f"/ai-review override {A}: <reason>"),
+                 (ovr(), "review", "override must be a top-level PR comment", f"/ai-review override {A}: <reason>"),
+                 ("/ai-review wontfix: fp", "issue", "wontfix belongs in a finding thread", "inside the finding's thread"))
+        for body, kind, reason, want in cases:
+            with self.subTest(reason=reason):
+                gh = self.gh(body, kind=kind)
+                gh.run(reason=reason)
+                self.assertEqual(len(gh.replies), 1)
+                self.assertIn(want, gh.replies[0][1])
+
+    def test_payload_must_match_reason_and_author(self):
+        cases = (("/ai-review help", "explain requested", {}),
+                 ("/ai-review help", "help requested", dict(login="mallory", assoc="NONE")),
+                 ("/ai-review help", "help requested", dict(user_type="Bot")),
+                 ("/ai-review override", "override needs a head SHA and a reason", dict(login="c", assoc="COLLABORATOR")),
+                 ("/ai-review wontfix: x", "wontfix belongs in a finding thread", {}))
+        for body, reason, who in cases:
+            with self.subTest(body=body, reason=reason, who=who):
+                kind = "review" if body.startswith("/ai-review wontfix") else "issue"
+                gh = self.gh(body, kind=kind, **who)
+                gh.run(reason=reason)
+                self.assertEqual(gh.replies, [])
+        gh = self.gh("/ai-review help", login="mallory", assoc="NONE")
+        gh.run(reason="help requested")
+        self.assertEqual(gh.reactions, [])
+
+    def test_dry_run_writes_nothing(self):
+        gh = self.gh("/ai-review help")
+        argv = ["verdict.py", "--repo", "o/r", "--pr", "7", "--reason", "help requested", "--dry-run"]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "e.json")
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump(gh.event, fh)
+            with mock.patch.object(v.gh, "api", side_effect=gh.api), \
+                    mock.patch.object(v.th, "fetch", return_value=[]), \
+                    mock.patch.object(v.sys, "argv", argv), \
+                    mock.patch.dict(os.environ, {"PRG_OWNER": "o", "GITHUB_EVENT_NAME": "issue_comment",
+                                                 "GITHUB_EVENT_PATH": path}), \
+                    mock.patch("builtins.print"):
+                self.assertEqual(v.main(), 0)
+        self.assertEqual(gh.writes, [])
+
+
+class ExplainBodyTest(unittest.TestCase):
+    def test_thread_link_falls_back_to_current_id(self):
+        f = finding("R-002", prior_id="R-001")
+        body = v.explain_body(state(f), "R-002", {"R-002": finding_thread("R-002", 7)})
+        self.assertIn("https://github.com/o/r/pull/7#discussion_r7", body)
+        body = v.explain_body(state(f), "R-002", {"R-001": finding_thread("R-001", 3),
+                                                  "R-002": finding_thread("R-002", 7)})
+        self.assertIn("#discussion_r3", body)
+        self.assertTrue(v.blocking_lines(state(f), {"R-002": finding_thread("R-002", 7)})[0].startswith(
+            "- [R-002 · P1 · CWE-89](https://github.com/o/r/pull/7#discussion_r7)"))
+
+    def test_missing_title_leaves_no_dangling_colon(self):
+        body = v.explain_body(state(finding(title="")), "R-001", {})
+        self.assertIn("**R-001** · P1 · security · CWE-89\n", body)
+
+    def test_graceful_without_rationale_or_threads(self):
+        f = finding("R-001", rationale="")
+        body = v.explain_body(state(f), "R-001", {})
+        self.assertIn("**R-001** · P1 · security · CWE-89: title R-001", body)
+        self.assertNotIn("> ", body)
+        self.assertIn("No finding `R-009`", v.explain_body(state(f), "R-009", {}))
+        self.assertIn("no findings", v.explain_body(None, "R-001", {}))
+        self.assertIn("**R-001**", v.explain_body(state({**f, "thread_key": "K-001"}), "K-001", {}))
+
+    def test_rationale_is_clipped(self):
+        body = v.explain_body(state(finding(rationale="x" * 5000)), "R-001", {})
+        self.assertLess(len(body), 2000)
 
 
 if __name__ == "__main__":
