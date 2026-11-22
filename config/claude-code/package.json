@@ -3,6 +3,6 @@
   "private": true,
   "description": "Pins Claude Code for the rate-limit fallback reviewer; npm ci verifies the lockfile hashes.",
   "dependencies": {
-    "@anthropic-ai/claude-code": "2.1.280"
+    "@anthropic-ai/claude-code": "2.1.325"
   }
 }
